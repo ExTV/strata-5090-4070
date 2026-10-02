@@ -1,7 +1,7 @@
 """spec-min-p sweep without a restart: the same 5 prompts (600 tokens, temperature 0.6 like real use, fixed seed)
 at strata_tune.spec_min_p 0.3 / 0.5 / 0.7, interleaved so drift hits every arm alike. Prints one JSON line."""
-import json, sys, time, urllib.request
-B = "http://127.0.0.1:8888"
+import json, os, sys, time, urllib.request
+B = os.environ.get("STRATA_URL", "http://127.0.0.1:8888")
 M = json.load(urllib.request.urlopen(B + "/v1/models"))["data"][0]["id"]
 Q = ["Write a Python function that parses a CSV file and returns per-column statistics, with docstrings.",
      "Explain how a hash map handles collisions, with examples in C.",

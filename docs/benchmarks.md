@@ -17,6 +17,12 @@ state that boot was in; compare rows with similar fault counts.
 | 38 | 70 / 86 | 760 / 740 | 1,182 / 1,179 | 5.9 s |
 | 39 | 92 | 499 | 1,127 | 5.9 s |
 | 36, `--prefill 1024` | 107 | 273 | 265 | 7.2 s |
+| 36, Strata 0.1.31 vs 0.1.33 same day | 99 / 111 | 639 / 646 | 922 / 928 | |
+
+The README's "stock" ranges (decode 99-111, 16K 470-646, 80K 886-928) are the spread of the split-36
+rows above. Until this commit the bench seeded its prompts from Python's per-process string hash,
+so prompts differed between runs; they are random words of the same shape, so the numbers stand,
+but runs are only identical from this commit on.
 
 ## `--prefill-main` vs stock, same day, fresh boots
 

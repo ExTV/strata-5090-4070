@@ -2,7 +2,7 @@
 
 Qwen3.8-Flash-Next (the 3-bit ISTA GSQ-RCO GGUF, 76 GB of experts) with the **full 262,144-token
 context** on an RTX 5090 32 GB plus an RTX 4070 Ti SUPER 16 GB in a chipset x1 slot, 31 GB of RAM,
-served by [Strata](https://github.com/Niko1221/Strata) 0.1.33 with two local patches.
+served by [Strata](https://github.com/Niko1221/Strata) 0.1.33 with four patches.
 
 What you get on this hardware (details and every measurement in [docs/benchmarks.md](docs/benchmarks.md)):
 
@@ -18,25 +18,33 @@ What you get on this hardware (details and every measurement in [docs/benchmarks
 
 Stock Strata refuses conversation parking with a layer split, reads every prompt through both
 cards (the x1 card becomes the prompt bottleneck), and on a box with less RAM than the expert file
-pays a page fault per 4 KB of expert weight whenever the kernel drops its readahead hint. The three
+pays a page fault per 4 KB of expert weight whenever the kernel drops its readahead hint. The
 patches change that:
 
-- `patches/02-prefill-main-and-parking-with-layer-split.patch`: `--prefill-main` reads the whole
-  prompt on the big card (port of Strata PR #269 onto 0.1.33, rewritten for its carved sessions) and
-  copies the small card's share of the state afterwards, only the cells in use; conversation parking
-  works with the split (the big card's session is parked, the small card's state is copied back on
-  restore). Also carries PR #487 (PCIe probe noise).
-- `patches/01-upstream-0.1.35-server-stager-and-mmq-guard.patch`: from Strata 0.1.34/0.1.35:
-  client-disconnect cancel (#430), per-request draft stats (#457, #460), the stager DMA wait fix
-  (#385) and the MMQ tile guard (#420).
-- `patches/03-pread-expert-blobs.patch`: with `STRATA_BLOB_PREAD=1` the expert pool reads each
+- `patches/01-upstream-0.1.35-server-stager-and-mmq-guard.patch`: `serve/server.py`,
+  `moe_mmq.cu` and `moe_mmq.hpp` exactly as in Strata v0.1.35 (client-disconnect cancel #430,
+  per-request draft stats #457/#460, the MMQ tile guard #420), plus the stager DMA wait fix from
+  the still-open PR #385.
+- `patches/02-pcie-probe-median-pr487.patch`: the still-open PR #487 (the PCIe probe takes the
+  median of several primed bursts instead of one). It changes `pcie_frac` for any layer split.
+- `patches/03-prefill-main-and-parking-with-layer-split.patch`: `--prefill-main` reads the whole
+  prompt on the big card (port of Strata PR #269, closed unmerged, onto 0.1.33's carved sessions)
+  and copies the small card's share of the state afterwards, only the cells in use; conversation
+  parking works with the split (the big card's session is parked, the small card's state is copied
+  back on restore). Cost: the big card's session spans all 48 layers, so the pinned host K/V of
+  the small card's 12 layers exists twice, about 0.77 GiB of extra pinned RAM (3.09 GiB for 48
+  layers in the launch log) and a few hundred MB of VRAM.
+- `patches/04-pread-expert-blobs.patch`: with `STRATA_BLOB_PREAD=1` the expert pool reads each
   expert's slices with `pread` instead of `memcpy` through the mmap, so a cold expert costs one
   request instead of up to 500 synchronous page faults. Together with `--prefill auto:32768` this is
   what took the 80K prompt from 510-700 tok/s to 1,796.
 
-All three patches apply to a pristine v0.1.33 checkout and reproduce the tested tree byte for byte.
-PR #439 (batched expert gathers) is deliberately **not** included: under `--prefill-main` it
-deadlocks on the second prompt chunk of a fully streamed layer ([docs/how-it-works.md](docs/how-it-works.md)).
+All four patches apply in order to a pristine v0.1.33 checkout; `patches/MANIFEST.sha256` holds the
+sha256 of the 11 patched files as tested, `install.sh` checks it, and the CI job does the same against
+the upstream tag. PR #439 (batched expert gathers) is deliberately **not** included: under
+`--prefill-main` it deadlocks on the second prompt chunk of a fully streamed layer
+([docs/how-it-works.md](docs/how-it-works.md)). `STRATA_PM_SHARE=1` (patch 03) is an experiment that
+lost on decode and has an unreviewed interaction with the residency snapshot; do not use it.
 
 ## What you need
 
@@ -60,8 +68,8 @@ lives (default `./models`); it is written into `strata/strata-flash-next-262k.js
 ## Step 2: download the model
 
 ```bash
-pip install -U huggingface_hub
-hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "IQ3_XXS/*" "mmproj-*" --local-dir models
+strata/.venv/bin/pip install -U huggingface_hub
+strata/.venv/bin/hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "IQ3_XXS/*" "mmproj-*" --local-dir models
 mv models/IQ3_XXS/* models/ && rmdir models/IQ3_XXS
 ./prepare.sh            # builds the dense pack (packs/gsq-iq3_xxs) and the MTP draft runtime (mtp/rt)
 ```
@@ -75,9 +83,11 @@ Shard 1 (47 GB) holds the experts and is read in place; shard 2 (28.8 GB) is the
 launchers/flash-next-262k.sh
 ```
 
-Serves `http://0.0.0.0:8888/v1` (OpenAI chat completions, Anthropic messages, model name
+Serves `http://127.0.0.1:8888/v1` (OpenAI chat completions, Anthropic messages, model name
 `qwen3.8-flash-next`, images on). The config is `strata/strata-flash-next-262k.json`; `CONFIG=`,
-`PORT=`, `HOST=` override. Sampling defaults are 0.6 / 0.95 / 20; a request can override them, and
+`PORT=`, `HOST=` override. There is no authentication: `HOST=0.0.0.0` exposes the endpoint, image
+input included, to everything on your network, so only do that behind a firewall rule or a proxy
+that adds auth. Sampling defaults are 0.6 / 0.95 / 20; a request can override them, and
 can tune the drafter per request with `"strata_tune": {"spec_min_p": 0.8}` in the body.
 
 ## RAM: the one thing to know
@@ -102,6 +112,8 @@ swap-ins, back to back). Details in [docs/how-it-works.md](docs/how-it-works.md)
 `tools/decode_after.py NAME` (decode right after a big prompt), `tools/needle_followups.py` (40K
 needle, four follow-ups, a 20K extension), `tools/parking_check.py` (two alternating conversations,
 correctness and switch time), `tools/spec_min_p_sweep.py NAME` (per-request drafter threshold A/B, no
-restart), `tools/snapshot.py` (fault/swap/NVMe/GPU counters). All talk to `127.0.0.1:8888`.
+restart), `tools/snapshot.py` (fault/swap/direct-reclaim/NVMe/GPU counters). All talk to `127.0.0.1:8888`
+unless `STRATA_URL` says otherwise. The bench prompts are random words seeded from the run name
+(crc32), so two runs of the same name read identical prompts.
 
 License: MIT. Strata itself is MIT (LICENSE.strata).

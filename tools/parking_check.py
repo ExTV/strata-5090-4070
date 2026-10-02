@@ -1,7 +1,7 @@
-"""Two conversations alternating (A ~30K with a needle, B ~15K with another), 3 rounds; each turn must answer its own
+"""Two conversations alternating (A ~30K with a needle, B ~15K with another), 4 rounds; each turn must answer its own
 needle and, after the first read, reuse its history instead of re-reading it."""
-import json, random, string, time, urllib.request
-B = "http://127.0.0.1:8888"
+import json, os, random, string, time, urllib.request
+B = os.environ.get("STRATA_URL", "http://127.0.0.1:8888")
 M = json.load(urllib.request.urlopen(B + "/v1/models"))["data"][0]["id"]
 def chat(msgs, n):
     body = {"model": M, "messages": msgs, "max_tokens": n, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}

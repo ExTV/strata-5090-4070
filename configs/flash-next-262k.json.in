@@ -28,7 +28,7 @@
  "tokenizer": "packs/gsq-iq3_xxs/tokenizer",
  "model_name": "qwen3.8-flash-next",
  "log": "strata-flash-next-262k.log",
- "host": "0.0.0.0",
+ "host": "127.0.0.1",
  "port": 8888,
  "vision": {
   "exe": "build-vision/bin/strata-vision",

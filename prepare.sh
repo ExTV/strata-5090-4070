@@ -4,7 +4,7 @@
 # shards in $MODELS (README step 2).  Skips what already exists.
 set -euo pipefail
 cd "$(dirname "$0")/strata"
-MODELS=${MODELS:-$PWD/../models}
+MODELS=${MODELS:-$(cat models.path 2>/dev/null || echo "$PWD/../models")}   # models.path is written by install.sh
 SHARD1=$MODELS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
 [ -f "$SHARD1" ] || { echo "missing $SHARD1 (README step 2)" >&2; exit 1; }
 export STRATA_GGUF_PY=${STRATA_GGUF_PY:-$PWD/build/_deps/strata_llamacpp-src/gguf-py}

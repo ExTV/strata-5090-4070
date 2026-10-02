@@ -1,6 +1,6 @@
-"""Correctness: a needle in a ~40K prompt, then two follow-up turns (exercise the stage->main copy), greedy."""
-import json, random, string, sys, time, urllib.request
-B = "http://127.0.0.1:8888"
+"""Correctness: a needle in a ~40K prompt, then four follow-up turns and a 20K extension with a third needle (exercise the stage->main copy), greedy."""
+import json, os, random, string, sys, time, urllib.request
+B = os.environ.get("STRATA_URL", "http://127.0.0.1:8888")
 M = json.load(urllib.request.urlopen(B + "/v1/models"))["data"][0]["id"]
 def chat(msgs, n):
     body = {"model": M, "messages": msgs, "max_tokens": n, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}

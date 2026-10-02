@@ -39,7 +39,10 @@ visible in the new `KV streaming (CUDA1)` log line).
 
 Measured: 80K fresh prompt 1,791 tok/s vs 896 on stock, same box state, same day. The 5090's
 cache does not hold layer 36-47 pairs (`STRATA_PM_SHARE=1` would make it, and was rejected: the
-decode-hot pairs of layers 0-35 get evicted and decode after a big prompt fell to 28 tok/s).
+decode-hot pairs of layers 0-35 get evicted and decode after a big prompt fell to 28 tok/s; it also
+restores a pre-prompt snapshot of the residency table after the prompt, which is only safe while
+those rows are empty, as they are without the knob). The cost of the full-range session on the big
+card: the small card's 12 layers have their pinned host K/V in both sessions, about 0.77 GiB extra.
 
 ## Conversation parking with a layer split
 
@@ -79,7 +82,7 @@ either. Two things did:
 1. **Prompt chunk size.** Each chunk re-streams the experts of every layer, so an 80K prompt in
    8,192-token chunks streams the ~15 GB working set ten times. `--prefill auto:32768` streams it
    three times: 510 -> 1,451 tok/s and 24 M -> 1.1 M faults on the same afternoon (16384: 1,337).
-2. **`pread` instead of page faults** (`patches/03-pread-expert-blobs.patch`, on with
+2. **`pread` instead of page faults** (`patches/04-pread-expert-blobs.patch`, on with
    `STRATA_BLOB_PREAD=1`). Strata's pool copied each expert's three role slices out of the mmap with
    `memcpy`, after a `madvise(MADV_WILLNEED)` hint. Under memory pressure the kernel throttles or
    drops that readahead, and the copy then takes one major fault per 4 KB page with 64 KB

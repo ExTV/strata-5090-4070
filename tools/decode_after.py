@@ -1,7 +1,7 @@
 """Bench: 5 greedy thinking-off decodes (600 tok), fresh prompts of ~2K x2, ~16K, ~80K (prefill tok/s),
 then a 2K follow-up on the 80K prompt (cache reuse). Prints one JSON line."""
-import json, random, string, sys, time, urllib.request
-B = "http://127.0.0.1:8888"
+import json, os, zlib, random, string, sys, time, urllib.request
+B = os.environ.get("STRATA_URL", "http://127.0.0.1:8888")
 M = json.load(urllib.request.urlopen(B + "/v1/models"))["data"][0]["id"]
 def chat(msgs, max_tokens):
     body = {"model": M, "messages": msgs, "max_tokens": max_tokens, "temperature": 0,

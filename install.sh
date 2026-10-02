@@ -19,6 +19,8 @@ if [ ! -d strata ]; then
     git clone --branch "$STRATA_TAG" --depth 1 https://github.com/Niko1221/Strata.git strata
 fi
 cd strata
+have=$(git describe --tags --exact-match 2>/dev/null || echo none)
+[ "$have" = "$STRATA_TAG" ] || { echo "./strata is at '$have', not $STRATA_TAG; remove it or set STRATA_TAG" >&2; exit 1; }
 
 for p in ../patches/*.patch; do
     if patch -p1 -R --dry-run --force --quiet < "$p" >/dev/null 2>&1; then
@@ -48,7 +50,9 @@ cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAM
       -DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
 cmake --build build-vision --target strata-vision -j"$JOBS"
 
-sed "s|@MODELS@|$MODELS|g" ../configs/flash-next-262k.json.in > strata-flash-next-262k.json
+MODELS="$MODELS" python3 -c 'import os,sys; sys.stdout.write(open("../configs/flash-next-262k.json.in").read().replace("@MODELS@", os.environ["MODELS"]))' > strata-flash-next-262k.json
+echo "$MODELS" > models.path      # prepare.sh and the launcher read it, so MODELS= is needed only here
+sha256sum -c --quiet ../patches/MANIFEST.sha256 && echo "the 11 patched files match patches/MANIFEST.sha256 (the tested tree)"
 echo
 echo "built: strata/build/strata, strata/build-vision/bin/strata-vision; config strata/strata-flash-next-262k.json (MODELS=$MODELS)"
 echo "next: download the model into $MODELS (README step 2), then ./prepare.sh, then launchers/flash-next-262k.sh"
