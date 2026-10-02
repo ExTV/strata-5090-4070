@@ -1,0 +1,648 @@
+--- a/include/strata/core/session.hpp
++++ b/include/strata/core/session.hpp
+@@ -106,6 +106,16 @@
+ /// from the reference's own `zeros()`.
+ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
+ 
++/// --prefill-main (local patch): brings `dst`'s copy of layers [layer_begin, layer_end) up to date from `src`, which
++/// lives on another device, for a sequence both held identically up to cell `cell0` and `src` now holds up to `cell1`:
++/// the GDN recurrences (whole), the QSA indexer state, the step/position records, and the streamed K/V host copy and
++/// indexer rows of blocks [cell0 / page, ceil(cell1 / page)) only.  `dst`'s resident K/V blocks from that first block
++/// on are evicted (their host copy was rewritten; the readers resolve them again), the rest stay warm.  `cell0 = 0`
++/// is a whole-state copy.  `err` gets the first failed hop.
++bool session_copy_layers(SessionState& dst, const SessionState& src, const ModelGeometry& g,
++                         int64_t layer_begin, int64_t layer_end, int src_dev, int dst_dev, std::string& err,
++                         int64_t cell0, int64_t cell1);
++
+ /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.
+ ///
+ /// `parts` is (k, n_embd) DEVICE memory, filled by the caller - by the CPU expert pool and the VRAM-resident
+--- a/include/strata/kernels/kv_stream.hpp
++++ b/include/strata/kernels/kv_stream.hpp
+@@ -64,6 +64,9 @@
+ 
+ /// Every block evicted: page table all -1, slots free, counters zero.
+ void kv_stream_reset(const KvStreamMap& m, void* stream);
++/// Blocks [b0, n_blocks) evicted (their slots freed); blocks below b0 stay resident, counters untouched.  For a
++/// session whose host copy was rewritten from cell b0 * page_size on by another session (the --prefill-main hand-off).
++void kv_stream_evict_from(const KvStreamMap& m, int64_t b0, void* stream);
+ 
+ /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
+ /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call
+--- a/src/kernels/cuda/kv_stream.cu
++++ b/src/kernels/cuda/kv_stream.cu
+@@ -181,6 +181,18 @@
+     if (i0 < kKvCtlInts) m.ctl[i0] = 0;
+ }
+ 
++__global__ void evict_from_kernel(KvStreamMap m, long long b0) {
++    const long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x, st = (long long) gridDim.x * blockDim.x;
++    for (long long b = b0 + i0; b < m.n_blocks; b += st) {
++        const int32_t sl = m.page_table[b];
++        if (sl < 0) continue;   // -2 (a claim in flight) cannot occur: no resolve runs while this does
++        m.slot_block[sl] = -1;
++        m.slot_stamp[sl] = -1;
++        m.slot_ref[sl] = 0;
++        m.page_table[b] = -1;
++    }
++}
++
+ __global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slots) {
+     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n_blocks;
+          i += (long long) gridDim.x * blockDim.x)
+@@ -201,6 +213,13 @@
+     check("reset");
+ }
+ 
++void kv_stream_evict_from(const KvStreamMap& m, int64_t b0, void* stream) {
++    if (b0 <= 0) { kv_stream_reset(m, stream); return; }
++    if (b0 >= m.n_blocks) return;
++    evict_from_kernel<<<128, 256, 0, (cudaStream_t) stream>>>(m, (long long) b0);
++    check("evict_from");
++}
++
+ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
+                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
+                        void* stream) {
+--- a/src/core/session.cpp
++++ b/src/core/session.cpp
+@@ -4,6 +4,9 @@
+ #include "strata/core/progress.hpp"
+ 
+ #include "strata/kernels/qsa.hpp"
++#include "strata/kernels/kv_q8.hpp"   // STRATA_PREFILL_MAIN: session_copy_layers (KV_Q8_GROUP)
++#include "strata/kernels/kv_q4.hpp"     // --prefill-main: session_copy_layers (q4 row bytes)
++#include "strata/kernels/kv_stream.hpp" // --prefill-main: session_copy_layers (evict)
+ #include "strata/kernels/elementwise.hpp"
+ #include "strata/kernels/quantize_act.hpp"
+ #include "strata/kernels/s2_expert_grouped.hpp"
+@@ -172,6 +175,123 @@
+     s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+ }
+ 
++bool session_copy_layers(SessionState& dst, const SessionState& src, const ModelGeometry& g,
++                         int64_t layer_begin, int64_t layer_end, int src_dev, int dst_dev,
++                         std::string& err, int64_t cell0, int64_t cell1) {
++    // Local port of Strata PR #269 onto the 0.1.33 layer-range carve.  Each session finds its pieces through its own
++    // ordinals and QsaState pointers (the raw block layouts differ).  Streamed K/V: the host copy is the identity
++    // layout [block][kv_head][page][head_dim] (kv_stream.hpp), so a block range is a contiguous run of every array;
++    // VRAM slots are never copied - the receiver's map is evicted from the first rewritten block and its readers
++    // resolve from the host copy, as they do after any miss.  Works in both directions.
++    if (layer_begin >= layer_end) return true;
++    if (cell0 < 0) cell0 = 0;
++    if (cell1 < cell0) cell1 = cell0;
++    int prev_dev = 0;
++    if (cudaGetDevice(&prev_dev) != cudaSuccess) {
++        err = "session_copy_layers: cudaGetDevice failed";
++        return false;
++    }
++    cudaSetDevice(src_dev);
++    cudaDeviceSynchronize();   // the writer's streams must be done with the state being handed off
++    cudaGetLastError();
++    cudaSetDevice(dst_dev);
++    cudaDeviceSynchronize();
++    cudaGetLastError();
++    auto hop = [&](const void* srcp, void* dstp, uint64_t bytes, const char* what) -> bool {
++        if (bytes == 0) return true;
++        if (cudaError_t e = cudaMemcpyPeer(dstp, dst_dev, srcp, src_dev, (size_t) bytes); e != cudaSuccess) {
++            err = std::string("session_copy_layers: peer ") + what + ": " + cudaGetErrorString(e);
++            return false;
++        }
++        return true;
++    };
++    kernels::QsaShapes sh = kernels::qsa_real_shapes();
++    sh.n_head = g.n_head;
++    sh.n_head_kv = g.n_head_kv;
++    sh.head_dim = g.head_dim;
++    sh.idx_n_head = g.idx_q_heads;
++    sh.idx_dim = g.idx_key_dim;
++    const uint64_t gdn_row = gdn_state_floats(g) * 4;
++    bool ok = true;
++    int64_t gdn_ord = 0, qsa_ord = 0;
++    for (int64_t l = 0; l < layer_end && ok; ++l) {
++        const bool mine = l >= layer_begin;
++        if (is_qsa_layer(g, l)) {
++            if (mine) {
++                const QsaState& sq = src.qsa_states[qsa_ord];
++                QsaState& dq = dst.qsa_states[qsa_ord];
++                if (sq.n_slots != dq.n_slots || sq.kv_mode != dq.kv_mode || sq.n_pages != dq.n_pages ||
++                    sq.idx_pooled_rows != dq.idx_pooled_rows) {
++                    err = "session_copy_layers: QSA layouts differ between the sessions";
++                    ok = false;
++                    break;
++                }
++                // the block range [b0, b1): host K/V and the pooled indexer rows (one row per page)
++                const int64_t b0 = std::min<int64_t>(cell0 / sh.page_size, sq.n_pages);
++                const int64_t b1 = std::min<int64_t>((cell1 + sh.page_size - 1) / sh.page_size, sq.n_pages);
++                const uint64_t brows = (uint64_t) sh.n_head_kv * sh.page_size;   // K/V rows per block
++                if (b1 > b0 && sq.kv_mode == 1 && sq.host.present()) {
++                    const uint64_t r0 = (uint64_t) b0 * brows, nr = (uint64_t) (b1 - b0) * brows;
++                    const uint64_t q4_row = kernels::kv_q4_bytes_per_head((int) sh.head_dim);
++                    const uint64_t sc = sh.head_dim / kernels::KV_Q8_GROUP;
++                    if (sq.kv_q4) {
++                        std::memcpy(dq.host.k_q4 + r0 * q4_row, sq.host.k_q4 + r0 * q4_row, nr * q4_row);
++                        std::memcpy(dq.host.v_q4 + r0 * q4_row, sq.host.v_q4 + r0 * q4_row, nr * q4_row);
++                    } else if (sq.kv_int8) {
++                        std::memcpy(dq.host.k_q + r0 * sh.head_dim, sq.host.k_q + r0 * sh.head_dim, nr * sh.head_dim);
++                        std::memcpy(dq.host.v_q + r0 * sh.head_dim, sq.host.v_q + r0 * sh.head_dim, nr * sh.head_dim);
++                        std::memcpy(dq.host.k_scale + r0 * sc, sq.host.k_scale + r0 * sc, nr * sc * 2);
++                        std::memcpy(dq.host.v_scale + r0 * sc, sq.host.v_scale + r0 * sc, nr * sc * 2);
++                    } else {
++                        std::memcpy(dq.host.k_pool + r0 * sh.head_dim, sq.host.k_pool + r0 * sh.head_dim, nr * sh.head_dim * 2);
++                        std::memcpy(dq.host.v_pool + r0 * sh.head_dim, sq.host.v_pool + r0 * sh.head_dim, nr * sh.head_dim * 2);
++                    }
++                } else if (sq.kv_mode != 1) {
++                    // a fully resident layer (no streaming): the VRAM pool is the only copy, whole blocks over the link
++                    const uint8_t* s0 = sq.kv_hybrid || sq.kv_int8 ? (const uint8_t*) sq.k_q
++                                        : sq.kv_q4               ? (const uint8_t*) sq.k_q4
++                                                                 : (const uint8_t*) sq.k_pool;
++                    uint8_t* d0 = dq.kv_hybrid || dq.kv_int8 ? (uint8_t*) dq.k_q
++                                  : dq.kv_q4                 ? (uint8_t*) dq.k_q4
++                                                             : (uint8_t*) dq.k_pool;
++                    ok = hop(s0, d0, (uint64_t) ((const uint8_t*) sq.idx_tail - s0), "qsa pool");
++                }
++                if (ok && b1 > b0) {
++                    const int64_t p0 = std::min<int64_t>(cell0 / sh.idx_block, sq.idx_pooled_rows);
++                    const int64_t p1 = std::min<int64_t>((cell1 + sh.idx_block - 1) / sh.idx_block, sq.idx_pooled_rows);
++                    if (p1 > p0)
++                        ok = hop(sq.idx_pooled + (size_t) p0 * sh.idx_dim, dq.idx_pooled + (size_t) p0 * sh.idx_dim,
++                                 (uint64_t) (p1 - p0) * sh.idx_dim * 4, "indexer rows");
++                }
++                // the indexer's tail and dead row (contiguous), its block position, the step and position records
++                if (ok) ok = hop(sq.idx_tail, dq.idx_tail, (uint64_t) ((const uint8_t*) sq.idx_pooled - (const uint8_t*) sq.idx_tail),
++                                 "indexer tail");
++                if (ok) ok = hop(sq.idx_block_pos, dq.idx_block_pos, 4, "indexer block pos");
++                if (ok) ok = hop(sq.step, dq.step, (uint64_t) ((const uint8_t*) (sq.pos_dev + sh.n_head) - (const uint8_t*) sq.step),
++                                 "qsa step");
++                if (ok) {
++                    std::memcpy(dq.host_step, sq.host_step, kernels::qsa_step_bytes() + sizeof(int32_t));
++                    std::memcpy(dq.host_pos, sq.host_pos, (size_t) sh.n_head * 4);
++                }
++                // the receiver's resident blocks from b0 on hold the old cells: evict them (a whole-state copy resets)
++                if (ok && dq.kv_mode == 1) {
++                    cudaSetDevice(dst_dev);
++                    kernels::kv_stream_evict_from(dq.map, b0, nullptr);
++                    cudaDeviceSynchronize();
++                }
++            }
++            ++qsa_ord;
++        } else {
++            if (mine)
++                ok = hop(src.gdn_state + (size_t) (gdn_ord - src.gdn_ord0) * gdn_state_floats(g),
++                         dst.gdn_state + (size_t) (gdn_ord - dst.gdn_ord0) * gdn_state_floats(g), gdn_row, "gdn state");
++            ++gdn_ord;
++        }
++    }
++    cudaSetDevice(prev_dev);
++    return ok;
++}
++
+ /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
+ /// captured the SOURCE POINTER, not the value, and that is exactly why the buffers are pinned and fixed.
+ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s) {
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -334,6 +334,9 @@
+     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
+     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
+     bool no_prefill_borrow = false;
++    /// In a layer split, the WHOLE batched prompt runs on the main device (all layers); the later stages get
++    /// their layers' state afterwards and keep their VRAM for their expert caches.  Decode stays split.
++    bool prefill_main = false;
+     /// Plan v0.3 P5 validation: batch only positions [0, P) and run the rest of the prompt through the token path
+     /// (teacher-forced), so the logits of positions >= P - which depend on the batched state - can be scored
+     /// against the oracle at many positions.  0 = the whole prompt but the last position.
+@@ -542,6 +545,10 @@
+                  "  --expert-cache-device1 N  pre-fill N experts on CUDA1 (experimental)\n"
+                  "  --expert-cache-device2 N  pre-fill N more experts on CUDA2\n"
+                  "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
++                 "  --prefill-main         in a layer split, run the WHOLE batched prompt on the main GPU and\n"
++                 "                       hand the stages their state afterwards (they keep their VRAM for\n"
++                 "                       their expert caches).  Decode stays split.  Measured on 2x RTX 5090\n"
++                 "                       Laptop (PCIe 5.0 x8 + TB5): the split's prefill 990 -> 1520 tok/s.\n"
+                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
+                  "                       layers across CUDA1..3 (default: stripe)\n"
+                  "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
+@@ -947,9 +954,15 @@
+ // The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
+ // reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
+ // carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).
++//
++// A single burst is not enough.  On one x16 PCIe 4.0 laptop link the same binary read 18.5 GB/s on one start and
++// 5.8-6.9 GB/s on another (concurrent copy-engine work, ASPM/low link power, or a context that has not ramped);
++// the low sample then pins pcie_frac ~3x below what tools/calibrate.py picks for the same machine.  Prime the
++// link, then take the MEDIAN of several bursts so one contended sample cannot decide the load's share.
+ double probe_pcie_h2d_gbps() {
+     constexpr size_t kBytes = 256ull << 20;
+-    constexpr int kIters = 4;
++    constexpr int kWarm = 2;      // untimed: context up, copy engine and link ramped
++    constexpr int kRuns = 5;      // timed bursts; the median of these is the result
+     void* h = nullptr;
+     void* d = nullptr;
+     cudaEvent_t ev0, ev1;
+@@ -961,19 +974,29 @@
+         return -1.0;
+     }
+     std::memset(h, 0, kBytes);   // fault the pages in before timing
+-    cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);   // warmup: context up, copy engine primed
+-    cudaEventRecord(ev0);
+-    for (int i = 0; i < kIters; ++i) cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
+-    cudaEventRecord(ev1);
+-    const bool ok = cudaEventSynchronize(ev1) == cudaSuccess;
+-    float ms = 0.f;
+-    const bool timed = ok && cudaEventElapsedTime(&ms, ev0, ev1) == cudaSuccess && ms > 0.01f;
+-    const double bw = timed ? ((double) kIters * (double) kBytes / (ms * 1e-3)) / 1e9 : -1.0;
++    for (int i = 0; i < kWarm; ++i) cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
++    double bw[kRuns];
++    int n = 0;
++    for (int i = 0; i < kRuns; ++i) {
++        cudaEventRecord(ev0);
++        cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
++        cudaEventRecord(ev1);
++        float ms = 0.f;
++        if (cudaEventSynchronize(ev1) == cudaSuccess && cudaEventElapsedTime(&ms, ev0, ev1) == cudaSuccess &&
++            ms > 0.01f) {
++            bw[n++] = ((double) kBytes / (ms * 1e-3)) / 1e9;
++        }
++    }
++    double median = -1.0;
++    if (n > 0) {
++        std::sort(bw, bw + n);
++        median = (n % 2 == 1) ? bw[n / 2] : 0.5 * (bw[n / 2 - 1] + bw[n / 2]);
++    }
+     cudaEventDestroy(ev0);
+     cudaEventDestroy(ev1);
+     cudaFree(d);
+     cudaFreeHost(h);
+-    return bw;
++    return median;
+ }
+ 
+ }  // namespace
+@@ -1128,6 +1151,7 @@
+         }
+         else if (a == "--no-split-rows") o.no_split_rows = true;
+         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
++        else if (a == "--prefill-main") o.prefill_main = true;
+         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
+         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
+         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
+@@ -1257,7 +1281,10 @@
+     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
+         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
+                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
+-    if (o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0 && !o.layer_split.empty()) {
++    // local: with --prefill-main CUDA0's session holds every layer, so it is parked whole (the stage's layers are
++    // synced into it first and copied back out after a restore)
++    if (o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0 && !o.layer_split.empty() &&
++        !o.prefill_main) {
+         std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-cache-mib 0\n");
+         return 2;
+     }
+@@ -1338,6 +1365,11 @@
+         std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
+         return 2;
+     }
++    // STRATA_PREFILL_MAIN: in a layer split, the whole batched prompt runs on the MAIN device (CUDA0) for all
++    // layers, and the later stage's session receives its layers' state through session_copy_layers after
++    // each batched prompt segment.  The later stage keeps its VRAM for its expert cache instead of the
++    // prompt-path buffers it no longer needs; decode stays split across the cards.
++    const bool prefill_main = multi_gpu && o.prefill_main;
+     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
+     // split, the visible GPUs no stage runs on, in order
+     int remote_dev[3] = {1, 2, 3};
+@@ -2424,7 +2456,12 @@
+         std::vector<std::pair<int32_t, int32_t>> mine;
+         for (const auto& pr : profile) {
+             const int st = stage_of(pr.first);
+-            (st == 0 ? mine : stages[(size_t) st - 1]->profile).push_back(pr);
++            // --prefill-main with STRATA_PM_SHARE=1: CUDA0's cache also keeps the ranked pairs of the later
++            // layers (its prompt path reads them; its decode loses those slots).  Default: its own layers only,
++            // the later layers stream over CUDA0's link during a prompt.  (PR #269 had this test inverted.)
++            static const bool pm_share = std::getenv("STRATA_PM_SHARE") != nullptr && std::getenv("STRATA_PM_SHARE")[0] == '1';
++            if (st == 0 || (prefill_main && pm_share)) mine.push_back(pr);
++            if (st > 0) stages[(size_t) st - 1]->profile.push_back(pr);
+         }
+         profile.swap(mine);
+         for (size_t i = 0; i < stages.size(); ++i) {
+@@ -2439,7 +2476,7 @@
+     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
+     {
+         const strata::core::OnDevice on0(0);
+-        const int64_t hi0 = multi_gpu ? split_at[0] : -1;
++        const int64_t hi0 = multi_gpu && !prefill_main ? split_at[0] : -1;   // --prefill-main: CUDA0 reads every layer of a prompt
+         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+             std::fprintf(stderr, "strata generate: session state allocation failed\n");
+             return 1;
+@@ -3610,6 +3647,11 @@
+     // Plan v0.3 P4: with a PROFILE-filled cache the residency is static, so the hit decision moves onto the
+     // device and the token graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
+     std::vector<int32_t> host_res;
++    // STRATA_PREFILL_MAIN: the batched prompt path sees the later stages' residency masked out in place in
++    // host_res (their slot ids mean their own device's arena); the true table is restored before the windows.
++    // The prefill reads the LIVE host_res (lent slots stream during a prompt, refills land in it) - a stale
++    // copy once read lent workspace bytes as expert weights.
++    std::vector<int32_t> host_res_true;
+     int32_t* d_res = nullptr;
+     int32_t* d_hit_count = nullptr;
+     strata::core::TokenHits thits;
+@@ -3880,9 +3922,13 @@
+         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
+         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
+         if (pf_borrow && d_res != nullptr) {
+-            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
+-            for (auto& st : stages)
+-                pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
++            // --prefill-main: only CUDA0 reads prompts, so only its cache lends, and the residency rows it may
++            // mark are every layer's (the later layers' rows name CUDA0's own slots while a prompt is read)
++            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu && !prefill_main ? split_at[0] : g.n_layers,
++                                -1, -1, 0, {}});
++            if (!prefill_main)
++                for (auto& st : stages)
++                    pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
+             // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
+             // 128-slot floor.  The percentage cap is an AUTO-chunk rule and only the auto scan applies it - an
+             // explicit --prefill is the operator's number, and a loan of it only has to fit.  With one participant
+@@ -3983,7 +4029,7 @@
+         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
+         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
+-            for (size_t i = 0; i < stages.size(); ++i) {
++            for (size_t i = 0; i < stages.size() && !prefill_main; ++i) {   // --prefill-main: no stage prompt paths
+                 GpuStage& st = *stages[i];
+                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
+                 const strata::core::OnDevice on(st.dev);
+@@ -4000,7 +4046,10 @@
+                     return err.find("do not fit") != std::string::npos ? 2 : 1;
+                 }
+             }
+-            if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
++            if (multi_gpu) {
++                if (prefill_main) sp.set_stage(0, -1, nullptr);   // all layers on the main device
++                else sp.set_stage(0, split_at[0], &stages[0]->sp);
++            }
+             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
+                 return err.find("do not fit") != std::string::npos ? 2 : 1;
+             return 0;
+@@ -4012,7 +4061,7 @@
+             // failed to launch on gfx1201 and the prompt hung).  `bytes_needed` is the same count `init` makes.
+             const int64_t kHeadroom = 512ll << 20;
+             auto own_fits = [&](int64_t c, int& dev_out, int64_t& need_out, int64_t& free_out) -> bool {
+-                for (size_t i = 0; i <= stages.size(); ++i) {
++                for (size_t i = 0; i <= (prefill_main ? 0 : stages.size()); ++i) {   // --prefill-main: CUDA0 alone
+                     const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
+                     if (loan) continue;
+                     const int dev = i == 0 ? -1 : stages[i - 1]->dev;
+@@ -4242,6 +4291,35 @@
+         strata::core::ConversationCache conversations(
+             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
+             (size_t) o.conversation_cache_slots);
++        // --prefill-main: CUDA0's session holds every layer and is the whole-model state at rest (checkpoints and
++        // parked conversations are taken from it alone).  Decode and window reads advance only the stage's copy of
++        // layers [K, 48), so `pm_stage_ahead` says when CUDA0's copy of them is behind and must be synced first.
++        bool pm_stage_ahead = false;
++        int64_t pm_synced = 0;   // the cells up to which both sessions' copies of layers [K, 48) agree
++        static const bool pm_trace = std::getenv("STRATA_TRACE") != nullptr;
++        // `cell_hi`: how many cells the sender holds; only [pm_synced, cell_hi) of the streamed K/V moves
++        auto pm_sync = [&](bool to_stage, std::string& e, int64_t cell_hi) -> bool {
++            const auto t_cp = Clock::now();
++            const int64_t c0 = pm_synced;
++            const bool ok = to_stage ? strata::core::session_copy_layers(stages[0]->ss, ss, g, split_at[0], g.n_layers,
++                                                                        0, stages[0]->dev, e, c0, cell_hi)
++                                     : strata::core::session_copy_layers(ss, stages[0]->ss, g, split_at[0], g.n_layers,
++                                                                        stages[0]->dev, 0, e, c0, cell_hi);
++            if (ok) {   // both copies agree now
++                pm_stage_ahead = false;
++                pm_synced = cell_hi;
++            }
++            if (pm_trace) {
++                std::fprintf(stderr, "strata trace: prefill-main %s copy of cells [%lld, %lld) in %.1f ms\n",
++                             to_stage ? "to-stage" : "to-main", (long long) c0, (long long) cell_hi,
++                             std::chrono::duration<double, std::milli>(Clock::now() - t_cp).count());
++                std::fflush(stderr);
++            }
++            return ok;
++        };
++        auto pm_main_whole = [&](std::string& e, int64_t cell_hi) -> bool {
++            return !prefill_main || !pm_stage_ahead || pm_sync(false, e, cell_hi);
++        };
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+         auto park_current = [&](size_t held) -> bool {
+@@ -4287,6 +4365,11 @@
+                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
+                     return true;
+                 }
++                if (prefill_main) {   // CUDA0's session is what gets parked: whole first, and the drafter's device idle
++                    if (!pm_main_whole(err, (int64_t) live.size())) return false;
++                    const strata::core::OnDevice on(stages.back()->dev);   // the draft K/V is read from here
++                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "prefill-main: stage sync before parking failed"; return false; }
++                }
+                 strata::core::SavedConversation image;
+                 size_t reused_bytes = 0;
+                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), err,
+@@ -4339,6 +4422,10 @@
+                 c.dead = std::move((*parts)[0].dead);
+                 c.block_pos = std::move((*parts)[0].block_pos);
+                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
++            } else if (prefill_main) {
++                std::string e;
++                if (!pm_main_whole(e, L)) { std::fprintf(stderr, "strata serve: %s\n", e.c_str()); return false; }
++                if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+             } else {
+                 if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
+@@ -4361,12 +4448,42 @@
+             }
+             return true;
+         };
++        void* pm_rows = nullptr;      // --prefill-main: the drafter's copy of a chunk's rows (last stage's device)
+         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+             std::vector<int32_t> nxt((size_t) T);
+             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
+-            // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
++            // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last
++            // stage; STRATA_PREFILL_MAIN: the main device's rows cover all layers, so it qualifies too)
+             const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+-            if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
++            // local port: with --prefill-main the rows are on CUDA0 but the drafter lives on the last stage, and
++            // GeForce cards have no peer access, so its kernels cannot read them there: copy them over in pieces of
++            // kPmRows rows (a small buffer: the last stage's VRAM is already spoken for by its cache)
++            if (prefill_main && !batched && e.empty()) {
++                constexpr int64_t kPmRows = 256;
++                const uint64_t row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);
++                const int ddev = stages.back()->dev;
++                if (pm_rows == nullptr) {
++                    const strata::core::OnDevice on(ddev);
++                    if (cudaMalloc(&pm_rows, (size_t) (kPmRows * row_bytes)) != cudaSuccess) {
++                        pm_rows = nullptr;
++                        e = "prefill-main: the drafter's row buffer does not fit";
++                        return false;
++                    }
++                }
++                {
++                    const strata::core::OnDevice on(0);
++                    cudaDeviceSynchronize();   // the prompt path's streams must be done writing the rows
++                }
++                for (int64_t i = 0; i < T; i += kPmRows) {
++                    const int64_t m = std::min<int64_t>(kPmRows, T - i);
++                    if (const cudaError_t ce = cudaMemcpyPeer(pm_rows, ddev, (const uint8_t*) R_rows + i * row_bytes, 0,
++                                                              (size_t) (m * row_bytes)); ce != cudaSuccess) {
++                        e = std::string("prefill-main: rows to the drafter: ") + cudaGetErrorString(ce);
++                        return false;
++                    }
++                    if (!mtp.prefill((const float*) pm_rows, nxt.data() + i, m, p0 + i, e)) return false;
++                }
++            } else if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+             if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
+                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
+                              batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
+@@ -4380,7 +4497,7 @@
+             std::fflush(stdout);
+             if (o.prompt_cache_every > 0 && done >= pp_next_check) {
+                 bool saved = false;
+-                if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
++                if (multi_gpu && !prefill_main) {   // the stages' parts, saved when each of them read this chunk
+                     std::vector<ConvCheckpoint> parts;
+                     {
+                         std::lock_guard<std::mutex> lk(part_mu);
+@@ -4399,7 +4516,7 @@
+             }
+             return true;
+         };
+-        if (multi_gpu) {   // the batched prompt is reported by its last stage (the drafter's rows are there)
++        if (multi_gpu && !prefill_main) {   // STRATA_PREFILL_MAIN: on_chunk stays on the main sp (its rows are the last stage's)
+             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
+             sp.on_chunk = nullptr;
+             for (size_t i = 0; i <= stages.size(); ++i) {
+@@ -4934,6 +5051,11 @@
+                              (long long) resume, from_live ? "live" : "checkpoint",
+                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                              conversations.size(), conversations.bytes());
++                pm_synced = 0;   // the stage's copy is replaced whole
++                if (prefill_main && !pm_sync(true, err, (int64_t) live.size())) {
++                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
++                    return 1;
++                }
+             }
+             if (want_cvec != cvec_cached) {
+                 live_ok = false;
+@@ -4956,6 +5078,8 @@
+                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                     cudaStreamSynchronize(st->stream);
+                 }
++                pm_stage_ahead = false;   // both sessions start empty
++                pm_synced = 0;
+                 checks.clear();
+             } else if (!from_live) {
+                 ConvCheckpoint* c = nullptr;
+@@ -4978,6 +5102,12 @@
+                     reread_to = resume;
+                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
+                                          "restoring\n", (long long) resume);
++                } else if (prefill_main) {
++                    pm_synced = 0;   // the stage's copy is replaced whole
++                    if (c == nullptr || !checkpoint_restore(*c, ss, g) || !pm_sync(true, err, resume)) {
++                        std::printf("ERR restoring a conversation checkpoint failed\n");
++                        return 1;
++                    }
+                 } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+                            [&] {
+                                for (size_t i = 0; i < stages.size(); ++i) {
+@@ -5231,6 +5361,28 @@
+                         if (i >= o.prompt_cache_root) root_at = i;
+                         break;
+                     }
++            // --prefill-main (local port of PR #269): while CUDA0's batched path computes the later stages' layers,
++            // the residency must not name THEIR slots - those ids mean the stage's arena, and the shared pool reads
++            // this very array.  Those rows name CUDA0's own slots instead (none unless STRATA_PM_SHARE=1); what CUDA0
++            // does not hold streams, as on one GPU.  Window reads and the verify windows see the true table.
++            bool pm_masked = false;
++            auto pm_mask = [&](bool on) {
++                if (!prefill_main || host_res.empty() || pm_masked == on) return;
++                if (on) {
++                    // the true table as of NOW: a window read earlier in this request may have run adapt swaps,
++                    // so land every pending swap first and snapshot after it (a snapshot from the request's start
++                    // would be restored over those swaps, naming slots that now hold other experts)
++                    apply_pending(true);
++                    host_res_true = host_res;
++                }
++                for (int64_t l = split_at[0]; l < g.n_layers; ++l)
++                    for (int64_t e = 0; e < g.n_expert; ++e) {
++                        const size_t i = (size_t) (l * g.n_expert + e);
++                        host_res[i] = on ? xcache.slot_of(l, e) : host_res_true[i];
++                    }
++                pm_masked = on;
++                res_upload();
++            };
+             int64_t at = read_from;
+             for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
+                 if (to <= at) continue;
+@@ -5240,12 +5392,22 @@
+                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                     return 1;
+                 }
++                if (win) pm_mask(false);
++                if (!win && prefill_main) {
++                    if (!pm_main_whole(err, at)) {
++                        std::fprintf(stderr, "strata serve: %s\n", err.c_str());
++                        std::printf("ERR %s\n", err.c_str());
++                        return 1;
++                    }
++                    pm_mask(true);
++                }
+                 if (!win && !lend(to - at, err)) {
+                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                     return 1;
+                 }
+                 const auto tsp = Clock::now();
+                 const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
++                if (prefill_main && win) pm_stage_ahead = true;   // the windows advanced only the stage's layers
+                 if (trace) {
+                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
+                                  win ? "windows" : "batched",
+@@ -5268,6 +5430,13 @@
+                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
+                     break;
+                 }
++                // a batched read ran every layer on CUDA0: hand the stage its layers' state before anything reads
++                // or saves it
++                if (prefill_main && !win && !pm_sync(true, err, to)) {
++                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
++                    std::printf("ERR %s\n", err.c_str());
++                    return 1;
++                }
+                 at = to;
+                 if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                     std::printf("ERR saving a conversation checkpoint failed\n");
+@@ -5278,6 +5447,8 @@
+                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                 return 1;
+             }
++            pm_mask(false);   // the verify windows see the true residency again
++            if (prefill_main) pm_stage_ahead = true;   // decode advances only the stage's layers from here
+             tr("prompt done (slots refilled)");
+             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
+@@ -5624,6 +5795,21 @@
+                                      "from RAM%s\n", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
+                              (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
+                              over ? " - OVERFLOW (too few resident cells)" : "");
++                for (auto& st : stages) {   // a split's later stages: their own layers' counters
++                    const strata::core::OnDevice on(st->dev);
++                    uint64_t smiss = 0, slook = 0;
++                    bool sover = false;
++                    for (int64_t j = 0; j < st->ss.qsa_alloc; ++j) {
++                        const strata::kernels::KvStreamCounters c =
++                            strata::kernels::kv_stream_counters(st->ss.qsa_states[st->ss.qsa_ord0 + j].map);
++                        smiss += c.misses; slook += c.lookups; sover = sover || c.overflow;
++                    }
++                    std::fprintf(stderr, "strata serve: KV streaming (CUDA%d): %.2f%% of %llu block reads hit VRAM, %.1f MiB "
++                                         "read from RAM%s\n", st->dev,
++                                 slook ? 100.0 * (double) (slook - smiss) / (double) slook : 100.0,
++                                 (unsigned long long) slook, (double) smiss * 4224.0 / 1048576.0,
++                                 sover ? " - OVERFLOW (too few resident cells)" : "");
++                }
+             }
+             if (sfx_windows > 0)
+                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",

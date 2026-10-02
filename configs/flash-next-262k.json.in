@@ -1,0 +1,40 @@
+{
+ "exe": "build/strata",
+ "args": [
+  "--pack", "packs/gsq-iq3_xxs",
+  "--native", "@MODELS@/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "--ple-gguf", "@MODELS@/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+  "--expert-profile", "data/expert-profile.bin",
+  "--expert-cache", "auto",
+  "--mmap-experts",
+  "--prefill", "auto:32768",
+  "--spec", "4",
+  "--spec-min-p", "0.8",
+  "--mtp", "mtp/rt",
+  "--max-context", "262144",
+  "--kv", "int8",
+  "--kv-resident", "32768",
+  "--vision",
+  "--vram-reserve-mib", "700",
+  "--prefill-main",
+  "--conversation-cache-mib", "6144",
+  "--conversation-cache-slots", "4"
+ ],
+ "gpu": [0, 1],
+ "layer_split": "36",
+ "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+ "env": {"STRATA_BLOB_PREAD": "1"},
+ "cwd": ".",
+ "tokenizer": "packs/gsq-iq3_xxs/tokenizer",
+ "model_name": "qwen3.8-flash-next",
+ "log": "strata-flash-next-262k.log",
+ "host": "0.0.0.0",
+ "port": 8888,
+ "vision": {
+  "exe": "build-vision/bin/strata-vision",
+  "mmproj": "@MODELS@/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+  "model": "@MODELS@/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "gpu": true,
+  "max_tokens": 1024
+ }
+}

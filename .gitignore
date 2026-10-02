@@ -1,0 +1,5 @@
+strata/
+models/
+*.log
+*.out
+__pycache__/
