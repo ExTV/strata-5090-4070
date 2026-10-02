@@ -2,16 +2,17 @@
 
 Qwen3.8-Flash-Next (the 3-bit ISTA GSQ-RCO GGUF, 76 GB of experts) with the **full 262,144-token
 context** on an RTX 5090 32 GB plus an RTX 4070 Ti SUPER 16 GB in a chipset x1 slot, 31 GB of RAM,
-served by [Strata](https://github.com/Niko1221/Strata) 0.1.33 with four patches.
+served by [Strata](https://github.com/Niko1221/Strata) 0.1.37 with three patches and its fused prompt kernels
+switched on.
 
 What you get on this hardware (details and every measurement in [docs/benchmarks.md](docs/benchmarks.md)):
 
 | | stock Strata 0.1.33, layer split 36 | this repo |
 | --- | --- | --- |
-| 80K-token fresh prompt | 886-928 tok/s (the 4070 at 100%, the 5090 idle) | **1,796 tok/s** (45 s) |
-| 16K fresh prompt | 470-646 tok/s | **985 tok/s** |
-| 2K fresh prompt | 200-240 tok/s | **350-375 tok/s** |
-| follow-up on an 80K conversation | 7.8 s | **6.1 s** |
+| 80K-token fresh prompt | 886-928 tok/s (the 4070 at 100%, the 5090 idle) | **1,970-1,990 tok/s** (41 s) |
+| 16K fresh prompt | 470-646 tok/s | **1,210-1,240 tok/s** |
+| 2K fresh prompt | 200-240 tok/s | **355-372 tok/s** |
+| follow-up on an 80K conversation | 7.8 s | **5.8 s** |
 | decode, 600-token answers, thinking off | 99-111 tok/s median | 95-108 at temperature 0, **128-134 sampled** at spec-min-p 0.7-0.8 |
 | switching between two conversations (30K and 15K) | re-reads the other one: 20-48 s | **0.6-1.2 s** |
 | major page faults per benchmark run | 16-24 M (the box swaps) | **14 K** |
@@ -21,30 +22,33 @@ cards (the x1 card becomes the prompt bottleneck), and on a box with less RAM th
 pays a page fault per 4 KB of expert weight whenever the kernel drops its readahead hint. The
 patches change that:
 
-- `patches/01-upstream-0.1.35-server-stager-and-mmq-guard.patch`: `serve/server.py`,
-  `moe_mmq.cu` and `moe_mmq.hpp` exactly as in Strata v0.1.35 (client-disconnect cancel #430,
-  per-request draft stats #457/#460, the MMQ tile guard #420), plus the stager DMA wait fix from
-  the still-open PR #385.
-- `patches/02-pcie-probe-median-pr487.patch`: the still-open PR #487 (the PCIe probe takes the
-  median of several primed bursts instead of one). It changes `pcie_frac` for any layer split.
-- `patches/03-prefill-main-and-parking-with-layer-split.patch`: `--prefill-main` reads the whole
-  prompt on the big card (port of Strata PR #269, closed unmerged, onto 0.1.33's carved sessions)
-  and copies the small card's share of the state afterwards, only the cells in use; conversation
-  parking works with the split (the big card's session is parked, the small card's state is copied
-  back on restore). Cost: the big card's session spans all 48 layers, so the pinned host K/V of
-  the small card's 12 layers exists twice, about 0.77 GiB of extra pinned RAM (3.09 GiB for 48
-  layers in the launch log) and a few hundred MB of VRAM.
-- `patches/04-pread-expert-blobs.patch`: with `STRATA_BLOB_PREAD=1` the expert pool reads each
+- `patches/01-stager-dma-wait-pr385.patch`: the stager DMA wait fix from the still-open PR #385
+  (a stager buffer's first job of a generation waits for the previous DMA).
+- `patches/02-prefill-main-and-parking-with-layer-split.patch`: `--prefill-main` reads the whole
+  prompt on the big card (port of Strata PR #269, closed unmerged, onto the carved sessions of
+  0.1.33 and later) and copies the small card's share of the state afterwards, only the cells in
+  use; conversation parking works with the split (the big card's session is parked, the small
+  card's state is copied back on restore). Cost: the big card's session spans all 48 layers, so
+  the pinned host K/V of the small card's 12 layers exists twice, about 0.77 GiB of extra pinned
+  RAM (3.09 GiB for 48 layers in the launch log) and a few hundred MB of VRAM.
+- `patches/03-pread-expert-blobs.patch`: with `STRATA_BLOB_PREAD=1` the expert pool reads each
   expert's slices with `pread` instead of `memcpy` through the mmap, so a cold expert costs one
   request instead of up to 500 synchronous page faults. Together with `--prefill auto:32768` this is
   what took the 80K prompt from 510-700 tok/s to 1,796.
 
-All four patches apply in order to a pristine v0.1.33 checkout; `patches/MANIFEST.sha256` holds the
-sha256 of the 11 patched files as tested, `install.sh` checks it, and the CI job does the same against
-the upstream tag. PR #439 (batched expert gathers) is deliberately **not** included: under
-`--prefill-main` it deadlocks on the second prompt chunk of a fully streamed layer
-([docs/how-it-works.md](docs/how-it-works.md)). `STRATA_PM_SHARE=1` (patch 03) is an experiment that
-lost on decode and has an unreviewed interaction with the residency snapshot; do not use it.
+Not a patch but in the shipped config: `STRATA_PF_FUSED=1`, Strata 0.1.36's fused int8 tensor-core
+prompt kernels for the native IQ packs (opt-in upstream, "about even" on their RTX 5070 for the IQ3
+sizes). Every expert tensor type in this GGUF is covered, and on this box they are worth another
++9% at 80K, +13% at 16K and 0.9 s on the 80K follow-up, with decode unchanged.
+
+All three patches apply in order to a pristine v0.1.37 checkout; `patches/MANIFEST.sha256` holds the
+sha256 of the 8 patched files as tested, `install.sh` checks it, and the CI job does the same against
+the upstream tag. The earlier release of this repo targeted v0.1.33 and also carried the 0.1.35 server
+hunks and PR #487 (PCIe probe); both are upstream now (#485 replaced #487). PR #439 (batched expert
+gathers) is deliberately **not** included: under `--prefill-main` it deadlocks on the second prompt
+chunk of a fully streamed layer ([docs/how-it-works.md](docs/how-it-works.md)). `STRATA_PM_SHARE=1`
+(patch 02) is an experiment that lost on decode and has an unreviewed interaction with the residency
+snapshot; do not use it.
 
 ## What you need
 
@@ -59,7 +63,7 @@ lost on decode and has an unreviewed interaction with the residency snapshot; do
 
 ```bash
 git clone https://github.com/ExTV/strata-5090-4070.git && cd strata-5090-4070
-./install.sh            # clones Strata v0.1.33 into ./strata, patches, builds engine + vision helper, venv
+./install.sh            # clones Strata v0.1.37 into ./strata, patches, builds engine + vision helper, venv
 ```
 
 `JOBS=3` by default (each CUDA compile job takes ~3 GB of RAM). `MODELS=` sets where the GGUF

@@ -1,6 +1,8 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 307edd9..51951a5 100644
 --- a/include/strata/core/expert_source.hpp
 +++ b/include/strata/core/expert_source.hpp
-@@ -514,6 +514,8 @@
+@@ -518,6 +518,8 @@ private:
      std::vector<Map> maps_;
      std::vector<const uint8_t*> role_ptr_;    ///< 3 x n_layers: gate / up / down of the layer's expert 0
      std::vector<uint64_t> role_bytes_;        ///< 3 x n_layers: bytes per expert of that role
@@ -9,6 +11,8 @@
      // the blobs assembled for `blob()`: a small pool of buffers, one per recent (layer, expert).  A buffer is
      // reused only once `kStageAge` layer changes have passed since its blob was last asked for, so a pointer holds
      // through the layer it was asked in and the next ones (the pool computes a layer's misses before the next).
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 087854e..e884809 100644
 --- a/src/core/expert_source.cpp
 +++ b/src/core/expert_source.cpp
 @@ -15,6 +15,7 @@
@@ -19,7 +23,7 @@
  #include <chrono>
  #include <cstdio>
  #include <cstdlib>
-@@ -571,6 +572,8 @@
+@@ -571,6 +572,8 @@ bool FileExpertSource::open_gguf(std::string& err) {
      std::map<std::string, size_t> index;
      role_ptr_.assign((size_t) (3 * n_layers_), nullptr);
      role_bytes_.assign((size_t) (3 * n_layers_), 0);
@@ -28,7 +32,7 @@
      for (int64_t l = 0; l < n_layers_; ++l) {
          const auto& fm = lay.fmt[(size_t) l];
          const uint64_t per[3] = {fm.up_off, fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
-@@ -630,6 +633,10 @@
+@@ -630,6 +633,10 @@ bool FileExpertSource::open_gguf(std::string& err) {
              }
              role_ptr_[i] = m.base + (size_t) at;
              role_bytes_[i] = per[r];
@@ -39,7 +43,7 @@
          }
      }
      base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
-@@ -641,10 +648,28 @@
+@@ -641,10 +648,28 @@ bool FileExpertSource::open_gguf(std::string& err) {
  bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
      if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
      if (!role_ptr_.empty()) {

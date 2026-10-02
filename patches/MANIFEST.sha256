@@ -1,11 +1,8 @@
-13bd68a0dbe76a2bf3b2349f6c172e5cce0bd22d8ca6bb8b3f3e67ca025b8acd  ./include/strata/core/expert_source.hpp
+c632f422193b8d9af689bcda15454691ff82fbb352d46cede406361a735c0311  ./src/prefill/prefill.cpp
 85093cae2e4afd5adc72172e69f858d0344d21c880e9a88f6d09b32d95ce7eed  ./include/strata/core/session.hpp
 9d46d21b62e6d9a3fde3fd84c166cf26fbe36d1821584ac56b8e27f48525dee3  ./include/strata/kernels/kv_stream.hpp
-80ed21172093dc0b06e747e79861a0dd0eed867a306708e205dd731be055f122  ./include/strata/prefill/moe_mmq.hpp
-9d226296f29ac2c2690ace6f95df50803f4bacb16d76a0b7da7a887e71203e92  ./serve/server.py
-4bcb139a41b5463f8fab2af1ea3429f0aa53c1bf28bf0633256cf60b84ba9918  ./src/core/expert_source.cpp
-3af18c7260d66a36200a38e8fa41c68bae328dfbf7084791faa723f425df873e  ./src/core/session.cpp
 0823074ecf16e3f653eff50888b9fa988e4ba6fe28b4174b28639bcaa6207afc  ./src/kernels/cuda/kv_stream.cu
-4081e0a6f70d8103fac5566aa32e81b859ab8338052e194574184d223bac420c  ./src/prefill/moe_mmq.cu
-655546f958dbf41d45fb56fb9a51612a6761e7ad8144f242681705e167cc4af1  ./src/prefill/prefill.cpp
-40ba92f3a7dfdb9b0031ba2916a79691f5ba53334736bc4d035103005e6033a1  ./src/program/generate.cpp
+3af18c7260d66a36200a38e8fa41c68bae328dfbf7084791faa723f425df873e  ./src/core/session.cpp
+61dfa3a8429420bd28b75f846181d30508d56d5eb7f0840659fc8b4bba522333  ./src/program/generate.cpp
+d010b279c01f34bb9e9a5b31f30317b6cc0a1c16c3f4a4a226c05bfa24cadd92  ./include/strata/core/expert_source.hpp
+107413b19892da38bdf5a1e282d45adc1984d1df4a76ff1375db139ce5f4e2f0  ./src/core/expert_source.cpp

@@ -1,11 +1,11 @@
-name: patches apply to Strata v0.1.33
+name: patches apply to Strata v0.1.37
 on: [push, pull_request]
 jobs:
   dry-run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: git clone --branch v0.1.33 --depth 1 https://github.com/Niko1221/Strata.git strata
+      - run: git clone --branch v0.1.37 --depth 1 https://github.com/Niko1221/Strata.git strata
       - name: apply every patch in order, then check the manifest
         run: |
           cd strata

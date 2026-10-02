@@ -82,7 +82,7 @@ either. Two things did:
 1. **Prompt chunk size.** Each chunk re-streams the experts of every layer, so an 80K prompt in
    8,192-token chunks streams the ~15 GB working set ten times. `--prefill auto:32768` streams it
    three times: 510 -> 1,451 tok/s and 24 M -> 1.1 M faults on the same afternoon (16384: 1,337).
-2. **`pread` instead of page faults** (`patches/04-pread-expert-blobs.patch`, on with
+2. **`pread` instead of page faults** (`patches/03-pread-expert-blobs.patch`, on with
    `STRATA_BLOB_PREAD=1`). Strata's pool copied each expert's three role slices out of the mmap with
    `memcpy`, after a `madvise(MADV_WILLNEED)` hint. Under memory pressure the kernel throttles or
    drops that readahead, and the copy then takes one major fault per 4 KB page with 64 KB
@@ -94,3 +94,24 @@ either. Two things did:
 
 Both GPUs are now busy during a prompt instead of waiting on the pool. Not needed after these:
 `MADV_RANDOM`, locking the heap, readahead changes, moving the swap file.
+
+## Upstream 0.1.37 and the fused prompt kernels
+
+The first release of this repo sat on 0.1.33. Upstream 0.1.36 added fused int8 tensor-core kernels
+for the prompt path's experts (#136): on by default for the Q2_0 pack, opt-in with `STRATA_PF_FUSED=1`
+for the native IQ packs, which the release notes called "about even" for the IQ3 sizes on an RTX 5070.
+Strata issue #519 then measured +13-23% on IQ3_XXS prompts on an RTX 5090, with every expert resident
+in 96 GB of RAM. The three patches here reapply to v0.1.37 with line offsets only (PR #385, the
+prefill-main and parking port, pread); the PCIe-probe patch was dropped because 0.1.37 carries its
+own fix (#485), and the 0.1.35 server hunks are upstream.
+
+The fused path runs for a prompt chunk of 1,024 tokens or more (`STRATA_PREFILL_STREAM_MIN`) whose
+layer streams all of its non-resident experts, and only for layers whose gate/up and down tensor
+types the kernels cover (gate/up IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; down Q2_0, IQ4_NL).
+The RCO allocation of this GGUF uses exactly those types in all 48 layers, so every layer takes it;
+the engine logs `prompt experts on the fused int8 kernels` on the first prompt. Against MMQ on the
+same 0.1.37 build, two rounds each, alternated: 80K 1,826 -> 1,969-1,994 tok/s, 16K 1,080 -> 1,212-1,240,
+2K 340 -> 355-372, the 80K follow-up 6.7 -> 5.8 s, decode unchanged (108 median, 115 after the 80K
+prompt on both). The 23% does not reproduce here because our prompts are still partly bound by expert
+streaming, not GPU compute. The needle and parking checks pass on the fused build (5/5, 8/8); the
+kernels' numerics were not compared further than that.

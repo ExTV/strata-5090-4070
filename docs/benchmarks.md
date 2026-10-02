@@ -1,7 +1,8 @@
 # Benchmarks
 
-All on 2026-10-02, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, Strata 0.1.33, ISTA
-GSQ-RCO IQ3_XXS, 262,144 context, layer split 36, int8 KV with 32,768 resident cells, vision on.
+All on 2026-10-02 (the last section 2026-10-03), RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch
+Linux, Strata 0.1.33 (0.1.37 in the last section), ISTA GSQ-RCO IQ3_XXS, 262,144 context, layer split
+36, int8 KV with 32,768 resident cells, vision on.
 `tools/bench.py`: five 600-token greedy answers with thinking off (decode median), fresh prompts of
 ~2K (twice), ~16K and ~80K tokens of random words (prefill tok/s), then a 2K follow-up on the 80K
 conversation; `tools/decode_after.py`: five more answers right after the 80K prompt. "faults" is
@@ -31,7 +32,7 @@ but runs are only identical from this commit on.
 | stock split 36 | 79 | 243 | 637 | 896 | 7.8 s | 136 |
 | prefill-main (first port) | 98 | 330 | 694 | **1,791** | 6.1 s | 84 |
 
-## Final build (patches 01 + 02, "v4") and its A/Bs, same evening
+## Final 0.1.33 build (PR #385, the 0.1.35 hunks and the prefill-main port, "v4") and its A/Bs, same evening
 
 | boot | decode median | 2K | 16K | 80K | follow-up | decode after 80K | faults |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -82,6 +83,22 @@ with spec-min-p 0.7-0.8 measured 128-134 tok/s median on the same prompts (`tool
 | --- | --- | --- | --- | --- | --- |
 | sweep 1, median tok/s | 78 | 114 | 128 | | |
 | sweep 2, median tok/s | | | 97 | 134 | 121 |
+
+## Upstream 0.1.37 base and `STRATA_PF_FUSED=1` (2026-10-03, the shipped config)
+
+The same three patches on v0.1.37, pread on, chunk 32768, spec-min-p 0.8; MMQ and the fused kernels
+alternated, two rounds each, one boot per row. The MMQ rows reproduce the 0.1.33 v5 numbers above.
+
+| | decode median | 2K | 16K | 80K | follow-up | decode after 80K |
+| --- | --- | --- | --- | --- | --- | --- |
+| MMQ, round 1 | 108 | 339 / 341 | 1,080 | 1,826 | 6.7 s | 114 |
+| MMQ, round 2 | 108 | 336 / 347 | 1,086 | 1,827 | 6.7 s | 115 |
+| **fused, round 1** | 110 | 355 / 356 | 1,212 | 1,969 | 5.9 s | 115 |
+| **fused, round 2** | 106 | 360 / 372 | **1,240** | **1,994** | **5.8 s** | 118 |
+
+Major faults per bench stayed in the 1-2 K range on every row. Correctness on the fused build: the
+40K needle with four follow-ups and the 20K extension 5/5 (follow-ups 0.4-0.7 s, the extension 15.8 s),
+the two alternating conversations 8/8 with 0.6-0.7 s switches.
 
 ## VRAM
 

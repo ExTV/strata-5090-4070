@@ -23,7 +23,7 @@
  "gpu": [0, 1],
  "layer_split": "36",
  "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
- "env": {"STRATA_BLOB_PREAD": "1"},
+ "env": {"STRATA_BLOB_PREAD": "1", "STRATA_PF_FUSED": "1"},
  "cwd": ".",
  "tokenizer": "packs/gsq-iq3_xxs/tokenizer",
  "model_name": "qwen3.8-flash-next",

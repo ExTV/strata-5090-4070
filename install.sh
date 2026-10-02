@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Clones Strata v0.1.33 into ./strata, applies the patches in patches/, builds the engine and the vision helper
+# Clones Strata v0.1.37 into ./strata, applies the patches in patches/, builds the engine and the vision helper
 # for an RTX 5090 (sm_120) + RTX 4070 Ti SUPER (sm_89), makes the Python venv, and writes the server config
 # from configs/flash-next-262k.json.in with $MODELS filled in.  Safe to re-run: patches already applied are
 # skipped and cmake only rebuilds what changed.  The expert pack and the MTP drafter are built by prepare.sh.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-STRATA_TAG=${STRATA_TAG:-v0.1.33}
+STRATA_TAG=${STRATA_TAG:-v0.1.37}
 MODELS=${MODELS:-$PWD/models}
 CUDA_ARCHS=${CUDA_ARCHS:-"89;120"}
 JOBS=${JOBS:-3}          # a cicc/nvcc job takes ~3 GB of RAM; 3 jobs fit a 32 GB box next to a desktop
@@ -26,7 +26,7 @@ for p in ../patches/*.patch; do
     if patch -p1 -R --dry-run --force --quiet < "$p" >/dev/null 2>&1; then
         echo "already applied  $(basename "$p")"
     elif patch -p1 --dry-run --forward --quiet < "$p" >/dev/null 2>&1; then
-        patch -p1 --forward --quiet -b -z .orig-0.1.33 < "$p"
+        patch -p1 --forward --quiet -b -z .orig-0.1.37 < "$p"
         echo "applied          $(basename "$p")"
     else
         echo "does not apply   $(basename "$p")" >&2; exit 1
@@ -52,7 +52,7 @@ cmake --build build-vision --target strata-vision -j"$JOBS"
 
 MODELS="$MODELS" python3 -c 'import os,sys; sys.stdout.write(open("../configs/flash-next-262k.json.in").read().replace("@MODELS@", os.environ["MODELS"]))' > strata-flash-next-262k.json
 echo "$MODELS" > models.path      # prepare.sh and the launcher read it, so MODELS= is needed only here
-sha256sum -c --quiet ../patches/MANIFEST.sha256 && echo "the 11 patched files match patches/MANIFEST.sha256 (the tested tree)"
+sha256sum -c --quiet ../patches/MANIFEST.sha256 && echo "the 8 patched files match patches/MANIFEST.sha256 (the tested tree)"
 echo
 echo "built: strata/build/strata, strata/build-vision/bin/strata-vision; config strata/strata-flash-next-262k.json (MODELS=$MODELS)"
 echo "next: download the model into $MODELS (README step 2), then ./prepare.sh, then launchers/flash-next-262k.sh"
