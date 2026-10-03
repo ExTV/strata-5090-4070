@@ -1,0 +1,94 @@
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index da225d3..32f923e 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -77,8 +77,10 @@ public:
+     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
+     static void set_ring_override(int slots);
+ 
+-    /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
+-    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
++    /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold). `src`: `init` gets an
++    /// ExpertSource (only then can a chunk take the fused layout, whose MoE buffers are smaller).
++    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
++                                 bool src = true);
+ 
+     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
+     /// first, -1 for none) and is advanced to the last two of these.
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index dc35c2b..dd9ae26 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -950,8 +950,9 @@ void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+ void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
+ double Prefill::pinned_share() { return g_pinned_share; }
+ 
+-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+-    // the same allocation sequence as `init`, counted
++uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
++    // the same allocation sequence as `init` (`carve`), counted: `xn` only for the unfused hyper-connection read, `grs`
++    // always, and the MoE layout `carve` picks for the same source
+     const size_t T = (size_t) chunk;
+     bool ok = true;
+     Alloc o;
+@@ -959,7 +960,10 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
+     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+     o.take<uint8_t>(GEMM_WS, ok);
+     auto f = [&](size_t n) { o.take<float>(n, ok); };
+-    f(T * N); f(T * D); f(T * D); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
++    f(T * N); f(T * D);
++    if (gr_unfused()) f(T * D);
++    f(T * HC);
++    o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
+     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
+     if (bf16x2_hc()) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
+     if (bf16x2()) o.take<uint16_t>(T * N, ok);
+@@ -970,7 +974,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
+     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+-                                       moe_set_bytes(T, g.n_expert, fused_layout(T, true))}), ok);
++                                       moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
+     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+     if (mmq_plan().any) {
+         const MmqPlan& mp = mmq_plan();
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index f2df1d4..b50c8f5 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -3785,7 +3785,7 @@ int main(int argc, char** argv) {
+         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
+     }
+     auto lend_slots = [&](int64_t c) -> int64_t {
+-        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
++        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c, srcp != nullptr);
+         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
+@@ -3933,7 +3933,7 @@ int main(int argc, char** argv) {
+             std::vector<std::pair<int32_t, int32_t>> lent;
+         };
+         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
+-            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
++            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr);
+             strata::core::ExpertCache& xc = *p.cache;
+             if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
+                 int64_t k = 0;
+@@ -4061,7 +4061,7 @@ int main(int argc, char** argv) {
+                         const strata::core::OnDevice on(p.dev);
+                         size_t fb = 0, tb = 0;
+                         if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+-                        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
++                        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk, srcp != nullptr);
+                         if ((uint64_t) fb >= need + (3ull << 29)) {
+                             std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
+                                                  "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
+@@ -4148,7 +4148,7 @@ int main(int argc, char** argv) {
+                     const strata::core::OnDevice on(dev);
+                     size_t fb = 0, tb = 0;
+                     cudaMemGetInfo(&fb, &tb);
+-                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c);
++                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c, srcp != nullptr);
+                     if (need + kHeadroom > (int64_t) fb) {
+                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
+                         return false;

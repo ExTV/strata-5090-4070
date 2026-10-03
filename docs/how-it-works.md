@@ -82,7 +82,7 @@ either. Two things did:
 1. **Prompt chunk size.** Each chunk re-streams the experts of every layer, so an 80K prompt in
    8,192-token chunks streams the ~15 GB working set ten times. `--prefill auto:32768` streams it
    three times: 510 -> 1,451 tok/s and 24 M -> 1.1 M faults on the same afternoon (16384: 1,337).
-2. **`pread` instead of page faults** (`patches/03-pread-expert-blobs.patch`, on with
+2. **`pread` instead of page faults** (`patches/08-pread-expert-blobs.patch`, on with
    `STRATA_BLOB_PREAD=1`). Strata's pool copied each expert's three role slices out of the mmap with
    `memcpy`, after a `madvise(MADV_WILLNEED)` hint. Under memory pressure the kernel throttles or
    drops that readahead, and the copy then takes one major fault per 4 KB page with 64 KB
@@ -95,23 +95,63 @@ either. Two things did:
 Both GPUs are now busy during a prompt instead of waiting on the pool. Not needed after these:
 `MADV_RANDOM`, locking the heap, readahead changes, moving the swap file.
 
-## Upstream 0.1.37 and the fused prompt kernels
+## Upstream 0.1.38, the fused prompt kernels and six open PRs
 
-The first release of this repo sat on 0.1.33. Upstream 0.1.36 added fused int8 tensor-core kernels
-for the prompt path's experts (#136): on by default for the Q2_0 pack, opt-in with `STRATA_PF_FUSED=1`
-for the native IQ packs, which the release notes called "about even" for the IQ3 sizes on an RTX 5070.
-Strata issue #519 then measured +13-23% on IQ3_XXS prompts on an RTX 5090, with every expert resident
-in 96 GB of RAM. The three patches here reapply to v0.1.37 with line offsets only (PR #385, the
-prefill-main and parking port, pread); the PCIe-probe patch was dropped because 0.1.37 carries its
-own fix (#485), and the 0.1.35 server hunks are upstream.
+The first release of this repo sat on 0.1.33, the second on 0.1.37. Upstream 0.1.36 added fused int8
+tensor-core kernels for the prompt path's experts (#136): on by default for the Q2_0 pack, opt-in with
+`STRATA_PF_FUSED=1` for the native IQ packs. The fused path runs for a prompt chunk of 1,024 tokens or more
+whose layer streams all of its non-resident experts, and only for layers whose gate/up and down tensor
+types the kernels cover; this GGUF uses exactly those types in all 48 layers. Against MMQ on the same
+build: 80K 1,826 -> 1,969-1,994 tok/s, 16K 1,080 -> 1,212-1,240, the 80K follow-up 6.7 -> 5.8 s, decode
+unchanged. Upstream's own +23% (#519) was measured with every expert resident in 96 GB of RAM.
 
-The fused path runs for a prompt chunk of 1,024 tokens or more (`STRATA_PREFILL_STREAM_MIN`) whose
-layer streams all of its non-resident experts, and only for layers whose gate/up and down tensor
-types the kernels cover (gate/up IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; down Q2_0, IQ4_NL).
-The RCO allocation of this GGUF uses exactly those types in all 48 layers, so every layer takes it;
-the engine logs `prompt experts on the fused int8 kernels` on the first prompt. Against MMQ on the
-same 0.1.37 build, two rounds each, alternated: 80K 1,826 -> 1,969-1,994 tok/s, 16K 1,080 -> 1,212-1,240,
-2K 340 -> 355-372, the 80K follow-up 6.7 -> 5.8 s, decode unchanged (108 median, 115 after the 80K
-prompt on both). The 23% does not reproduce here because our prompts are still partly bound by expert
-streaming, not GPU compute. The needle and parking checks pass on the fused build (5/5, 8/8); the
-kernels' numerics were not compared further than that.
+0.1.38 (released 2026-10-03) merged PR #385 and brought small prompt gains. Six open PRs are applied on
+top, as patches 01-06: #603 matters most here. Strata's fast top-k over the selected attention blocks
+holds one query's keys in registers and covers 33,792 blocks, about 135K cells, on NVIDIA; a 262,144
+context has 65,536 blocks, so every prompt batch and every decode window on the 5090 took the old
+six-pass kernel. #603 adds a register-layout kernel with no size limit and the same ids. #547 makes the
+prompt path borrow 1.25 GiB fewer expert-cache slots per 32K chunk (6,243 instead of 6,939 here).
+#567 keeps the last rendered prompts and tokenises only the text after the shared prefix. #510, #572
+and #525 are server-side tool-call fixes. Same bench, 0.1.37 to 0.1.38 with the PRs: decode 110,
+2K 373-376, 16K 1,305, 80K 2,094, follow-up 5.5 s.
+
+## What the prompt loan costs, and what did not fix it
+
+The prompt path borrows 6,243 of the 5090's expert-cache slots (9.77 GiB) for its own buffers on every
+prompt; the lent experts are streamed from the file during the prompt and copied back afterwards.
+Upstream's comment on this says the loan is cheap when the lent experts are "DMA'd from pinned RAM",
+which is the 64 GB-and-up case. Here they come from the SSD, so an 80K prompt reads about 100 GB from
+NVMe, six times what the expert miss rate alone predicts. Measured on 2026-10-03, nothing in the flag
+set moves this:
+
+- `--layer-split 38`: the 4070 then holds every pair of its 10 layers (5,120 of 5,120, zero stage
+  misses) but with `--prefill-main` the prompt still streams those layers from the file; unchanged.
+- the stock split prefill at split 38: 1,203 tok/s at 80K. The 4070 is about 4x slower per layer than
+  the 5090, the stages run in sequence, and a full stage cache cannot lend slots, so the chunk fell
+  from 32K to 16K.
+- `--ple-inflight 256`: identical. The n-gram table reads are already direct I/O off the critical path.
+- `--no-prefill-borrow` forces 2048-token chunks (measured 3x worse earlier); own buffers for a 32K
+  chunk would reserve 21.8 GiB of VRAM.
+- parking off, to hand its RAM to the page cache: about 2% on fresh prompts, nothing on follow-ups,
+  and every conversation switch becomes a full re-read.
+
+## The dual-GPU fork
+
+Hardin22's Strata-DualGPU (Strata issue #642) is the same problem on the same class of box: two cards
+and 32 GB of RAM. It lets `--resident-experts` run with `--layer-split`: the RAM copy is the complement
+of every card's cache, hottest first, page-locked, and a swap-back bug (an evicted expert copied back
+from the wrong card's slot) is fixed. Here the copy is 6.9 GiB and the decode hit path never reads
+the file. It also pipelines decode: with `--pipeline-windows 2` stage 0 runs window K+1 on tokens from
+a teacher-forced MTP chain while stage 1 still verifies window K, with a GDN snapshot (112 MiB on the
+5090) to undo K+1 when K's acceptance disagrees. The stages hand off through flags in mapped pinned
+memory, commits are queued per stream, the draft round is one graph, and the adaptive tier swaps
+asynchronously. On this box: decode 110 -> 170 tok/s median, 117 -> 155 after an 80K prompt, 2K
+prompts 373 -> 450-460, the 80K follow-up 5.5 -> 4.4 s, 16K and 80K prompts unchanged (the loan above
+is still the floor there). Needle 5/5, parking 8/8, coherence probes and a second decode set clean.
+
+Two things to know. The fork's separate reserve for the second card must stay at 700 MiB: at 300 the
+4070's expert cache grew by 175 slots and the MTP draft head no longer fit ("the draft head does not
+fit"). And the RAM copy leaves about 8 GB free, so the parking budget is 4 GB here instead of 6: one
+130K-token conversation parks, two of them alternate by re-reading each other. The fork's hybrid-CPU
+pool default (P-cores plus half the E-cores) is Windows-only; 13 workers set by hand measured the same
+as the 19-worker default on this box, because decode misses are 0.5% and served from RAM.

@@ -1,8 +1,9 @@
 # Benchmarks
 
-All on 2026-10-02 (the last section 2026-10-03), RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch
-Linux, Strata 0.1.33 (0.1.37 in the last section), ISTA GSQ-RCO IQ3_XXS, 262,144 context, layer split
-36, int8 KV with 32,768 resident cells, vision on.
+All on 2026-10-02 and 2026-10-03, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
+IQ3_XXS, 262,144 context, layer split 36, int8 KV with 32,768 resident cells, vision on. The Strata base
+moves through the sections: 0.1.33, 0.1.37, 0.1.38 with six PRs, then the Strata-DualGPU fork (the shipped
+config).
 `tools/bench.py`: five 600-token greedy answers with thinking off (decode median), fresh prompts of
 ~2K (twice), ~16K and ~80K tokens of random words (prefill tok/s), then a 2K follow-up on the 80K
 conversation; `tools/decode_after.py`: five more answers right after the 80K prompt. "faults" is
@@ -86,7 +87,7 @@ with spec-min-p 0.7-0.8 measured 128-134 tok/s median on the same prompts (`tool
 
 ## Upstream 0.1.37 base and `STRATA_PF_FUSED=1` (2026-10-03, the shipped config)
 
-The same three patches on v0.1.37, pread on, chunk 32768, spec-min-p 0.8; MMQ and the fused kernels
+The v4 patch set (then three patches) on v0.1.37, pread on, chunk 32768, spec-min-p 0.8; MMQ and the fused kernels
 alternated, two rounds each, one boot per row. The MMQ rows reproduce the 0.1.33 v5 numbers above.
 
 | | decode median | 2K | 16K | 80K | follow-up | decode after 80K |
@@ -100,7 +101,72 @@ Major faults per bench stayed in the 1-2 K range on every row. Correctness on th
 40K needle with four follow-ups and the 20K extension 5/5 (follow-ups 0.4-0.7 s, the extension 15.8 s),
 the two alternating conversations 8/8 with 0.6-0.7 s switches.
 
-## VRAM
+## Upstream 0.1.38 plus PRs #603, #547, #567, #510, #572, #525 (2026-10-03 afternoon)
+
+Same config as the 0.1.37 rows (fused kernels, pread, chunk 32768, spec-min-p 0.8, parking 6 GB).
+
+| | decode median | 2K | 16K | 80K | follow-up | decode after 80K |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.1.37 fused (above, same day) | 106-110 | 355-372 | 1,212-1,240 | 1,969-1,994 | 5.8 s | 115-118 |
+| **0.1.38 + the six PRs** | 110 | 373 / 376 | 1,305 | 2,094 | 5.5 s | 117 |
+
+Needle 5/5 (follow-ups 0.4-0.5 s, the 20K extension 15.4 s), parking 8/8 (switches 0.5-0.7 s). The
+prompt path's loan fell from 6,939 to 6,243 slots (#547).
+
+## Layer split 38 and the stock split prefill (2026-10-03 morning, 0.1.37 build)
+
+| arm | decode | 2K | 16K | 80K | follow-up | decode after 80K |
+| --- | --- | --- | --- | --- | --- | --- |
+| split 38, `--prefill-main` (the 4070 holds all 5,120 pairs of its 10 layers) | 104 | 336 / 348 | 1,223 | 2,018 | 6.0 s | 108 |
+| split 38, stock split prefill, parking off | 106 | 285 / 294 | 618 | 1,203 | 7.5 s | 114 |
+| the same with `--ple-inflight 256` | 109 | 282 / 293 | 618 | 1,206 | 7.5 s | 117 |
+
+The 80K prompt read 99-111 GB from NVMe in every arm: the lent experts, not the miss rate, are the
+traffic (docs/how-it-works.md, "What the prompt loan costs").
+
+## Parking off versus on (2026-10-03 evening, 0.1.38 build, alternated)
+
+The bench's requests are separate conversations, so with parking on each request parks the previous
+one (50-500 ms, inside the measured time). The last two rows also had a 112K-token session parked
+first.
+
+| state | decode | 2K | 16K | 80K | follow-up | decode after 80K | NVMe read per bench |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| parking off, round 1 | 112 | 375 / 378 | 1,306 | 2,127 | 5.5 s | 126 | 158 GB |
+| parking off, round 2 | 112 | 390 / 388 | 1,324 | 2,129 | 5.6 s | 124 | 156 GB |
+| parking 6 GB, round 1 | 106 | 364 / 373 | 1,273 | 2,090 | 5.5 s | 115 | 163 GB |
+| parking 6 GB, round 2 | 111 | 376 / 381 | 1,282 | 2,093 | 5.4 s | 113 | 163 GB |
+| 6 GB plus a 112K session parked, round 1 | 99 | 384 / 385 | 1,335 | 2,086 | 5.4 s | 113 | 173 GB |
+| 6 GB plus a 112K session parked, round 2 | 99 | 388 / 388 | 1,312 | 2,181 | 5.5 s | 114 | 173 GB |
+
+Freeing the parking RAM buys about 2% on fresh prompts and nothing on follow-ups. Parking stays. The
+four-slot limit evicted the 112K snapshot after four short conversations, so `--conversation-cache-slots`
+matters as much as the byte budget when several clients talk to the server.
+
+## The Strata-DualGPU fork (2026-10-03 evening, the shipped config)
+
+Fork commit of 2026-10-03 plus the same PRs and patches; `--resident-experts` (6.92 GiB page-locked
+RAM copy of the experts neither card holds), `--vram-reserve-later-mib 700`, `--pipeline-windows` at its
+default of 2, parking 4 GB; everything else as above.
+
+| | decode median | 2K | 16K | 80K | follow-up | decode after 80K |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.1.38 + PRs (above, same day) | 110 | 373 / 376 | 1,305 | 2,094 | 5.5 s | 117 |
+| **the fork + PRs + patches** | **170** (136-190) | **449 / 460** | 1,359 | 2,121 | **4.4 s** | **155** |
+| the same with `--pool-workers 13` | 167 | 439 / 445 | 1,356 | 2,098 | 4.5 s | 164 |
+
+Correctness on the fork: needle 5/5 (follow-ups 0.3-0.4 s, the extension 14.3 s), parking 8/8
+(switches 0.4-0.5 s, restores 40-80 ms), a second set of five decodes after everything else at 172
+median, planets / iterative Fibonacci / the 9:40 train (14:05) right, no refill failures or rollback
+errors in the log, decode expert hits 99.2% with the misses served from the RAM copy. The prompt path
+still read 293 GB from the GGUF over the whole test: the loan is untouched by the fork. With
+`--vram-reserve-later-mib 300` the boot failed ("mtp: the draft head does not fit", 178 MiB needed,
+155 free on the 4070).
+
+RAM with the model up: 23.4 GB used, 8.3 GB available. The 5090 idles at 32,071 MiB of 32,607 (the
+pipeline's GDN snapshot and second verifiers took the last 500 MiB); the 4070 at 15,800.
+
+## VRAM (before the fork)
 
 5090: 31,994 MiB used with the server up (about 280 MiB free for a desktop; `--vram-reserve-mib 700`
 is what keeps the expert cache from taking it all). 4070 Ti SUPER: 15,754 MiB. Peak during an 80K

@@ -1,0 +1,578 @@
+diff --git a/serve/server.py b/serve/server.py
+index 2709556..76b7618 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -892,18 +892,25 @@ class ByteTokenizer:
+     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
+     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
+ 
++    max_special_len = max(len(s) for s in SPECIALS)
++
+     def encode(self, text, parse_special=False):
+-        out, i = [], 0
++        return self.encode_marked(text, parse_special)[0]
++
++    def encode_marked(self, text, parse_special=False):
++        """encode() and its resume points (after each special), as strata_tokenizer's for PromptEncoder."""
++        out, marks, i = [], [], 0
+         while i < len(text):
+             for k, s in enumerate(self.SPECIALS):
+                 if parse_special and text.startswith(s, i):
+                     out.append(256 + k)
+                     i += len(s)
++                    marks.append((i, len(out)))
+                     break
+             else:
+                 out.extend(text[i].encode("utf-8"))
+                 i += 1
+-        return out
++        return out, marks
+ 
+     def decode(self, ids, errors="replace"):
+         raw = bytearray()
+@@ -987,6 +994,17 @@ class Service:
+         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
+                             tokenizer.encode("<|endoftext|>", parse_special=True))
++        # A prompt re-encodes only what follows the last special token it shares with a recent prompt (the same ids
++        # as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points encode in full.
++        self.prompts = None
++        if hasattr(tokenizer, "encode_marked"):
++            from strata_tokenizer import PromptEncoder
++            self.prompts = PromptEncoder(tokenizer)
++
++    def encode_prompt(self, prompt: str) -> list[int]:
++        if self.prompts is None:
++            return self.tok.encode(prompt, parse_special=True)
++        return self.prompts.encode(prompt)
+ 
+     def loaded(self) -> bool:
+         return not hasattr(self.engine, "alive") or self.engine.alive()
+@@ -1333,7 +1351,7 @@ class Service:
+         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
+         the rest of the context."""
+         prompt = self.template.render(messages, tools=tools, **kwargs)
+-        ids = self.tok.encode(prompt, parse_special=True)
++        ids = self.encode_prompt(prompt)
+         self.embeddings.path = None
+         images = images_of(messages)
+         if images:
+@@ -2416,7 +2434,7 @@ def make_handler(svc: Service):
+             req = svc.with_shared(req, "anthropic")
+             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+             prompt = svc.template.render(messages, tools=tools, **kw)
+-            self._json(200, {"input_tokens": len(svc.tok.encode(prompt, parse_special=True))})
++            self._json(200, {"input_tokens": len(svc.encode_prompt(prompt))})
+ 
+         def _anthropic(self, req):
+             svc.load()
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 8f34a74..fff7540 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -618,6 +618,59 @@ class RecordingPrompt(MockEngine):
+         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+ 
+ 
++class IncrementalPrompts(unittest.TestCase):
++    """The prompt encoder: every request's ids are those of a full encode, and a turn reuses the previous one's."""
++
++    @classmethod
++    def setUpClass(cls):
++        tok = ByteTokenizer()
++        cls.engine = RecordingPrompt(tok, "Thinking.\n</think>\n\nThe answer.", max_context=CTX)
++        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        cls.httpd = serve(cls.svc, port=0)
++        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.httpd.shutdown()
++        cls.httpd.server_close()
++
++    post = ClientShapes.post
++
++    def test_turns(self):
++        self.assertIsNotNone(self.svc.prompts)
++        msgs = [{"role": "system", "content": "Be brief."}]
++        for turn in range(6):
++            msgs.append({"role": "user", "content": f"question {turn} <|im_end|> é你 " * (turn + 1)})
++            status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
++            self.assertEqual(status, 200, b)
++            prompt = self.svc.template.render(msgs)
++            self.assertEqual(self.engine.last_ids, self.svc.tok.encode(prompt, parse_special=True))
++            if turn:
++                self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
++            msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
++
++    def test_same_ids_as_a_full_encode_on_varied_conversations(self):
++        import random
++        sys.path.insert(0, str(ROOT / "tools"))
++        from test_strata_tokenizer import conversation_prompts, load_tokenizer
++        toks = [("byte", ByteTokenizer())]
++        if load_tokenizer() is not None:
++            toks.append(("qwen35", load_tokenizer()))
++        for name, tok in toks:
++            svc = Service(self.engine, tok, self.svc.template)
++            for seed in range(3):
++                for what, prompt in conversation_prompts(self.svc.template, random.Random(seed)):
++                    with self.subTest(tokenizer=name, seed=seed, what=what):
++                        self.assertEqual(svc.encode_prompt(prompt), tok.encode(prompt, parse_special=True))
++
++    def test_a_tokenizer_without_resume_points_encodes_in_full(self):
++        class Plain:
++            encode = ByteTokenizer().encode
++        svc = Service(self.engine, Plain(), self.svc.template)
++        self.assertIsNone(svc.prompts)
++        self.assertEqual(svc.encode_prompt("<|im_start|>hi"), ByteTokenizer().encode("<|im_start|>hi", True))
++
++
+ class DyingEngine(MockEngine):
+     """Issue #27: an engine that dies after a few tokens of its first answer, and comes back when restarted."""
+ 
+diff --git a/tools/strata_tokenizer.py b/tools/strata_tokenizer.py
+index c14492c..eedc297 100644
+--- a/tools/strata_tokenizer.py
++++ b/tools/strata_tokenizer.py
+@@ -15,9 +15,11 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
+ """
+ from __future__ import annotations
+ 
++import bisect
+ import json
+ import pathlib
+ import sys
++import threading
+ 
+ import regex
+ 
+@@ -110,6 +112,8 @@ class Tokenizer:
+         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
+         self._always_re = self._alt(always)
+         self._special_re = self._alt(list(self.special_tokens))
++        # How far a special-token match can look ahead of where it starts (PromptEncoder's margin).
++        self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
+ 
+     @staticmethod
+     def _alt(literals: list[str]):
+@@ -213,12 +217,15 @@ class Tokenizer:
+                 out.append(i)
+         return out
+ 
+-    def _encode_matching(self, text: str, pat) -> list[int]:
++    def _encode_matching(self, text: str, pat, marks: list | None = None) -> list[int]:
+         """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
+ 
+         The split happens on the RAW text, before the byte mapping, because a special token's string is a
+         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
+         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.
++
++        `marks`, when given, receives (end of the match in `text`, ids so far) for every match: the points where
++        the encoding of a longer text with the same beginning can resume (PromptEncoder).
+         """
+         if pat is None:
+             return self._encode_plain(text)
+@@ -229,6 +236,8 @@ class Tokenizer:
+                 out.extend(self._encode_plain(text[pos:m.start()]))
+             out.append(self.special_tokens[m.group(0)])
+             pos = m.end()
++            if marks is not None:
++                marks.append((pos, len(out)))
+         if pos < len(text):
+             out.extend(self._encode_plain(text[pos:]))
+         return out
+@@ -241,6 +250,11 @@ class Tokenizer:
+         """
+         return self._encode_matching(text, self._special_re if parse_special else self._always_re)
+ 
++    def encode_marked(self, text: str, parse_special: bool = False) -> tuple[list[int], list[tuple[int, int]]]:
++        """encode() and its resume points: (end offset in `text`, ids so far) after every special-token match."""
++        marks: list[tuple[int, int]] = []
++        return self._encode_matching(text, self._special_re if parse_special else self._always_re, marks), marks
++
+     def token_bytes(self, i: int) -> bytes:
+         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
+         cache = self.__dict__.setdefault("_bytes_cache", {})
+@@ -261,6 +275,79 @@ class Tokenizer:
+         return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
+ 
+ 
++# ------------------------------------------------------------------ incremental prompts
++def common_prefix_len(a: str, b: str) -> int:
++    """Length of the longest common prefix, by slices (C speed) rather than a loop over characters."""
++    n = min(len(a), len(b))
++    lo, step = 0, 4096
++    while lo < n:                                       # whole chunks first, doubling
++        hi = min(n, lo + step)
++        if a[lo:hi] != b[lo:hi]:
++            break
++        lo, step = hi, min(step * 2, 1 << 20)
++    else:
++        return n
++    while hi - lo > 1:                                  # the first difference is in [lo, hi): bisect it
++        mid = (lo + hi) // 2
++        if a[lo:mid] == b[lo:mid]:
++            lo = mid
++        else:
++            hi = mid
++    return lo
++
++
++class PromptEncoder:
++    """`tok.encode(text, parse_special=True)` for chat prompts, reusing the ids of an earlier prompt.
++
++    A chat client sends the whole conversation every turn, and the rendered prompt of turn n+1 starts with most of
++    turn n's.  Running BPE over all of it again costs hundreds of milliseconds at 100K tokens, even when the engine
++    reuses the whole prefix.  So the ids up to a SPECIAL-TOKEN BOUNDARY both prompts share are taken as they were,
++    and only the rest is encoded.
++
++    WHY THAT IS EXACT.  Encoding splits the text at special-token matches and BPE-encodes each stretch between two
++    matches on its own (`_encode_matching`): nothing crosses a match.  Whether a match starts at position q depends
++    only on text[q : q + max_special_len].  So if the two texts agree up to L, every decision the scan makes at a
++    position before c = the end of some match, with c + max_special_len - 1 <= L, is the same for both - the same
++    matches, the same stretches, the same ids up to c - and from c the scan starts afresh, exactly as it does on
++    text[c:].  Hence encode(new) == ids_old[:ids at c] + encode(new[c:]).  The margin matters only for a
++    vocabulary where a literal overlaps another's end; it costs re-encoding one short stretch.
++
++    A few recent prompts are kept (one per conversation: the one a prompt extends is replaced by it), so a second
++    client does not evict the first.  The tokenizer needs `encode_marked` and `max_special_len`.
++    """
++
++    def __init__(self, tok, keep: int = 4):
++        self.tok, self.keep = tok, keep
++        self.entries: list[tuple[str, list[int], list[int], list[int]]] = []   # (text, ids, mark ends, mark counts)
++        self.lock = threading.Lock()
++        self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
++
++    def encode(self, text: str) -> list[int]:
++        with self.lock:
++            entries = self.entries                      # replaced, never changed in place
++        margin = self.tok.max_special_len - 1
++        src, cut_k = None, -1
++        for e in entries:
++            limit = common_prefix_len(e[0], text) - margin
++            k = bisect.bisect_right(e[2], limit) - 1       # the last boundary c with c <= limit
++            if k >= 0 and (src is None or e[2][k] > src[2][cut_k]):
++                src, cut_k = e, k
++        if src is None:
++            ids, marks = self.tok.encode_marked(text, parse_special=True)
++            ends, counts = [m[0] for m in marks], [m[1] for m in marks]
++            self.last_reused = 0
++        else:
++            c, n = src[2][cut_k], src[3][cut_k]
++            tail, marks = self.tok.encode_marked(text[c:], parse_special=True)
++            ids = src[1][:n] + tail
++            ends = src[2][:cut_k + 1] + [c + m[0] for m in marks]
++            counts = src[3][:cut_k + 1] + [n + m[1] for m in marks]
++            self.last_reused = c
++        with self.lock:
++            self.entries = [(text, ids, ends, counts)] + [e for e in self.entries if e is not src][:self.keep - 1]
++        return list(ids)
++
++
+ # ------------------------------------------------------------------ the pack's tokenizer/ directory
+ def extract(gguf_path, out_dir) -> dict:
+     """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
+diff --git a/tools/test_strata_tokenizer.py b/tools/test_strata_tokenizer.py
+new file mode 100644
+index 0000000..fb5b5d2
+--- /dev/null
++++ b/tools/test_strata_tokenizer.py
+@@ -0,0 +1,297 @@
++"""Tests for tools/strata_tokenizer.py: llama.cpp's reference vectors, and the incremental prompt encoder, which must give
++exactly the ids of a plain encode.
++
++    python -m unittest tools.test_strata_tokenizer -v
++
++The real vocabulary comes from $STRATA_TOKENIZER (a pack's tokenizer/ directory) when set, else from llama.cpp's
++`models/ggml-vocab-qwen35.gguf` next to the gguf-py the tools use ($STRATA_GGUF_PY, third_party/llama.cpp); the
++tests that need it are skipped without one.  The chat template's USER_DEFINED tokens (`<think>`, `<tool_call>`,
++...) are added to the llama.cpp vocabulary, which does not have them, as the pack's has.
++"""
++from __future__ import annotations
++
++import json
++import os
++import pathlib
++import random
++import sys
++import unittest
++
++ROOT = pathlib.Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "tools"))
++sys.path.insert(0, str(ROOT))
++import strata_tokenizer as ST  # noqa: E402
++
++ADDED = ["<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
++         "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
++
++
++def vocab_gguf() -> pathlib.Path | None:
++    cands = [os.environ.get("STRATA_GGUF_PY"), ROOT / "third_party" / "llama.cpp" / "gguf-py", "/opt/llama.cpp/gguf-py"]
++    for c in cands:
++        if c and (pathlib.Path(c).parent / "models" / "ggml-vocab-qwen35.gguf").is_file():
++            return pathlib.Path(c).parent / "models" / "ggml-vocab-qwen35.gguf"
++    return None
++
++
++def load_tokenizer():
++    pack = os.environ.get("STRATA_TOKENIZER")
++    if pack and (pathlib.Path(pack) / "vocab.json").is_file():
++        t = pathlib.Path(pack)
++        vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
++        tokens = [None] * len(vocab)
++        for s, i in vocab.items():
++            tokens[i] = s
++        return ST.Tokenizer(tokens, (t / "merges.txt").read_text(encoding="utf-8").split("\n"),
++                            json.loads((t / "token_type.json").read_text()))
++    path = vocab_gguf()
++    if path is None:
++        return None
++    from gguf_reader import GGUFFile
++    md = GGUFFile(path).metadata
++    tokens, types = list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.token_type"])
++    for s in ADDED:
++        if s not in tokens:
++            tokens.append(s)
++            types.append(4)
++    return ST.Tokenizer(tokens, list(md["tokenizer.ggml.merges"]), types)
++
++
++def byte_tokenizer(specials: list[str]) -> ST.Tokenizer:
++    """A vocabulary of the 256 byte tokens and `specials` (CONTROL), no merges: small enough to build per test."""
++    tokens = [ST.BYTE_TO_UNICODE[b] for b in range(256)] + specials
++    return ST.Tokenizer(tokens, [], [1] * 256 + [3] * len(specials))
++
++
++WORDS = ["the", "tokenizer", " ", "  ", "\n", "\n\n", "\t", "def", "f(x):", "return", "x", "==", "->", "café",
++         "你好", "\U0001f600", "é", "1234", "don't", "I'm", "<|im_", "<think", "</", "tool", "_call>",
++         " ", "\r\n", "Hello,", "world!", "<", ">", "|", "      ", "x" * 70]
++
++
++def random_text(rnd: random.Random, n: int, specials=()) -> str:
++    parts = []
++    for _ in range(n):
++        parts.append(rnd.choice(WORDS) if not specials or rnd.random() > 0.05 else rnd.choice(specials))
++        if rnd.random() < 0.5:
++            parts.append(" ")
++    return "".join(parts)
++
++
++def conversation_prompts(template, rnd: random.Random) -> list[tuple[str, str]]:
++    """Rendered prompts, in the order a server would see them, from clients that grow a conversation turn after turn,
++    use tools, send images, change the start of the prompt, edit an earlier turn, send a shorter conversation, and
++    interleave with each other: (what happens, prompt)."""
++    out: list[tuple[str, str]] = []
++    specials = ["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_response>"]
++    weather = [{"type": "function", "function": {"name": "get_weather", "description": "Get the weather",
++                                                  "parameters": {"type": "object", "properties": {
++                                                      "city": {"type": "string"}}, "required": ["city"]}}}]
++
++    def add(what, msgs, tools=None, **kw):
++        out.append((what, template.render(msgs, tools=tools, **kw)))
++
++    # several turns, with unicode, a literal special token inside the text, and reasoning kept or not
++    msgs = [{"role": "system", "content": "Be brief. Réponds en français si on te parle en français."}]
++    for turn in range(6):
++        msgs.append({"role": "user", "content": random_text(rnd, 60, specials) + " é你\U0001f600 " * turn})
++        add(f"turn {turn}", msgs)
++        answer = {"role": "assistant", "content": random_text(rnd, 30)}
++        if turn % 2:
++            answer["reasoning_content"] = random_text(rnd, 30)
++        msgs.append(answer)
++    grown = list(msgs)
++
++    # tools: definitions, a call, its response, then a following turn
++    tmsgs = [{"role": "user", "content": "Weather in Oslo?"}]
++    add("tools 1", tmsgs, weather)
++    tmsgs += [{"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {
++        "name": "get_weather", "arguments": {"city": "Oslo"}}}]},
++        {"role": "tool", "content": "{\"temp\": 3}", "name": "get_weather"}]
++    add("tools 2", tmsgs, weather)
++    tmsgs += [{"role": "assistant", "content": "3 degrees."}, {"role": "user", "content": "And in Bergen? " * 20}]
++    add("tools 3", tmsgs, weather)
++
++    # images: one per user turn, the placeholder tokens are specials
++    imsgs = []
++    for turn in range(3):
++        imsgs.append({"role": "user", "content": [{"type": "image", "source": f"img{turn}"},
++                                                   {"type": "text", "text": f"What is on picture {turn}?"}]})
++        add(f"images {turn}", imsgs)
++        imsgs.append({"role": "assistant", "content": "A cat."})
++
++    # the start of the prompt changes (a thinking level, a system message), then the old conversation grows again
++    add("effort changed", grown, reasoning_effort="low")
++    add("system changed", [dict(grown[0], content=grown[0]["content"] + " Be kind.")] + grown[1:])
++    grown.append({"role": "user", "content": "one more question"})
++    add("grown again", grown)
++
++    # an earlier turn edited, then a conversation that got shorter, then the full one again
++    edited = list(grown)
++    edited[3] = dict(edited[3], content=edited[3]["content"] + " (edited)")
++    add("edited", edited)
++    add("shorter", grown[:5])
++    add("empty user", [{"role": "user", "content": ""}])
++    add("full again", grown)
++    return out
++
++
++class Oracle(unittest.TestCase):
++    """llama.cpp's own tokenizer test vectors for qwen35."""
++
++    def test_llama_cpp_vectors(self):
++        path = vocab_gguf()
++        if path is None or not path.with_suffix(".gguf.inp").is_file():
++            self.skipTest("llama.cpp's ggml-vocab-qwen35.gguf test vectors are not here")
++        tk = load_tokenizer()
++        inp = path.with_suffix(".gguf.inp").read_text(encoding="utf-8").split("\n__ggml_vocab_test__\n")
++        out = path.with_suffix(".gguf.out").read_text(encoding="utf-8").split("\n")
++        n = 0
++        for text, want in zip(inp, out):
++            if text.endswith("\n__ggml_vocab_test__"):
++                text = text[:-len("\n__ggml_vocab_test__")]
++            self.assertEqual(tk.encode(text), [int(x) for x in want.split()], repr(text[:40]))
++            n += 1
++        self.assertGreater(n, 40)
++
++
++class Marks(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tk = load_tokenizer()
++        if cls.tk is None:
++            raise unittest.SkipTest("no tokenizer (set STRATA_TOKENIZER or STRATA_GGUF_PY)")
++
++    def test_marks(self):
++        text = "a<|im_start|>user\nhi<|im_end|>\n<think>\n"
++        ids, marks = self.tk.encode_marked(text, parse_special=True)
++        self.assertEqual(ids, self.tk.encode(text, parse_special=True))
++        self.assertEqual([m[0] for m in marks], [text.index("user"), text.index("<|im_end|>") + len("<|im_end|>"),
++                                                  len(text) - 1])
++        for end, n in marks:                            # each mark: the ids of the text up to it
++            self.assertEqual(ids[:n], self.tk.encode(text[:end], parse_special=True))
++
++
++class Prompts(unittest.TestCase):
++    """PromptEncoder: the ids of a plain encode, whatever the earlier prompts were."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls.tk = load_tokenizer()
++        if cls.tk is None:
++            raise unittest.SkipTest("no tokenizer (set STRATA_TOKENIZER or STRATA_GGUF_PY)")
++        from serve.frontend import ChatTemplate
++        cls.template = ChatTemplate(ROOT / "serve" / "chat_template.jinja")
++
++    def check(self, enc, text):
++        got = enc.encode(text)
++        self.assertEqual(got, self.tk.encode(text, parse_special=True))
++        return got
++
++    def test_chat_golden(self):
++        cases = json.loads((ROOT / "serve" / "chat_golden.json").read_text(encoding="utf-8"))
++        enc = ST.PromptEncoder(self.tk)
++        for c in cases + cases:                         # the second round finds its own earlier prompts
++            if c.get("rendered"):
++                with self.subTest(case=c["name"]):
++                    self.check(enc, c["rendered"])
++
++    def test_conversations(self):
++        for seed in range(3):
++            prompts = conversation_prompts(self.template, random.Random(seed))
++            for keep in (1, 2, 4):
++                enc = ST.PromptEncoder(self.tk, keep=keep)
++                for what, prompt in prompts:
++                    with self.subTest(seed=seed, keep=keep, what=what):
++                        self.check(enc, prompt)
++
++    def test_growing_turn_reuses_the_previous_prompt(self):
++        enc = ST.PromptEncoder(self.tk)
++        msgs = [{"role": "user", "content": "first question " * 50}]
++        prev = ""
++        for turn in range(4):
++            prompt = self.template.render(msgs)
++            self.check(enc, prompt)
++            if turn:
++                self.assertGreater(enc.last_reused, len(prev) - 100)
++            prev = prompt
++            msgs += [{"role": "assistant", "content": f"answer {turn}"}, {"role": "user", "content": f"question {turn}"}]
++
++    def test_prefix_of_an_earlier_prompt_and_unrelated_prompts(self):
++        enc = ST.PromptEncoder(self.tk, keep=2)
++        a = self.template.render([{"role": "user", "content": "first question " * 50}])
++        b = self.template.render([{"role": "user", "content": "another conversation"}])
++        c = self.template.render([{"role": "user", "content": "a third one"}])
++        for text in (a, a[:len(a) // 2], b, c, a, a + "tail", "", "<|im_end|>", "<|im_end|><|im_end|>x"):
++            with self.subTest(text=text[:30]):
++                self.check(enc, text)
++
++    def test_the_returned_ids_are_the_callers(self):
++        enc = ST.PromptEncoder(self.tk)
++        text = "<|im_start|>user\nhi<|im_end|>\n" + "and a tail longer than the look-ahead margin. " * 3
++        want = self.tk.encode(text, parse_special=True)
++        got = enc.encode(text)
++        got[0] = -1                                     # inside the part the next call takes from this one
++        got.append(-1)
++        self.assertEqual(enc.encode(text), want)
++        self.assertGreater(enc.last_reused, 0)
++
++
++class Margin(unittest.TestCase):
++    """A special literal that is a prefix of a longer one: cutting at the shorter one's end without the look-ahead
++    margin would give different ids."""
++
++    def test_longer_literal_past_the_common_prefix(self):
++        tk = byte_tokenizer(["<|a|>", "<|a|>zz"])
++        enc = ST.PromptEncoder(tk)
++        first = "x<|a|>y" + "<|a|>" * 3 + "q"
++        self.assertEqual(enc.encode(first), tk.encode(first, parse_special=True))
++        second = "x<|a|>y" + "<|a|>" * 3 + "zz"             # shares everything up to the last <|a|>
++        got = enc.encode(second)
++        self.assertEqual(got, tk.encode(second, parse_special=True))
++        self.assertEqual(got[-1], tk.special_tokens["<|a|>zz"])
++        self.assertGreater(enc.last_reused, 0)              # the earlier boundaries were still reused
++
++    def test_literal_ending_inside_another(self):
++        tk = byte_tokenizer(["<|a|>", "b<|a|>c"])
++        enc = ST.PromptEncoder(tk)
++        for text in ("zzb<|a|>d", "zzb<|a|>c", "zzb<|a|>cz<|a|>", "zzb<|a|>cz<|a|>b<|a|>c"):
++            with self.subTest(text=text):
++                self.assertEqual(enc.encode(text), tk.encode(text, parse_special=True))
++
++    def test_random_specials(self):
++        """Literals that extend or end inside one another, texts that change right after one of them."""
++        rnd = random.Random(3)
++
++        def word(lo, hi):
++            return "".join(rnd.choice("<|ab>") for _ in range(rnd.randint(lo, hi)))
++        for trial in range(60):
++            a, b = word(2, 4), word(2, 4)
++            lits = sorted({a, a + word(1, 3), b, word(1, 2) + b + word(0, 2)})
++            tk = byte_tokenizer(lits)
++            enc = ST.PromptEncoder(tk, keep=3)
++            pieces = lits + [x[:rnd.randint(1, len(x))] for x in lits] + ["x", "y", "a", "|"]
++            base = "".join(rnd.choice(pieces) for _ in range(60))
++            for _ in range(30):
++                cut = rnd.randint(0, len(base))
++                text = base[:cut] + "".join(rnd.choice(pieces) for _ in range(rnd.randint(0, 6)))
++                self.assertEqual(enc.encode(text), tk.encode(text, parse_special=True), (lits, text))
++                if rnd.random() < 0.3:
++                    base = text + base[cut:]
++
++
++class CommonPrefix(unittest.TestCase):
++    def test_against_a_loop(self):
++        rnd = random.Random(5)
++        for _ in range(500):
++            a = "".join(rnd.choice("ab") for _ in range(rnd.randint(0, 9000)))
++            k = rnd.randint(0, len(a))
++            b = a[:k] + rnd.choice(["", "c", "cd"]) + a[k:k + rnd.randint(0, 50)]
++            want = 0
++            while want < min(len(a), len(b)) and a[want] == b[want]:
++                want += 1
++            self.assertEqual(ST.common_prefix_len(a, b), want)
++            self.assertEqual(ST.common_prefix_len(b, a), want)
++
++
++if __name__ == "__main__":
++    unittest.main()
