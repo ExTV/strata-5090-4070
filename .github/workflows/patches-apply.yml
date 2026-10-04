@@ -5,7 +5,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: git clone https://github.com/Hardin22/Strata-DualGPU.git strata && git -C strata checkout --quiet dfdeb0540c5d7038531cde5fe2144ff7ad5cd9fe
+      - run: git clone https://github.com/Hardin22/Strata-DualGPU.git strata && git -C strata checkout --quiet 03a5ec955ba152a5f499a18a0f2f2ac192309c28
       - name: apply every patch in order, then check the manifest
         run: |
           cd strata

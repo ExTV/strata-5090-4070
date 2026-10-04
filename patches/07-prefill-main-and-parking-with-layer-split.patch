@@ -209,7 +209,7 @@ index ec01ff2..0918f99 100644
                         const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                         void* stream) {
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 7f0f334..5274f78 100644
+index 1c48bef..22ac260 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
 @@ -456,6 +456,9 @@ struct Options {
@@ -222,7 +222,7 @@ index 7f0f334..5274f78 100644
      /// Plan v0.3 P5 validation: batch only positions [0, P) and run the rest of the prompt through the token path
      /// (teacher-forced), so the logits of positions >= P - which depend on the batched state - can be scored
      /// against the oracle at many positions.  0 = the whole prompt but the last position.
-@@ -679,6 +682,10 @@ void usage() {
+@@ -682,6 +685,10 @@ void usage() {
                   "  --expert-cache-device1 N  pre-fill N experts on CUDA1 (experimental)\n"
                   "  --expert-cache-device2 N  pre-fill N more experts on CUDA2\n"
                   "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
@@ -233,7 +233,7 @@ index 7f0f334..5274f78 100644
                   "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                   "                       layers across CUDA1..3 (default: stripe)\n"
                   "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
-@@ -1429,6 +1436,7 @@ int main(int argc, char** argv) {
+@@ -1437,6 +1444,7 @@ int main(int argc, char** argv) {
          }
          else if (a == "--no-split-rows") o.no_split_rows = true;
          else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
@@ -241,7 +241,7 @@ index 7f0f334..5274f78 100644
          else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
          else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
          else if (a == "--spec") o.spec = std::atoi(next("--spec"));
-@@ -1592,7 +1600,10 @@ int main(int argc, char** argv) {
+@@ -1604,7 +1612,10 @@ int main(int argc, char** argv) {
      if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
          std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                       o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -253,7 +253,7 @@ index 7f0f334..5274f78 100644
          std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-cache-mib 0\n");
          return 2;
      }
-@@ -1666,6 +1677,11 @@ int main(int argc, char** argv) {
+@@ -1678,6 +1689,11 @@ int main(int argc, char** argv) {
          std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support remote expert caches\n");
          return 2;
      }
@@ -265,7 +265,18 @@ index 7f0f334..5274f78 100644
      // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
      // split, the visible GPUs no stage runs on, in order
      int remote_dev[3] = {1, 2, 3};
-@@ -2831,7 +2847,12 @@ int main(int argc, char** argv) {
+@@ -2904,7 +2920,9 @@ int main(int argc, char** argv) {
+         const int64_t before = trim_prefix[(size_t) g.n_layers];
+         std::string kept;
+         for (size_t i = 0; i <= stages.size(); ++i) {
+-            const int64_t lo = i == 0 ? 0 : split_at[i - 1], hi = i < split_at.size() ? split_at[i] : g.n_layers;
++            // --prefill-main: CUDA0 reads every layer of a prompt, so it keeps them all; the later cards still trim
++            const int64_t lo = i == 0 ? 0 : split_at[i - 1],
++                          hi = i < split_at.size() && !(i == 0 && prefill_main) ? split_at[i] : g.n_layers;
+             const bool ok = i == 0 ? reload(0, lo, hi, arena, pool_bytes, wt, native_dense) &&
+                                          (o.ple_gguf.empty() || wire_ple(wt))
+                                    : reload(stages[i - 1]->dev, lo, hi, stages[i - 1]->arena, stages[i - 1]->arena_bytes,
+@@ -2937,7 +2955,12 @@ int main(int argc, char** argv) {
          std::vector<std::pair<int32_t, int32_t>> mine;
          for (const auto& pr : profile) {
              const int st = stage_of(pr.first);
@@ -279,7 +290,7 @@ index 7f0f334..5274f78 100644
          }
          profile.swap(mine);
          for (size_t i = 0; i < stages.size(); ++i) {
-@@ -2846,7 +2867,7 @@ int main(int argc, char** argv) {
+@@ -2952,7 +2975,7 @@ int main(int argc, char** argv) {
      // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
      {
          const strata::core::OnDevice on0(0);
@@ -288,7 +299,7 @@ index 7f0f334..5274f78 100644
          if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
              std::fprintf(stderr, "strata generate: session state allocation failed\n");
              return 1;
-@@ -4126,6 +4147,11 @@ int main(int argc, char** argv) {
+@@ -4244,6 +4267,11 @@ int main(int argc, char** argv) {
      // Plan v0.3 P4: with a PROFILE-filled cache the residency is static, so the hit decision moves onto the
      // device and the token graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
      std::vector<int32_t> host_res;
@@ -300,7 +311,7 @@ index 7f0f334..5274f78 100644
      int32_t* d_res = nullptr;
      int32_t* d_hit_count = nullptr;
      strata::core::TokenHits thits;
-@@ -4424,9 +4450,13 @@ int main(int argc, char** argv) {
+@@ -4543,9 +4571,13 @@ int main(int argc, char** argv) {
          // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
          // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
          if (pf_borrow && d_res != nullptr) {
@@ -317,7 +328,7 @@ index 7f0f334..5274f78 100644
              // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
              // 128-slot floor.  The percentage cap is an AUTO-chunk rule and only the auto scan applies it - an
              // explicit --prefill is the operator's number, and a loan of it only has to fit.  With one participant
-@@ -4565,7 +4595,7 @@ int main(int argc, char** argv) {
+@@ -4684,7 +4716,7 @@ int main(int argc, char** argv) {
          // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
          // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
          auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
@@ -326,7 +337,7 @@ index 7f0f334..5274f78 100644
                  GpuStage& st = *stages[i];
                  st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
                  const strata::core::OnDevice on(st.dev);
-@@ -4582,7 +4612,10 @@ int main(int argc, char** argv) {
+@@ -4701,7 +4733,10 @@ int main(int argc, char** argv) {
                      return err.find("do not fit") != std::string::npos ? 2 : 1;
                  }
              }
@@ -338,7 +349,7 @@ index 7f0f334..5274f78 100644
              if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                  return err.find("do not fit") != std::string::npos ? 2 : 1;
              return 0;
-@@ -4594,7 +4627,7 @@ int main(int argc, char** argv) {
+@@ -4713,7 +4748,7 @@ int main(int argc, char** argv) {
              // failed to launch on gfx1201 and the prompt hung).  `bytes_needed` is the same count `init` makes.
              const int64_t kHeadroom = 512ll << 20;
              auto own_fits = [&](int64_t c, int& dev_out, int64_t& need_out, int64_t& free_out) -> bool {
@@ -347,7 +358,7 @@ index 7f0f334..5274f78 100644
                      const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
                      if (loan) continue;
                      const int dev = i == 0 ? -1 : stages[i - 1]->dev;
-@@ -5028,6 +5061,35 @@ int main(int argc, char** argv) {
+@@ -5152,6 +5187,35 @@ int main(int argc, char** argv) {
          strata::core::ConversationCache conversations(
              o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
              (size_t) o.conversation_cache_slots);
@@ -383,7 +394,7 @@ index 7f0f334..5274f78 100644
          // Save only on a switch/rewind, not on each continuing request. No graph
          // addresses change: all parked images live in ordinary host vectors.
          auto park_current = [&](size_t held) -> bool {
-@@ -5073,6 +5135,11 @@ int main(int argc, char** argv) {
+@@ -5197,6 +5261,11 @@ int main(int argc, char** argv) {
                                   additional >> 20, (long long) o.conversation_cache_min_free_mib);
                      return true;
                  }
@@ -395,7 +406,7 @@ index 7f0f334..5274f78 100644
                  strata::core::SavedConversation image;
                  size_t reused_bytes = 0;
                  if (!strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), err,
-@@ -5128,6 +5195,10 @@ int main(int argc, char** argv) {
+@@ -5252,6 +5321,10 @@ int main(int argc, char** argv) {
                  c.dead = std::move((*parts)[0].dead);
                  c.block_pos = std::move((*parts)[0].block_pos);
                  for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
@@ -406,7 +417,7 @@ index 7f0f334..5274f78 100644
              } else {
                  if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
                  for (auto& st : stages) {   // a layer split's later stages: their sessions' part
-@@ -5150,12 +5221,42 @@ int main(int argc, char** argv) {
+@@ -5274,12 +5347,42 @@ int main(int argc, char** argv) {
              }
              return true;
          };
@@ -451,7 +462,7 @@ index 7f0f334..5274f78 100644
              if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                  std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
                               batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
-@@ -5170,7 +5271,7 @@ int main(int argc, char** argv) {
+@@ -5294,7 +5397,7 @@ int main(int argc, char** argv) {
              std::fflush(stdout);
              if (o.prompt_cache_every > 0 && done >= pp_next_check) {
                  bool saved = false;
@@ -460,7 +471,7 @@ index 7f0f334..5274f78 100644
                      std::vector<ConvCheckpoint> parts;
                      {
                          std::lock_guard<std::mutex> lk(part_mu);
-@@ -5189,7 +5290,7 @@ int main(int argc, char** argv) {
+@@ -5313,7 +5416,7 @@ int main(int argc, char** argv) {
              }
              return true;
          };
@@ -469,7 +480,7 @@ index 7f0f334..5274f78 100644
              stages.back()->sp.on_chunk = std::move(sp.on_chunk);
              sp.on_chunk = nullptr;
              for (size_t i = 0; i <= stages.size(); ++i) {
-@@ -6062,6 +6163,11 @@ int main(int argc, char** argv) {
+@@ -6189,6 +6292,11 @@ int main(int argc, char** argv) {
                               (long long) resume, from_live ? "live" : "checkpoint",
                               std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                               conversations.size(), conversations.bytes());
@@ -481,7 +492,7 @@ index 7f0f334..5274f78 100644
              }
              if (want_cvec != cvec_cached) {
                  live_ok = false;
-@@ -6084,6 +6190,8 @@ int main(int argc, char** argv) {
+@@ -6211,6 +6319,8 @@ int main(int argc, char** argv) {
                      strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                      cudaStreamSynchronize(st->stream);
                  }
@@ -490,7 +501,7 @@ index 7f0f334..5274f78 100644
                  checks.clear();
              } else if (!from_live) {
                  ConvCheckpoint* c = nullptr;
-@@ -6106,6 +6214,12 @@ int main(int argc, char** argv) {
+@@ -6233,6 +6343,12 @@ int main(int argc, char** argv) {
                      reread_to = resume;
                      std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                           "restoring\n", (long long) resume);
@@ -503,7 +514,7 @@ index 7f0f334..5274f78 100644
                  } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
                             [&] {
                                 for (size_t i = 0; i < stages.size(); ++i) {
-@@ -6488,6 +6602,28 @@ int main(int argc, char** argv) {
+@@ -6615,6 +6731,28 @@ int main(int argc, char** argv) {
                          if (i >= o.prompt_cache_root) root_at = i;
                          break;
                      }
@@ -532,7 +543,7 @@ index 7f0f334..5274f78 100644
              int64_t at = read_from;
              for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
                  if (to <= at) continue;
-@@ -6497,12 +6633,22 @@ int main(int argc, char** argv) {
+@@ -6624,12 +6762,22 @@ int main(int argc, char** argv) {
                      std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                      return 1;
                  }
@@ -555,7 +566,7 @@ index 7f0f334..5274f78 100644
                  if (trace) {
                      std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                   win ? "windows" : "batched",
-@@ -6525,6 +6671,13 @@ int main(int argc, char** argv) {
+@@ -6652,6 +6800,13 @@ int main(int argc, char** argv) {
                      cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
                      break;
                  }
@@ -569,7 +580,7 @@ index 7f0f334..5274f78 100644
                  at = to;
                  if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
                      std::printf("ERR saving a conversation checkpoint failed\n");
-@@ -6535,6 +6688,8 @@ int main(int argc, char** argv) {
+@@ -6662,6 +6817,8 @@ int main(int argc, char** argv) {
                  std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                  return 1;
              }
@@ -578,7 +589,7 @@ index 7f0f334..5274f78 100644
              tr("prompt done (slots refilled)");
              const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
              std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
-@@ -7643,6 +7798,21 @@ int main(int argc, char** argv) {
+@@ -7770,6 +7927,21 @@ int main(int argc, char** argv) {
                                       "from RAM%s\n", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
                               (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
                               over ? " - OVERFLOW (too few resident cells)" : "");

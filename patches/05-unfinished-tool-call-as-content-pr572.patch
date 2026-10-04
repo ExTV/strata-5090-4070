@@ -1,8 +1,8 @@
 diff --git a/serve/frontend.py b/serve/frontend.py
-index 07e369d..451c6f0 100644
+index 6545fec..794a5c5 100644
 --- a/serve/frontend.py
 +++ b/serve/frontend.py
-@@ -568,6 +568,8 @@ class OutputParser:
+@@ -574,6 +574,8 @@ class OutputParser:
              out += self._scan()                 # the output ended inside a call that was already announced
              if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
                  out.append(Event("tool_call", call=self.scall))
@@ -12,7 +12,7 @@ index 07e369d..451c6f0 100644
              self._reset_scan()
              return out
 diff --git a/serve/test_server.py b/serve/test_server.py
-index 60a1926..3fcdef3 100644
+index e4fde98..18ad486 100644
 --- a/serve/test_server.py
 +++ b/serve/test_server.py
 @@ -325,8 +325,31 @@ class UnfinishedToolCall(unittest.TestCase):

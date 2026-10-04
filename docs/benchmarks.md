@@ -1,9 +1,9 @@
 # Benchmarks
 
-All on 2026-10-02 and 2026-10-03, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
+All on 2026-10-02 to 2026-10-04, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
 IQ3_XXS, 262,144 context, layer split 36, int8 KV with 32,768 resident cells, vision on. The Strata base
-moves through the sections: 0.1.33, 0.1.37, 0.1.38 with six PRs, then the Strata-DualGPU fork (the shipped
-config).
+moves through the sections: 0.1.33, 0.1.37, 0.1.38 with six PRs, the Strata-DualGPU fork, then the fork's later commits with the
+lend region in RAM (the shipped config).
 `tools/bench.py`: five 600-token greedy answers with thinking off (decode median), fresh prompts of
 ~2K (twice), ~16K and ~80K tokens of random words (prefill tok/s), then a 2K follow-up on the 80K
 conversation; `tools/decode_after.py`: five more answers right after the 80K prompt. "faults" is
@@ -143,7 +143,7 @@ Freeing the parking RAM buys about 2% on fresh prompts and nothing on follow-ups
 four-slot limit evicted the 112K snapshot after four short conversations, so `--conversation-cache-slots`
 matters as much as the byte budget when several clients talk to the server.
 
-## The Strata-DualGPU fork (2026-10-03 evening, the shipped config)
+## The Strata-DualGPU fork (2026-10-03 evening)
 
 Fork commit of 2026-10-03 plus the same PRs and patches; `--resident-experts` (6.92 GiB page-locked
 RAM copy of the experts neither card holds), `--vram-reserve-later-mib 700`, `--pipeline-windows` at its
@@ -165,6 +165,75 @@ still read 293 GB from the GGUF over the whole test: the loan is untouched by th
 
 RAM with the model up: 23.4 GB used, 8.3 GB available. The 5090 idles at 32,071 MiB of 32,607 (the
 pipeline's GDN snapshot and second verifiers took the last 500 MiB); the 4070 at 15,800.
+
+## The fork's later commits: per-card weights (2026-10-04)
+
+Fork head of 2026-10-03 21:38 UTC with the same PRs and patches; the 5090 keeps all 48 layers' dense
+weights for `--prefill-main` (patch 07), the 4070 its own 12. Same config otherwise.
+
+| | 4070 holds | experts in RAM | decode median | 2K | 16K | 80K | follow-up | decode after 80K |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fork of the evening before (above) | about 5,200 of 6,144 | 6.56 GiB | 170 | 449 / 460 | 1,359 | 2,121 | 4.4 s | 155 |
+| **later commits, split 36** (two runs) | 6,144 of 6,144 | 4.83 GiB | 173, 174 | 431-450 | 1,266-1,269 | 2,104-2,160 | 4.7-4.9 s | 175, 161 |
+| split 35 | 6,292 of 6,656 | 4.46 GiB | 161 | 393 / 419 | 1,300 | 2,103 | 5.1 s | 163 |
+| split 34, later-card reserve 512 | 6,262 of 7,168 | 4.36 GiB | 168 | 397 / 406 | 1,285 | 2,111 | 5.1 s | 161 |
+
+RAM 20.2 GB used, 11.6 available (23.4 / 8.3 before); VRAM 32,007 / 14,941 MiB. Needle 5/5 and
+parking 6/6 on every row.
+
+## The lend region in locked RAM (patch 09, 2026-10-04, same build, one session)
+
+`step` columns: `tools/step_times.py` on real web text, a 12.7K-token first message, then three reads
+each of 1.3K, 3.1K and 5.6K tokens (medians).
+
+| | locked | decode / after 80K | 2K | 16K | 80K | follow-up | first 12.7K | steps 1.3K / 3.1K / 5.6K | lowest available RAM |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| control (no lend region) | 4.83 GiB | 170 / 179 | 420 / 419 | 1,282 | 2,127 | 4.8 s | 10.0 s | 4.65 / 4.99 / 6.26 s | about 5 GB |
+| headroom 4 (all of it), parking 2 GB | 14.59 | 174 / 178 | 566 / 590 | 2,175 | 3,089 | 3.6 s | 5.4 s | 3.32 / 3.47 / 4.18 s | 0.85 GB |
+| the same, parking 4 GB, a 112K chat sent first | 14.59 | 173 / 173 | 598 / 577 | 2,177 | 3,173 | 3.6 s | 5.5 s | 3.50 / 3.78 / 4.46 s | 1.1 GB |
+| headroom 7, parking 4 GB | 13.02 | 176 / 169 | 585 / 588 | 2,212 | 2,491 | 3.6 s | 5.6 s | 3.37 / 4.06 / 4.77 s | 2.1 GB |
+| **headroom 10, parking 4 GB, a 112K chat parked first (shipped)** | 10.01 | 179 / 171 | 563 / 578 | 2,165 | 2,130 | 3.7 s | 5.6 s | 3.33 / 3.56 / 4.16 s | 2.3 GB |
+
+Parking check (two conversations of 30K and 15K alternating): 0.4-0.5 s per switch on the control and
+the shipped row; with everything locked every park was refused by the RAM admission floor and the
+switches took 5.4-8.1 s, answers still right. On the shipped row the 112K conversation parked (2.3 GB),
+seven later parks were refused while the 80K bench held the RAM, and parking resumed after it. Needle
+5/5 on every row. Swap in use grew from 1.9 to 6.6 GB with everything locked, 1.9 to 4.2 GB on the
+shipped row.
+
+## `--short-read` (2026-10-04, one boot, per-request threshold, real web text on a 12.7K-74K conversation)
+
+Seconds for a follow-up message of that many new tokens, two passes:
+
+| new tokens | 64 (default) | 256 | 512 | 1024 |
+| --- | --- | --- | --- | --- |
+| 69 | 0.33 | 0.31 | 0.34 | 0.32 |
+| 130 / 161 | 1.66 / 1.70 | 0.47 / 0.46 | 0.46 / 0.42 | 0.43 / 0.47 |
+| 251 / 283 | 1.72 / 2.15 | 0.53 / 1.98 | 0.65 / 0.84 | 0.66 / 0.72 |
+| 327 / 401 | 2.14 / 2.07 | 2.26 / 2.06 | 2.40 / 1.01 | 0.84 / 0.98 |
+| 637 / 683 | 2.00 / 2.64 | 2.03 / 2.39 | 2.16 / 2.29 | 1.47 / 1.38 |
+| 741 | 2.24 | 2.38 | 2.51 | 1.64 |
+| 884 | 2.85 | 2.81 | 2.84 | 3.41 |
+| 1,111 | 2.80 | 2.45 | 2.56 | 3.32 |
+| 1,511 / 1,572 | 3.66 / 3.67 | 3.76 / 3.57 | 3.71 / 3.55 | 3.81 / 3.43 |
+| 2,141 / 3,039 | 4.23 / 4.12 | 4.03 / 4.36 | 4.22 / 4.31 | 3.94 / 4.07 |
+
+A message part counts a few tokens more than the new text (the turn's header), so a size just under a
+threshold can fall on either side. Shipped: 768. This was measured before patch 09; with it the
+batched path's fixed cost is lower and the break-even may sit lower too (not re-measured).
+
+## A client that merges a turn's tool calls (patch 10, 2026-10-04)
+
+`tools/merged_tool_turn.py`, four tool steps of about 3K tokens each, tokens reused of the prompt:
+
+| | step 2 | step 3 | step 4 | the next user turn |
+| --- | --- | --- | --- | --- |
+| ids without a response marker (`OLD_IDS=1`) | 300 of 6,472 | 300 of 9,474 | 300 of 12,641 | |
+| patch 10 | 3,396 of 6,484 | 6,510 of 9,498 | 9,524 of 12,677 | 12,670 of 12,750 |
+
+In real use before the patch, one 30-call turn re-read 24K to 134K tokens on each of 19 requests
+(15-51 s per step); after it, 33 requests over three conversations each reused the whole live
+session. The server suite passes with the patch (180 tests, 10 of them new).
 
 ## VRAM (before the fork)
 

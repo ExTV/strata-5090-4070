@@ -1,0 +1,290 @@
+diff --git a/serve/frontend.py b/serve/frontend.py
+index 89ba71b..204c5b6 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -16,6 +16,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
+ from __future__ import annotations
+ 
+ import json
++import re
+ import uuid
+ from dataclasses import dataclass, field
+ from pathlib import Path
+@@ -160,10 +161,61 @@ def _object_list(value, name: str) -> list[dict]:
+     return value
+ 
+ 
++# A tool call id names the response that issued it (OutputParser.new_id): "call_<16 hex>_<n>".
++_STEP_ID = re.compile(r"call_([0-9a-f]{16})_\d+\Z")
++
++
++def _split_tool_steps(messages: list[dict]) -> list[dict]:
++    """Some clients keep one assistant message per user turn and send every tool call of the turn in it, followed
++    by all the results.  The model wrote them step by step (calls, results, calls, results); the merged form moves
++    each new call in front of the earlier results, so every request of the turn differs from the last one right
++    after the user's message and the conversation is read again from there.  The ids say which response issued
++    which calls, so the steps are put back: one assistant message per response, each followed by its results.
++    Text sent with the calls stays with the first step while the turn is running and becomes the closing
++    assistant message once it went on; reasoning goes with the last step.  Anything unexpected (ids of another
++    server, a response's calls not adjacent, a result of an unknown call) leaves the message as it was sent."""
++    out, i = [], 0
++    while i < len(messages):
++        m = messages[i]
++        i += 1
++        calls = m.get("tool_calls") if m.get("role") == "assistant" else None
++        if not isinstance(calls, list) or not all(isinstance(c, dict) for c in calls):
++            out.append(m)
++            continue
++        steps = []                                      # [marker, calls]: the calls of one response, in order
++        for c in calls:
++            found = _STEP_ID.match(c["id"]) if isinstance(c.get("id"), str) else None
++            mark = found.group(1) if found else None
++            if steps and steps[-1][0] == mark:
++                steps[-1][1].append(c)
++            else:
++                steps.append([mark, [c]])
++        j = i
++        while j < len(messages) and messages[j].get("role") == "tool":
++            j += 1
++        owner = {c.get("id"): n for n, (_, cs) in enumerate(steps) for c in cs}
++        if len(steps) < 2 or len({mark for mark, _ in steps}) != len(steps) or len(owner) != len(calls) or \
++                any(r.get("tool_call_id") not in owner for r in messages[i:j]):
++            out.append(m)
++            continue
++        went_on = j < len(messages)
++        for n, (_, cs) in enumerate(steps):
++            step = {"role": "assistant", "content": m.get("content") if n == 0 and not went_on else None,
++                    "tool_calls": cs}
++            if n == len(steps) - 1 and m.get("reasoning_content"):
++                step["reasoning_content"] = m["reasoning_content"]
++            out.append(step)
++            out.extend(r for r in messages[i:j] if owner[r.get("tool_call_id")] == n)
++        if went_on and m.get("content"):
++            out.append({"role": "assistant", "content": m["content"]})
++        i = j
++    return out
++
++
+ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+     messages = []
+-    for m in _object_list(req.get("messages"), "messages"):
++    for m in _split_tool_steps(_object_list(req.get("messages"), "messages")):
+         role = m.get("role")
+         if role == "developer":
+             role = "system"
+@@ -389,8 +441,15 @@ class OutputParser:
+         # _rescue_unclosed_call).  Cleared the moment the span closes: a call inside a CLOSED span was a
+         # mention, however valid, and must never be acted on.
+         self.reasoning_tail: str | None = None
++        # this response's mark in its tool call ids: a client that later sends the calls of several responses in
++        # one assistant message can be read back in the order they were written (_split_tool_steps)
++        self.step, self.ncalls = uuid.uuid4().hex[:16], 0
+         self._reset_scan()
+ 
++    def new_id(self) -> str:
++        self.ncalls += 1
++        return f"call_{self.step}_{self.ncalls - 1}"
++
+     def _reset_scan(self):
+         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
+         self.ss = "name"             # name -> between -> str|raw -> ... -> done
+@@ -414,7 +473,7 @@ class OutputParser:
+                 if b < 0:
+                     return out
+                 name = rest[a + 10:b]
+-                self.scall = ToolCall(name=name, arguments={})
++                self.scall = ToolCall(name=name, arguments={}, id=self.new_id())
+                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                 out.append(Event("tool_start", call=self.scall))
+@@ -555,6 +614,7 @@ class OutputParser:
+                 call = parse_tool_call(body, self.schemas.get(name))
+             except ValueError:
+                 return []                  # not a well-formed act; leave every block as reasoning
++            call.id = self.new_id()
+             calls.append(call)
+         return [Event("tool_call", call=call) for call in calls]
+ 
+@@ -596,6 +656,15 @@ class OutputParser:
+                         out.append(Event("content", self.buf[:j]))
+                         self.buf = self.buf[j:]
+                     return out
++                # A call is the tag followed by <function= (as the template writes it).  The tag named in a
++                # sentence is text: taken as a call, everything after it failed to parse and ended the request.
++                after = self.buf[i + len(CALL_START):].lstrip()
++                if not "<function=".startswith(after[:len("<function=")]):
++                    out.append(Event("content", self.buf[:i + len(CALL_START)]))
++                    self.buf = self.buf[i + len(CALL_START):]
++                    continue
++                if len(after) < len("<function="):              # not decided yet: wait for what follows
++                    return out
+                 if i and self.buf[:i].strip():
+                     out.append(Event("content", self.buf[:i].rstrip("\n")))
+                 self.buf = self.buf[i + len(CALL_START):]
+@@ -616,8 +685,7 @@ class OutputParser:
+                 self.buf = self.buf[i + len(CALL_END):]
+                 name = body.strip()[len("<function="):].split(">", 1)[0]
+                 call = parse_tool_call(body, self.schemas.get(name))
+-                if self.scall is not None:
+-                    call.id = self.scall.id
++                call.id = self.scall.id if self.scall is not None else self.new_id()
+                 out.append(Event("tool_call", call=call))
+                 self._reset_scan()
+                 self.state, self.lead = "content", True
+diff --git a/serve/test_tool_steps.py b/serve/test_tool_steps.py
+new file mode 100644
+index 0000000..0ec901d
+--- /dev/null
++++ b/serve/test_tool_steps.py
+@@ -0,0 +1,150 @@
++"""A client that keeps one assistant message per user turn sends every tool call of the turn in that message,
++followed by all the results.  The model produced them step by step (calls, results, calls, results), so the
++merged form moves each new call in front of the earlier results and the prompt stops being a continuation of
++what the engine holds.  Call ids carry the response that issued them; openai_to_messages puts the steps back."""
++import re
++import unittest
++from pathlib import Path
++
++from serve.frontend import ChatTemplate, OutputParser, openai_to_messages
++
++TEMPLATE = Path(__file__).with_name("chat_template.jinja")
++
++
++def call(cid, name="search", **args):
++    return {"id": cid, "type": "function", "function": {"name": name, "arguments": args or {"q": cid}}}
++
++
++def result(cid, text):
++    return {"role": "tool", "tool_call_id": cid, "content": text}
++
++
++A0, A1, B0, C0 = "call_aaaaaaaaaaaaaaaa_0", "call_aaaaaaaaaaaaaaaa_1", "call_bbbbbbbbbbbbbbbb_0", "call_cccccccccccccccc_0"
++USER = {"role": "user", "content": "compare these"}
++
++
++def roles(messages):
++    return [(m["role"], len(m.get("tool_calls") or [])) for m in messages]
++
++
++class CallIds(unittest.TestCase):
++    def emitted(self, parser):
++        text = ("<tool_call>\n<function=search>\n<parameter=q>\na\n</parameter>\n</function>\n</tool_call>\n"
++                "<tool_call>\n<function=search>\n<parameter=q>\nb\n</parameter>\n</function>\n</tool_call>")
++        events = parser.feed(text) + parser.finish()
++        return [e.call.id for e in events if e.kind == "tool_call"]
++
++    def test_calls_of_one_response_share_its_marker(self):
++        for stream in (False, True):
++            ids = self.emitted(OutputParser(thinking=False, stream_tools=stream))
++            self.assertEqual(len(ids), 2)
++            marks = [re.fullmatch(r"call_([0-9a-f]{16})_(\d+)", i) for i in ids]
++            self.assertTrue(all(marks), ids)
++            self.assertEqual(marks[0].group(1), marks[1].group(1))
++            self.assertEqual([m.group(2) for m in marks], ["0", "1"])
++
++    def test_another_response_has_another_marker(self):
++        a = self.emitted(OutputParser(thinking=False))
++        b = self.emitted(OutputParser(thinking=False))
++        self.assertNotEqual(a[0][:21], b[0][:21])
++
++
++class TagInProse(unittest.TestCase):
++    """A <tool_call> is a call only when <function= follows it; the tag named in a sentence is text."""
++    REAL = "<tool_call>\n<function=write>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
++
++    def run_parser(self, text, piece):
++        p = OutputParser(thinking=False, stream_tools=False)
++        events = []
++        for i in range(0, len(text), piece):
++            events += p.feed(text[i:i + piece])
++        events += p.finish()
++        content = "".join(e.text for e in events if e.kind == "content")
++        return content, [(e.call.name, e.call.arguments) for e in events if e.kind == "tool_call"]
++
++    def test_tag_named_before_the_real_call(self):
++        text = "I will use the `<tool_call>` format now.\n" + self.REAL
++        for piece in (1, 3, 7, len(text)):
++            with self.subTest(piece=piece):
++                content, calls = self.run_parser(text, piece)
++                self.assertEqual(content, "I will use the `<tool_call>` format now.")
++                self.assertEqual(calls, [("write", {"path": "a.txt"})])
++
++    def test_tag_alone_is_text(self):
++        for text in ("The tag is <tool_call>", "Write <tool_call> and then </tool_call> around it."):
++            for piece in (1, 5, len(text)):
++                with self.subTest(text=text, piece=piece):
++                    self.assertEqual(self.run_parser(text, piece), (text, []))
++
++    def test_a_plain_call_still_parses(self):
++        for piece in (1, 4, len(self.REAL)):
++            with self.subTest(piece=piece):
++                self.assertEqual(self.run_parser("Saving it.\n\n" + self.REAL, piece),
++                                 ("Saving it.", [("write", {"path": "a.txt"})]))
++
++
++class SplitSteps(unittest.TestCase):
++    def test_merged_turn_is_split_back_into_its_steps(self):
++        merged = [USER, {"role": "assistant", "content": "", "tool_calls": [call(A0), call(A1), call(B0)]},
++                  result(A0, "ra0"), result(A1, "ra1"), result(B0, "rb0")]
++        stepped = [USER, {"role": "assistant", "content": "", "tool_calls": [call(A0), call(A1)]},
++                   result(A0, "ra0"), result(A1, "ra1"),
++                   {"role": "assistant", "content": "", "tool_calls": [call(B0)]}, result(B0, "rb0")]
++        got = openai_to_messages({"messages": merged})[0]
++        self.assertEqual(roles(got), [("user", 0), ("assistant", 2), ("tool", 0), ("tool", 0), ("assistant", 1), ("tool", 0)])
++        tpl = ChatTemplate(TEMPLATE)
++        want = openai_to_messages({"messages": stepped})[0]
++        self.assertEqual(tpl.render(got, enable_thinking=False), tpl.render(want, enable_thinking=False))
++
++    def test_each_request_of_a_turn_continues_the_previous_one(self):
++        tpl = ChatTemplate(TEMPLATE)
++        calls, results, prompts = [], [], []
++        for cid in (A0, B0, C0):
++            calls.append(call(cid))
++            results.append(result(cid, "r" + cid))
++            msgs = [USER, {"role": "assistant", "content": "", "tool_calls": list(calls)}] + list(results)
++            prompts.append(tpl.render(openai_to_messages({"messages": msgs})[0], add_generation_prompt=False))
++        self.assertTrue(prompts[1].startswith(prompts[0]))
++        self.assertTrue(prompts[2].startswith(prompts[1]))
++
++    def test_answer_of_a_finished_turn_follows_its_last_results(self):
++        merged = [USER, {"role": "assistant", "content": "the answer", "tool_calls": [call(A0), call(B0)]},
++                  result(A0, "ra0"), result(B0, "rb0"), {"role": "user", "content": "thanks"}]
++        got = openai_to_messages({"messages": merged})[0]
++        self.assertEqual(roles(got), [("user", 0), ("assistant", 1), ("tool", 0), ("assistant", 1), ("tool", 0),
++                                      ("assistant", 0), ("user", 0)])
++        self.assertEqual(got[5]["content"], "the answer")
++        self.assertFalse(got[1]["content"])
++
++    def test_text_of_a_running_turn_stays_with_its_first_step(self):
++        merged = [USER, {"role": "assistant", "content": "let me look", "reasoning_content": "hm",
++                         "tool_calls": [call(A0), call(B0)]}, result(A0, "ra0"), result(B0, "rb0")]
++        got = openai_to_messages({"messages": merged})[0]
++        self.assertEqual(roles(got), [("user", 0), ("assistant", 1), ("tool", 0), ("assistant", 1), ("tool", 0)])
++        self.assertEqual(got[1]["content"], "let me look")
++        self.assertNotIn("reasoning_content", got[1])
++        self.assertEqual(got[3]["reasoning_content"], "hm")
++
++    def test_left_alone(self):
++        old = ["call_" + "0123456789abcdef01234567", "call_" + "89abcdef0123456789abcdef"]
++        cases = {
++            "one response": [call(A0), call(A1)],
++            "ids of another server": [call(old[0]), call(old[1])],
++            "a response's calls apart": [call(A0), call(B0), call(A1)],
++            "a repeated id": [call(A0), call(B0), call(B0)],
++        }
++        for name, calls in cases.items():
++            with self.subTest(name):
++                msgs = [USER, {"role": "assistant", "content": "", "tool_calls": calls}] + \
++                       [result(c["id"], "r") for c in calls]
++                self.assertEqual(roles(openai_to_messages({"messages": msgs})[0]),
++                                 [("user", 0), ("assistant", len(calls))] + [("tool", 0)] * len(calls))
++        with self.subTest("a result of an unknown call"):
++            msgs = [USER, {"role": "assistant", "content": "", "tool_calls": [call(A0), call(B0)]},
++                    result(A0, "r"), result("call_else", "r")]
++            self.assertEqual(roles(openai_to_messages({"messages": msgs})[0]),
++                             [("user", 0), ("assistant", 2), ("tool", 0), ("tool", 0)])
++
++
++if __name__ == "__main__":
++    unittest.main()

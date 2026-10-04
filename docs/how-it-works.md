@@ -149,9 +149,75 @@ asynchronously. On this box: decode 110 -> 170 tok/s median, 117 -> 155 after an
 prompts 373 -> 450-460, the 80K follow-up 5.5 -> 4.4 s, 16K and 80K prompts unchanged (the loan above
 is still the floor there). Needle 5/5, parking 8/8, coherence probes and a second decode set clean.
 
-Two things to know. The fork's separate reserve for the second card must stay at 700 MiB: at 300 the
-4070's expert cache grew by 175 slots and the MTP draft head no longer fit ("the draft head does not
-fit"). And the RAM copy leaves about 8 GB free, so the parking budget is 4 GB here instead of 6: one
-130K-token conversation parks, two of them alternate by re-reading each other. The fork's hybrid-CPU
-pool default (P-cores plus half the E-cores) is Windows-only; 13 workers set by hand measured the same
-as the 19-worker default on this box, because decode misses are 0.5% and served from RAM.
+Two things to know about that first fork commit. Its separate reserve for the second card had to stay at
+700 MiB: at 300 the 4070's expert cache grew by 175 slots and the MTP draft head no longer fit ("the
+draft head does not fit"). The fork's hybrid-CPU pool default (P-cores plus half the E-cores) is
+Windows-only; 13 workers set by hand measured the same as the 19-worker default on this box, because
+decode misses are 0.5% and served from RAM.
+
+## The fork's second day: each card keeps its own layers' weights
+
+Six more fork commits (pinned now) change the memory picture. A split used to load the dense weights of
+all 48 layers on every card; now each card reloads only its own. Under `--prefill-main` that cannot
+apply to the 5090, which reads every layer of a prompt, so patch 07 makes CUDA0 keep all 48 and lets the
+later cards trim. The 4070 frees 2,419 MiB and holds all 6,144 expert pairs of layers 36-47 (about 5,200
+before), the RAM copy shrinks from 6.56 to 4.83 GiB, and the draft head's room is kept out of the last
+card's cache, which removes the trap above (700 MiB stays anyway: the 4070 has room to spare). The
+CPU expert kernels use AVX-VNNI and gathers on Intel P-cores. Decode 170 -> 173, after an 80K prompt
+155 -> 161-175, RAM in use 23.4 -> 20.2 GB, prompts unchanged. Splits 35 and 34 were tried again on
+this build: the 4070 then misses 360 to 900 of its pairs, 0.4 GiB of RAM is saved and decode falls to
+161-168; 36 stays.
+
+## The loan from locked RAM
+
+On one GPU the resident mode already keeps the lent slots' experts in RAM "as far as RAM allows", so a
+prompt streams them from pinned memory. On a layer split both upstream and the fork turn that off (the
+copy's budget goes to the experts no card holds). Patch 09 adds `STRATA_RESIDENT_LEND=1`: on a split the
+lend region is kept too, from the last slot down (a short prompt borrows only the last slots), with what
+RAM is left after the whole complement and the headroom (`STRATA_RESIDENT_HEADROOM_GIB`). The GPU cache
+is untouched, so decode does not change; the cost is RAM only.
+
+Locking all 9.77 GiB of it (14.59 GiB with the complement) reads an 80K prompt at 3,089-3,173 tok/s
+instead of 2,127 and a 16K one at 2,175 instead of 1,282. But it leaves about 1 GB available, and the
+engine's parking admission keeps a 2,560 MiB floor: every park is refused ("skip parking (physical RAM
+admission ...)"), so a switch between two chats costs a re-read (5-8 s for 15K and 30K instead of 0.4 s),
+and so does every side request a chat app sends between turns. The shipped headroom of 10 GiB locks
+10.01 GiB, which covers the loan of a chunk up to about 17K tokens: 2K, 16K, follow-ups and tool-result
+steps keep the whole gain, an 80K prompt none (its 32K chunks borrow past the covered part), and
+parking works with about 3 GB of conversations before the floor refuses more. The headroom check reads
+the available RAM at boot, when the page cache still counts as available: a headroom of 7 still locked
+13 GiB. A smaller chunk does not rescue the long prompt: one 16K chunk already reads at about 2,170
+tok/s.
+
+## Short reads through the decode windows
+
+A part of the prompt of at most `--short-read` tokens (default 64) is read through the verify windows,
+as decode reads tokens; anything longer takes the batched path. The batched path has a fixed cost per
+run (it borrows slots, streams the experts the chunk routes to that are not in VRAM, refills), about
+1.6 s here on real text, then about 1.1 ms a token; a window costs about 2.2 ms a token and nothing
+up front. On the same server, the same conversation and real web text, thresholds of 64 / 256 / 512 /
+1024 read 130-160 new tokens in 1.7 / 0.5 / 0.4 / 0.4 s, 400 in 2.1 / 2.1 / 1.0 / 1.0 s, 640-740 in
+2.0-2.6 s against 1.4-1.6 s at 1024, and 884 in 2.85 against 3.4 s. The config uses 768. From 1,024
+tokens a chunk streams every expert the GPU does not hold, which is the step in the curve that patch 09
+flattens. Text built from a small vocabulary routes to few experts and made the batched path look three
+times cheaper; `tools/step_times.py` takes a file of real text for that reason.
+
+## Clients that merge a turn's tool calls
+
+The engine continues a conversation from the live session, or from a checkpoint it keeps at each turn
+boundary, as long as the new prompt starts with the tokens it holds. Some chat apps store one assistant
+message per user turn and send `assistant{tool_calls: [every call so far]}` followed by all the tool
+results. The model wrote calls and results step by step, so each new call is rendered in front of the
+earlier results, the prompt differs right after the user's message, and every step falls back to that
+checkpoint: in one 30-call research turn the log shows `14362 reused` on 19 requests in a row, the
+re-read growing from 24K to 134K tokens and from 15 to 51 s per step.
+
+Patch 10 makes the server undo this. A tool call id is `call_<16 hex>_<n>`, the 16 hex digits naming
+the response that issued it. `openai_to_messages` splits an assistant message whose calls carry two or
+more markers into one assistant message per response, each followed by its results. Text sent with the
+calls stays with the first step while the turn is running and becomes a closing assistant message once
+the conversation went on; reasoning goes with the last step. Ids of another server, a response's calls
+that are not adjacent, or a result of an unknown call leave the message as it was sent. With
+`tools/merged_tool_turn.py` every step then reuses the whole conversation and reads only the new
+result; with `OLD_IDS=1` each step reuses the first 300 tokens. What still costs a full read: a client
+that changes its system prompt between turns (a memory feature that rewrites it does).

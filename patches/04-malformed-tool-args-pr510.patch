@@ -18,10 +18,10 @@ index 07e369d..6545fec 100644
              out["tool_calls"] = calls
          messages.append(out)
 diff --git a/serve/server.py b/serve/server.py
-index 46e3fc3..7c70a9e 100644
+index 0c1a5ef..d5dc823 100644
 --- a/serve/server.py
 +++ b/serve/server.py
-@@ -2283,6 +2283,7 @@ def make_handler(svc: Service):
+@@ -2386,6 +2386,7 @@ def make_handler(svc: Service):
                  else:
                      self._json(404, {"error": {"message": "not found"}})
              except ValueError as e:
@@ -30,7 +30,7 @@ index 46e3fc3..7c70a9e 100644
              except ModelBusy as e:
                  self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
 diff --git a/serve/test_server.py b/serve/test_server.py
-index 60a1926..df6ae95 100644
+index 9d6aea1..e4fde98 100644
 --- a/serve/test_server.py
 +++ b/serve/test_server.py
 @@ -550,6 +550,17 @@ class ClientShapes(unittest.TestCase):

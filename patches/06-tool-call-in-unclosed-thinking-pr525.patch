@@ -1,8 +1,8 @@
 diff --git a/serve/frontend.py b/serve/frontend.py
-index 07e369d..9fdb124 100644
+index 794a5c5..89ba71b 100644
 --- a/serve/frontend.py
 +++ b/serve/frontend.py
-@@ -378,6 +378,11 @@ class OutputParser:
+@@ -384,6 +384,11 @@ class OutputParser:
          # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
          # nothing until the call is complete, which for a large file write can be many minutes.
          self.stream_tools = stream_tools
@@ -14,7 +14,7 @@ index 07e369d..9fdb124 100644
          self._reset_scan()
  
      def _reset_scan(self):
-@@ -500,6 +505,53 @@ class OutputParser:
+@@ -506,6 +511,53 @@ class OutputParser:
                      best = max(best, n)
          return best
  
@@ -68,7 +68,7 @@ index 07e369d..9fdb124 100644
      def feed(self, delta: str) -> list[Event]:
          self.buf += delta
          out: list[Event] = []
-@@ -507,15 +559,19 @@ class OutputParser:
+@@ -513,15 +565,19 @@ class OutputParser:
              if self.state == "reasoning":
                  i = self.buf.find(THINK_END)
                  if i < 0:
@@ -90,7 +90,7 @@ index 07e369d..9fdb124 100644
              elif self.state == "content":
                  if self.lead:                                   # newlines right after </think> or a call
                      stripped = self.buf.lstrip("\n")
-@@ -560,9 +616,10 @@ class OutputParser:
+@@ -566,9 +622,10 @@ class OutputParser:
                  self._reset_scan()
                  self.state, self.lead = "content", True
  
@@ -103,7 +103,7 @@ index 07e369d..9fdb124 100644
          out = []
          if self.state == "call" and self.stream_tools and self.scall is not None:
              out += self._scan()                 # the output ended inside a call that was already announced
-@@ -575,5 +632,7 @@ class OutputParser:
+@@ -583,5 +640,7 @@ class OutputParser:
              kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
              text = self.buf if self.state != "call" else CALL_START + self.buf
              out.append(Event(kind, text))
@@ -113,10 +113,10 @@ index 07e369d..9fdb124 100644
 -        return out
 +        return out + self._rescue_unclosed_call(finish_reason)
 diff --git a/serve/server.py b/serve/server.py
-index 46e3fc3..a20a2fb 100644
+index d5dc823..c024060 100644
 --- a/serve/server.py
 +++ b/serve/server.py
-@@ -1604,7 +1604,7 @@ class Service:
+@@ -1707,7 +1707,7 @@ class Service:
          finally:
              if emb:
                  Path(emb).unlink(missing_ok=True)
@@ -126,10 +126,10 @@ index 46e3fc3..a20a2fb 100644
          yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                         "timings": timings}
 diff --git a/serve/test_server.py b/serve/test_server.py
-index 60a1926..06e810d 100644
+index 18ad486..a6e20e9 100644
 --- a/serve/test_server.py
 +++ b/serve/test_server.py
-@@ -2329,5 +2329,140 @@ class LostStep(unittest.TestCase):
+@@ -2480,5 +2480,140 @@ class LostStep(unittest.TestCase):
          self.run_mode("stop", stream=False)
  
  

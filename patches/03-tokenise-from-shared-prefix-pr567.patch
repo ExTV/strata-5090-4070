@@ -1,8 +1,8 @@
 diff --git a/serve/server.py b/serve/server.py
-index 2709556..76b7618 100644
+index 28c2591..0c1a5ef 100644
 --- a/serve/server.py
 +++ b/serve/server.py
-@@ -892,18 +892,25 @@ class ByteTokenizer:
+@@ -978,18 +978,25 @@ class ByteTokenizer:
      """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
      SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
  
@@ -30,7 +30,7 @@ index 2709556..76b7618 100644
  
      def decode(self, ids, errors="replace"):
          raw = bytearray()
-@@ -987,6 +994,17 @@ class Service:
+@@ -1077,6 +1084,17 @@ class Service:
          self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
          self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                              tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -48,7 +48,7 @@ index 2709556..76b7618 100644
  
      def loaded(self) -> bool:
          return not hasattr(self.engine, "alive") or self.engine.alive()
-@@ -1333,7 +1351,7 @@ class Service:
+@@ -1423,7 +1441,7 @@ class Service:
          """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
          the rest of the context."""
          prompt = self.template.render(messages, tools=tools, **kwargs)
@@ -57,7 +57,7 @@ index 2709556..76b7618 100644
          self.embeddings.path = None
          images = images_of(messages)
          if images:
-@@ -2416,7 +2434,7 @@ def make_handler(svc: Service):
+@@ -2557,7 +2575,7 @@ def make_handler(svc: Service):
              req = svc.with_shared(req, "anthropic")
              messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
              prompt = svc.template.render(messages, tools=tools, **kw)
@@ -67,10 +67,10 @@ index 2709556..76b7618 100644
          def _anthropic(self, req):
              svc.load()
 diff --git a/serve/test_server.py b/serve/test_server.py
-index 8f34a74..fff7540 100644
+index 1f7ae17..9d6aea1 100644
 --- a/serve/test_server.py
 +++ b/serve/test_server.py
-@@ -618,6 +618,59 @@ class RecordingPrompt(MockEngine):
+@@ -655,6 +655,59 @@ class RecordingPrompt(MockEngine):
          yield from super().generate(ids, max_new, sampling, cancel, embeddings)
  
  

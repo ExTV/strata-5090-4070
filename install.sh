@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 STRATA_REPO=${STRATA_REPO:-https://github.com/Hardin22/Strata-DualGPU.git}
-STRATA_COMMIT=${STRATA_COMMIT:-dfdeb0540c5d7038531cde5fe2144ff7ad5cd9fe}   # the fork head of 2026-10-03 (issue Niko1221/Strata#642), on Strata v0.1.38
+STRATA_COMMIT=${STRATA_COMMIT:-03a5ec955ba152a5f499a18a0f2f2ac192309c28}   # the fork head of 2026-10-03 21:38 UTC (issue Niko1221/Strata#642), on Strata v0.1.38
 MODELS=${MODELS:-$PWD/models}
 CUDA_ARCHS=${CUDA_ARCHS:-"89;120"}
 JOBS=${JOBS:-3}          # a cicc/nvcc job takes ~3 GB of RAM; 3 jobs fit a 32 GB box next to a desktop
@@ -55,7 +55,7 @@ cmake --build build-vision --target strata-vision -j"$JOBS"
 
 MODELS="$MODELS" python3 -c 'import os,sys; sys.stdout.write(open("../configs/flash-next-262k.json.in").read().replace("@MODELS@", os.environ["MODELS"]))' > strata-flash-next-262k.json
 echo "$MODELS" > models.path      # prepare.sh and the launcher read it, so MODELS= is needed only here
-sha256sum -c --quiet ../patches/MANIFEST.sha256 && echo "the 18 patched files match patches/MANIFEST.sha256 (the tested tree)"
+sha256sum -c --quiet ../patches/MANIFEST.sha256 && echo "the 19 patched files match patches/MANIFEST.sha256 (the tested tree)"
 echo
 echo "built: strata/build/strata, strata/build-vision/bin/strata-vision; config strata/strata-flash-next-262k.json (MODELS=$MODELS)"
 echo "next: download the model into $MODELS (README step 2), then ./prepare.sh, then launchers/flash-next-262k.sh"
