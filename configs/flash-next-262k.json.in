@@ -19,9 +19,12 @@
   "--vram-reserve-later-mib", "700",
   "--resident-experts",
   "--prefill-main",
-  "--conversation-cache-mib", "4096",
+  "--conversation-cache-mib", "6144",
   "--conversation-cache-slots", "8",
-  "--short-read", "768"
+  "--short-read", "768",
+  "--trim-stage-weights",
+  "--pipeline-windows", "2",
+  "--adapt-async", "1"
  ],
  "fit_max_tokens": true,
  "gpu": [0, 1],
@@ -29,7 +32,13 @@
  "gpu_order": "as_given",
  "vram_reserve": "as_given",
  "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
- "env": {"STRATA_BLOB_PREAD": "1", "STRATA_PF_FUSED": "1", "STRATA_RESIDENT_LEND": "1", "STRATA_RESIDENT_HEADROOM_GIB": "10"},
+ "format_fixes": "stranded-call",
+ "env": {
+  "STRATA_BLOB_PREAD": "1", "STRATA_PF_FUSED": "1", "STRATA_RESIDENT_LEND": "1", "STRATA_RESIDENT_HEADROOM_GIB": "14",
+  "STRATA_PL_PLE_PREFETCH": "1", "STRATA_PL_PLE_LATE": "1", "STRATA_PL_EARLY_CHAIN": "1",
+  "STRATA_SPLIT_SMALL_OWN": "3072",
+  "MALLOC_MMAP_THRESHOLD_": "1048576", "MALLOC_ARENA_MAX": "4"
+ },
  "cwd": ".",
  "tokenizer": "packs/gsq-iq3_xxs/tokenizer",
  "model_name": "qwen3.8-flash-next",

@@ -1,0 +1,2555 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b86663b..8f69176 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -350,6 +350,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
+     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
+   endif()
++  # STRATA_ATTN_MERGE_V2: the decode attention's merge bounded by the selection width, against the original on the
++  # same chunk partials, bitwise, over the four KV formats (GPU, synthetic, no model, ~260 MB of VRAM; --bench adds
++  # each merge's time per call at the drafter's shape)
++  if(STRATA_BUILD_TESTS)
++    add_executable(attn_merge_parity src/kernels/attn_merge_parity.cpp)
++    target_include_directories(attn_merge_parity PRIVATE ${_strata_gpu_include_directories})
++    target_link_libraries(attn_merge_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
++    add_test(NAME attn_merge_parity COMMAND attn_merge_parity)
++    set_tests_properties(attn_merge_parity PROPERTIES SKIP_RETURN_CODE 77)
++  endif()
+   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
+   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
+   # 262144-cell capacity (the top-k dispatch follows the capacity) and exits non-zero on a failed gate
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index b606eb6..043503b 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -138,6 +138,13 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
+   as far as the RAM allows, their experts are kept in RAM too (so a prompt reads nothing from the SSD either).
+ - The cache still follows the conversation (`--adapt-every`): a swap copies the evicted expert back from VRAM into the
+   RAM place of the one that replaces it, so the RAM copy keeps holding exactly what the GPU does not.
++- `--adapt-async 1` (opt-in, `--serve`): the swaps of a round advance between decode windows on a helper thread
++  (copy back, copy in, move into RAM) instead of one window waiting for the whole round. Not with `--batch` or
++  `--peer-device` (the blocking tier runs there). With `--pipeline-windows 2` (two windows in flight, see
++  [MULTI_GPU.md](MULTI_GPU.md)) the copies are queued by the decode loop itself while their card has no window in
++  flight, and the copies into the evicted slots and the moves into RAM wait until the windows that were in flight when
++  they were decided have completed (`STRATA_PIPELINE_ADAPT_ASYNC=0`: the blocking tier there). It is not bit-exact from run to run: which window first computes a swapped-in expert on the GPU (which
++  rounds differently from the CPU) depends on when its copy lands.
+ - The answers are the plain mapped mode's for the same expert placement: the bytes are the file's. With a page-locked
+   copy the GPU also takes its usual share of the misses over PCIe (`--pcie-frac`), as with enough RAM; `--pcie-frac 0`
+   (or `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
+diff --git a/docs/MULTI_GPU.md b/docs/MULTI_GPU.md
+index f26f180..1a1f9e4 100644
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -223,6 +223,10 @@ Two cards, exactly two stages, `--serve`. In the config:
+   (`--expert-cache-device1..3`, `--remote-expert-opt`), a split into three or more stages or onto one GPU
+   (`--split-device 0`), or no draft layer. A request with repetition penalties (`penalty_last_n`) or coupled
+   draft sampling decodes serially.
++- **With the resident RAM mode's asynchronous swaps** (`--adapt-async 1`, [DETAILS.md](DETAILS.md)) a round's steps
++  advance between the verified windows. Each card's copies are queued by the decode loop itself while that card has
++  no window in flight, after every window that may still read what they overwrite has finished; the moves into RAM
++  wait the same way.
+ - **Measured** (Swift 1.5 IQ3_XXS, 160K context, q4_0 KV, the stock draft layer, RTX 4060 Ti (layers 0-19) +
+   RTX 5080 (20-47), i9-14900KF, 32 GB of RAM with the resident RAM mode on the split (#848); greedy, 500 tokens, two
+   interleaved pairs of three rounds, decode tok/s): Python code 90.4 -> 103.1, C code 76.6 -> 81.6, English prose
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 4bb0e37..736e70c 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -480,6 +480,7 @@ public:
+     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
+     bool reserve_exchanges(int64_t n, std::string& err);
+     int64_t exchange_capacity() const { return xstage_cap_; }
++    bool exchange_pinned() const { return xstage_pinned_; }
+     uint8_t* exchange_buffer(int64_t q) const;
+     /// Requires `has_resident(layer, in)`, `!has_resident(layer, out)` and `exchange_buffer(q)` holding out's blob.
+     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
+@@ -488,6 +489,14 @@ public:
+     void prepare_overrides() { if (override_.empty()) override_.assign((size_t) blobs_, nullptr); }
+     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
+     int64_t commit_exchanges();
++    /// `commit_exchanges` in two halves, for the asynchronous adaptive tier (--adapt-async): `commit_copies` moves
++    /// every staged evicted blob into its `in`'s place in the copy (on another thread: safe once nothing computes `in`
++    /// from RAM - it is resident on the GPU - while `out` is still read from its exchange buffer), then `commit_flip`
++    /// (the caller's thread, between windows) points `out` there and drops the staging.  Returns how many were applied.
++    void commit_copies();
++    int64_t commit_flip();
++    /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read (any thread).
++    const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
+     int64_t exchanges() const { return exchanges_; }
+     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
+     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index 7c638ed..b14d611 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -195,6 +195,17 @@ public:
+     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
+     /// the device-planned layers (E-6) off.  Before `init`.
+     void set_always_publish(bool on) { always_publish_ = on; }
++    /// STRATA_PL_PLE_LATE (stage 0): each pipelined window reads its PLE rows through a ticket of its own
++    /// (PleTable::gather_issue_t, so both verifiers of the stage can have a window staged) instead of the table's
++    /// shared prefetch slots, and `service` never waits for them: when layer 0 has been served before they have
++    /// landed, its flag goes up later, once they have, and the host serves the other windows meanwhile.  `run` and the
++    /// batch windows are unchanged.
++    void set_ple_ticketed(bool on) { ple_tk_ = on; }
++    /// set_ple_ticketed: tickets issued, collected at staging or launch (already landed), collected by `service`,
++    /// dropped (a window staged ahead and never launched); windows whose layer-0 flag waited for the rows, and that
++    /// wait (ms, host side)
++    int64_t ple_tk_issued = 0, ple_tk_now = 0, ple_tk_late = 0, ple_tk_dropped = 0, ple_tk_held = 0;
++    double ms_ple_held = 0;
+     cudaStream_t stream() const { return cs_; }
+     int device() const { return device_; }
+     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
+@@ -285,7 +296,17 @@ private:
+     // pipelined windows (pl_launch ...)
+     cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
+     bool always_publish_ = false;
+-    void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
++    bool pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
++    // set_ple_ticketed: the ticket of the window staged on this verifier (-1: none outstanding).  h_ple_ is written
++    // only by the collect of the ticket issued for the window staged here: at its staging or launch, or while it runs
++    // but before its layer-0 flag is up (layer 1 copies the rows after that flag).
++    bool ple_tk_ = false;
++    int ple_ticket_ = -1;
++    bool fl_ple_held_ = false;   ///< layer 0 served, its flag held until the window's rows have landed
++    double fl_ple_held_ms_ = 0;
++    /// The outstanding ticket's rows into h_ple_ if they have all landed (never blocks); -1 on an error (`err`), else
++    /// 0 (ple_ticket_ is -1 once they are in).  `late`: polled by `service` (counted apart from staging).
++    int ple_poll(std::string& err, bool late);
+     cudaEvent_t ev_done_ = nullptr, ev_commit_ = nullptr;
+     unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
+     bool fl_active_ = false, fl_prof_ = false, fl_ple_ = false, commit_live_ = false, pl_prestaged_ = false;
+diff --git a/include/strata/kernels/ngram.hpp b/include/strata/kernels/ngram.hpp
+index a321ea7..f10886e 100644
+--- a/include/strata/kernels/ngram.hpp
++++ b/include/strata/kernels/ngram.hpp
+@@ -150,6 +150,29 @@ public:
+     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
+     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
+     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
++    /// STRATA_PL_PLE_LATE: `gather_batch` in two halves with a HANDLE, so several batches can be in flight at once
++    /// (the pipelined decode's two stage-0 verifiers each stage a window ahead of its launch).  Each handle owns its row
++    /// list and raw buffer, apart from `prefetch_rows`' slots.  `gather_issue_t` starts the reads (Direct mode; the
++    /// mapped mode reads in `gather_collect_t`) and returns the handle, -1 on an error (`err`); `gather_ready` never
++    /// blocks; `gather_collect_t` writes `out` (the same bytes as `gather_batch`) and frees the handle; `gather_drop`
++    /// frees one that will never be collected (a window staged ahead and never launched) - its buffer is reused only
++    /// once its reads have landed.
++    int gather_issue_t(const uint32_t* rows, size_t n_tokens, std::string& err);
++    bool gather_ready(int h);
++    bool gather_collect_t(int h, float* out, std::string& err);
++    void gather_drop(int h);
++    /// STRATA_PL_PLE_PREFETCH (Direct mode): start reading the rows of `n` tokens into the reader's row cache - token
++    /// i's 16 rows from its two predecessors, (prev0, prev1) for token 0 then the tokens themselves, as a verify
++    /// window's staging hashes them.  Nothing waits for them; a later request for the same rows finds them cached, or
++    /// waits for their read in flight instead of reading them again.  `consts` null: the artifact's.
++    void prefetch_tokens(const int32_t* toks, int n, int32_t prev0, int32_t prev1, const PleConsts* consts = nullptr);
++    /// The reader's counters (Direct mode; zeros otherwise), for per-request deltas in the decode timing.
++    struct IoCounters {
++        uint64_t requests = 0, cache_hits = 0, attached = 0, reads = 0, prefetch_rows = 0, prefetch_skipped = 0,
++                 prefetch_reads = 0;
++        double wait_us = 0;
++    };
++    IoCounters io_counters() const;
+ 
+     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
+     void set_injected_delay_us(double us);
+diff --git a/include/strata/kernels/qsa_decode_attn.hpp b/include/strata/kernels/qsa_decode_attn.hpp
+index 45c0f30..9eca82a 100644
+--- a/include/strata/kernels/qsa_decode_attn.hpp
++++ b/include/strata/kernels/qsa_decode_attn.hpp
+@@ -43,4 +43,13 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+ 
++/// For src/kernels/attn_merge_parity.cpp only: qsa_decode_attn_batch's two passes apart.  `chunks_only` runs its chunk
++/// pass into `scratch`; `merge_only` merges those partials with the kernel `v2` names (0: attn_merge_kernel, 1:
++/// attn_merge_v2_kernel, the one STRATA_ATTN_MERGE_V2 picks, on by default on NVIDIA), whatever the environment says,
++/// so one chunk pass can be merged by both and the outputs compared bit for bit.
++void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
++                                 int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, void* stream);
++void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
++                                float* attn, int64_t n_q, int v2, void* stream);
++
+ }  // namespace strata::kernels
+diff --git a/include/strata/ngram/ple_reader.hpp b/include/strata/ngram/ple_reader.hpp
+index 2884817..cf0a391 100644
+--- a/include/strata/ngram/ple_reader.hpp
++++ b/include/strata/ngram/ple_reader.hpp
+@@ -39,6 +39,11 @@ struct ReaderStats {
+     uint64_t late_injected = 0;   ///< reads delayed by fault injection
+     uint64_t keepalive_reads = 0; ///< pages read only to keep the SSD awake (not in `reads`, `bytes` or latencies)
+     double keepalive_us_max = 0;  ///< the slowest of them
++    // STRATA_PL_PLE_PREFETCH: `prefetch`, not in `requests` / `cache_hits` (those stay the tickets' own rows)
++    uint64_t prefetch_rows = 0;     ///< rows `prefetch` sent to the SSD
++    uint64_t prefetch_skipped = 0;  ///< rows `prefetch` found in the row cache or already being read
++    uint64_t prefetch_reads = 0;    ///< SSD reads of those rows (also in `reads`, `bytes` and the latencies)
++    uint64_t attached_rows = 0;     ///< rows an `issue` took from a prefetch read still in flight (no second read)
+     std::vector<float> read_us;   ///< last <= 65,536 read latencies, for percentiles
+     double percentile(double q) const;
+ };
+@@ -72,6 +77,22 @@ public:
+     /// Block until every row of the ticket is in `out_raw`. Returns false on an I/O error (message in `err`).
+     bool collect(Ticket t, std::string& err);
+ 
++    /// STRATA_PL_PLE_PREFETCH: start reading `n` rows into the ROW CACHE, for an `issue` that will want them
++    /// soon (the pipelined decode knows a window's tokens 0.3-3 ms before it stages them: row 0 at the verdict,
++    /// each draft as the drafter's chain lands it).  No ticket: rows already cached or already being read by an
++    /// earlier prefetch are skipped, the rest go to the SSD behind any ticket's reads and are inserted into the
++    /// cache when they land.  An `issue` that wants a row whose prefetch read is still in flight ATTACHES to that
++    /// read (its ticket completes with it) instead of reading the page again.  The bytes are the table's, so
++    /// whatever is prefetched (a wrong guess included) changes no value; it only spends SSD reads.  Until the first
++    /// call the reader behaves exactly as before.
++    void prefetch(const uint32_t* rows, size_t n);
++
++    /// STRATA_PL_PLE_LATE: non-blocking - every row of the ticket has landed (or the reader failed: `collect`
++    /// then says so), so `collect` returns at once.  With `epoch` (io_thread mode): the reader's completion count
++    /// at the caller's last look; when no ticket has completed since, false without taking the reader's lock (the
++    /// host loop polls this between doorbells, beside the I/O worker that needs the same lock).
++    bool ready(Ticket t, uint64_t* epoch = nullptr);
++
+     /// Keep the SSD awake while the table is in use (io_thread mode only; call after `open`): when no read has
+     /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`.
+     /// Some SSDs drop into a power state after ~250 ms without a command and stall the next reads 50-150 ms
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index b8e5dab..0c2d817 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -1824,6 +1824,40 @@ int64_t FileExpertSource::commit_exchanges() {
+     return n;
+ }
+ 
++void FileExpertSource::commit_copies() {
++    for (const Exchange& x : staged_) {
++        const uint8_t* src = override_.empty() ? nullptr : override_[x.out];
++        const uint64_t at = complement_offsets_[x.in];
++        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
++            complement_host_ != nullptr)
++            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
++    }
++}
++
++int64_t FileExpertSource::commit_flip() {
++    int64_t n = 0;
++    for (const Exchange& x : staged_) {
++        const uint8_t* src = override_[x.out];
++        const uint64_t at = complement_offsets_[x.in];
++        // the same test as commit_copies: an exchange whose bytes were copied is the one that flips
++        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
++            complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
++            ++n;
++        override_[x.out] = nullptr;
++    }
++    staged_.clear();
++    exchanges_ += n;
++    return n;
++}
++
++const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) const {
++    if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ ||
++        expert >= n_expert_) return nullptr;
++    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
++    if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return nullptr;
++    return complement_host_ + (size_t) complement_offsets_[index];
++}
++
+ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
+     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 9ab1349..4d3a653 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -225,8 +225,28 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
+     const bool kv_hybrid_was = qsa_kv_hybrid();
+     const bool kv_int8_was = qsa_kv_int8();
++    const bool kv_q4_was = qsa_kv_q4();
+     qsa_set_kv_hybrid(false);
+     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
++    // STRATA_MTP_KV=q4|int8|f16 (opt-in): the draft layer's own K/V format; unset, it follows the main layers' as
++    // before.  Under --kv q4_0 the drafter's rotated 4-bit K/V costs draft acceptance, and only the drafts change, never
++    // the verified output: every drafter path reads st_'s own format (the K/V append and attention below, the prompt
++    // path's draft-layer batch, the conversation snapshot's format check).  It is one layer of K/V on the drafter's card,
++    // taken before `--expert-cache auto` sizes the slots: fully resident at --max-context 163840, q4_0 90 MiB, int8 165,
++    // f16 320.
++    std::string mtp_kv;   // "" = the main layers' format
++    if (const char* kv = std::getenv("STRATA_MTP_KV"); kv != nullptr && *kv != '\0') {
++        const std::string want(kv);
++        if (want == "q4" || want == "q4_0") mtp_kv = "q4";
++        else if (want == "int8" || want == "q8") mtp_kv = "int8";
++        else if (want == "f16" || want == "fp16") mtp_kv = "f16";
++        else std::fprintf(stderr, "strata mtp: STRATA_MTP_KV=%s is not q4, int8 or f16; the draft layer keeps the main "
++                                  "layers' K/V format\n", kv);
++    }
++    if (!mtp_kv.empty()) {
++        qsa_set_kv_q4(mtp_kv == "q4");
++        qsa_set_kv_int8(mtp_kv == "int8");
++    }
+     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
+     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+@@ -241,7 +261,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
+         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
+     }
+     qsa_set_kv_int8(kv_int8_was);
++    qsa_set_kv_q4(kv_q4_was);
+     qsa_set_kv_hybrid(kv_hybrid_was);
++    if (!mtp_kv.empty())
++        std::fprintf(stderr, "strata mtp: draft layer K/V format %s (STRATA_MTP_KV=%s; main layers %s), rotated %d, %s, "
++                             "state %.1f MiB of VRAM\n", st_.kv_q4 ? "q4_0" : (st_.kv_int8 ? "int8" : "f16"), mtp_kv.c_str(),
++                     kv_hybrid_was ? "k8v4" : (kv_q4_was ? "q4_0" : (kv_int8_was ? "int8" : "f16")), st_.kv_rot ? 1 : 0,
++                     st_.kv_mode == 2 ? "a window ring over pinned RAM"
++                                      : (st_.kv_mode == 1 ? "streamed over pinned RAM (--kv-resident)" : "fully resident"),
++                     (double) sb / 1048576.0);
+     qsa_state_zero(st_, g, nullptr);
+     cudaDeviceSynchronize();
+     vram_ += sb;
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index bcc35ff..f4256c5 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2189,6 +2189,9 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
+                     "commit event %s (commit launched %d)\n", name, fl_active_ ? "IN FLIGHT" : "idle", last_t_,
+                  (long long) last_pos0_, (long long) fl_k_, (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
+                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
++    if (ple_tk_)   // STRATA_PL_PLE_LATE: layer 0's flag waits for the window's PLE rows while it is held
++        std::fprintf(f, "  %s: PLE rows: ticket %d outstanding, layer 0 %s\n", name, ple_ticket_,
++                     fl_ple_held_ ? "HELD for them" : "not held");
+ }
+ 
+ bool Verifier::capture_all(std::string& err) {
+@@ -2214,8 +2217,10 @@ bool Verifier::capture_all(std::string& err) {
+ }
+ 
+ // The host staging of a pipelined window: run()'s (stage_inputs), and its PLE rows from `ple_prev` with their pages
+-// prefetched (they are gathered into the mapped rows when layer 0 is served, as run() does).
+-void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]) {
++// prefetched (they are gathered into the mapped rows when layer 0 is served, as run() does).  set_ple_ticketed: the
++// rows are read through a ticket of the window's own instead, collected now if they have all landed already (the row
++// cache), else by `service`.
++bool Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
+     using namespace strata::kernels;
+     stage_inputs(T, tokens, pos0);
+     staged_ = false;   // a later run() stages its own window
+@@ -2227,11 +2232,37 @@ void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_
+             ngram_rows(&tokens[t], prev, 1, ss.ple.consts, pl_ple_rows_.data() + t * PLE_N_HEADS);
+             prev[0] = prev[1];
+             prev[1] = tokens[t];
+-            ss.ple.table->prefetch_rows(pl_ple_rows_.data() + t * PLE_N_HEADS);
++            if (!ple_tk_) ss.ple.table->prefetch_rows(pl_ple_rows_.data() + t * PLE_N_HEADS);
++        }
++        if (ple_tk_) {
++            if (ple_ticket_ >= 0) {   // a window staged ahead and never launched: those rows are not this window's
++                ss.ple.table->gather_drop(ple_ticket_);
++                ple_ticket_ = -1;
++                ++ple_tk_dropped;
++            }
++            ple_ticket_ = ss.ple.table->gather_issue_t(pl_ple_rows_.data(), (size_t) T, err);
++            if (ple_ticket_ < 0) return false;
++            ++ple_tk_issued;
++            if (ple_poll(err, false) < 0) return false;
+         }
+     }
+     pl_prev_[0] = ple_prev[0];
+     pl_prev_[1] = ple_prev[1];
++    return true;
++}
++
++int Verifier::ple_poll(std::string& err, bool late) {
++    if (ple_ticket_ < 0) return 0;
++    SessionState& ss = *ss_;
++    if (!ss.ple.table->gather_ready(ple_ticket_)) return 0;
++    const int h = ple_ticket_;
++    ple_ticket_ = -1;
++    const bool ok = ss.ple.table->gather_collect_t(h, h_ple_, err);   // returns at once: every row has landed
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    _mm_sfence();
++    if (late) ++ple_tk_late;
++    else ++ple_tk_now;
++    return ok ? 0 : -1;
+ }
+ 
+ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
+@@ -2239,7 +2270,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
+     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+     if (pl_ple_rows_.empty()) { err = "verify: pipelined window not prepared (capture_all)"; return false; }
+     const Clock::time_point t0 = Clock::now();
+-    pl_stage(T, tokens, pos0, ple_prev);
++    if (!pl_stage(T, tokens, pos0, ple_prev, err)) return false;
+     pl_prestaged_ = true;
+     ms_host += ms_since(t0);
+     return true;
+@@ -2263,7 +2294,10 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
+     if (staged && ss.ple.ready() && ple_stage())
+         staged = pl_prev_[0] == ss.ple_prev[0] && pl_prev_[1] == ss.ple_prev[1];
+     pl_prestaged_ = false;
+-    if (!staged) pl_stage(T, tokens, pos0, ss.ple_prev);
++    if (!staged && !pl_stage(T, tokens, pos0, ss.ple_prev, err)) return false;
++    // set_ple_ticketed: a window staged ahead issued its rows then; they have usually landed by now
++    if (ple_ticket_ >= 0 && ple_poll(err, false) < 0) return false;
++    fl_ple_held_ = false;
+     const int G = groups_[T] > 0 ? groups_[T] : 1;
+     fl_T_ = T;
+     fl_k_ = 0;
+@@ -2301,8 +2335,20 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+         ms_host += ms_since(tp);
+         return true;
+     };
++    // set_ple_ticketed: 1 = the window's rows are in h_ple_ (or it has none), 0 = not landed yet, -1 = an error.
++    // Never blocks: this thread serves the stage's other window and the other stage too.
++    auto ple_in = [&]() -> int {
++        if (!fl_ple_) return 1;
++        if (ple_ticket_ >= 0 && ple_poll(err, true) < 0) return -1;
++        return ple_ticket_ < 0 ? 1 : 0;
++    };
+     if (all_resident_) {   // the zero-doorbell graph never rings: it waits only for flag 1 (stage 0's PLE rows)
+-        if (!gather_ple()) return -1;
++        if (ple_tk_) {
++            const int r = ple_in();
++            if (r <= 0) return r;
++        } else if (!gather_ple()) {
++            return -1;
++        }
+         *(volatile uint32_t*) h_flag_ = 1;
+         fl_k_ = fl_total_;
+         progress_tick();
+@@ -2313,6 +2359,25 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+     while (fl_k_ < fl_total_) {
+         const int64_t l = lb_ + fl_k_ / G;
+         const uint32_t want = (uint32_t) (fl_k_ + 1);
++        if (fl_ple_held_) {   // set_ple_ticketed: layer 0 is served, its flag waits for the window's PLE rows
++            const int r = ple_in();
++            if (r < 0) return -1;
++            if (r == 0) {
++                if (now_ms() - fl_ple_held_ms_ > 20000.0) {   // #267: no spin kernel may outlive the engine
++                    trace_ev("TIMEOUT", fl_k_, l, 0);
++                    err = "verify: the PLE rows of layer " + std::to_string(l) + " never landed" +
++                          released_note(release_gpu_waits(5000));
++                    return -1;
++                }
++                return 0;
++            }
++            fl_ple_held_ = false;
++            ms_ple_held += now_ms() - fl_ple_held_ms_;
++            *(volatile uint32_t*) h_flag_ = want;
++            ++fl_k_;
++            fl_since_ms_ = fl_flush_ms_ = now_ms();
++            continue;
++        }
+         if (*(volatile uint32_t*) h_seq_ < want) {
+             const double now = now_ms();
+             if (now - fl_flush_ms_ > 2.0) {   // flush WDDM and notice a dead graph, as run() does
+@@ -2358,7 +2423,19 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+             *(volatile uint32_t*) h_flagA_ = want;
+             raise_flag(h_flagB_, want);
+         }
+-        if (fl_k_ == 0 && !gather_ple()) return -1;
++        if (fl_k_ == 0 && ple_tk_) {
++            const int r = ple_in();
++            if (r < 0) return -1;
++            if (r == 0) {   // layer 0's flag goes up once the rows are in (the next calls), the host free meanwhile
++                fl_ple_held_ = true;
++                fl_ple_held_ms_ = now_ms();
++                ++ple_tk_held;
++                ms_pool += ms_since(b);
++                return 0;
++            }
++        } else if (fl_k_ == 0 && !gather_ple()) {
++            return -1;
++        }
+         *(volatile uint32_t*) h_flag_ = want;
+         ++fl_k_;
+         ms_pool += ms_since(b);
+@@ -2446,6 +2523,10 @@ void Verifier::absorb_stats(Verifier& o) {
+     windows += o.windows;
+     o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;
+     o.windows = 0;
++    ple_tk_issued += o.ple_tk_issued; ple_tk_now += o.ple_tk_now; ple_tk_late += o.ple_tk_late;
++    ple_tk_dropped += o.ple_tk_dropped; ple_tk_held += o.ple_tk_held; ms_ple_held += o.ms_ple_held;
++    o.ple_tk_issued = o.ple_tk_now = o.ple_tk_late = o.ple_tk_dropped = o.ple_tk_held = 0;
++    o.ms_ple_held = 0;
+     for (int k = 0; k < 2; ++k)
+         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
+     prof_windows_ += o.prof_windows_;
+diff --git a/src/kernels/attn_merge_parity.cpp b/src/kernels/attn_merge_parity.cpp
+new file mode 100644
+index 0000000..e1b68ae
+--- /dev/null
++++ b/src/kernels/attn_merge_parity.cpp
+@@ -0,0 +1,347 @@
++// src/kernels/attn_merge_parity.cpp - the decode attention's merge with STRATA_ATTN_MERGE_V2 (attn_merge_v2_kernel)
++// against the original (attn_merge_kernel), bitwise (GPU, synthetic, no model).
++//
++// One chunk pass of qsa_decode_attn_batch (qsa_decode_attn_chunks_only) over random pools, then BOTH merges on the same
++// partials (qsa_decode_attn_merge_only with v2 = 0, attn_merge_kernel, and v2 = 1, attn_merge_v2_kernel), and a memcmp
++// of the two outputs. The merge is chosen by the argument, never by the environment. Covers:
++//   - the four KV formats the chunk kernel reads: fp16, int8, q4_0 (rotated or not, the merge cannot tell), k8v4;
++//   - page tables with unresident (-1) pages: scattered single pages, and one run of 64 pages (256 consecutive cells)
++//     that the window-shaped selections land on, so whole chunks inside the width are masked (m = -FLT_MAX, l = 0,
++//     acc = 0) and some queries are masked entirely (output 0);
++//   - widths {0, 1, 63, 64, 65, 1023, 1024, 1025, 2051, 4096, 16383, 16385, 32768} per query (1023-1025 and 16383 /
++//     16385 sit on the v2 merge's 16-chunk block edges), all queries alike and mixed within one batch; a width above
++//     the cap (4096, 32768 under cap 2112) is clamped by the chunk kernel itself and must be by the merge too;
++//   - n_q 1..6, cap 2112 (the main layers' selection width 2051, rounded up to whole chunks) and 32768 (the drafter's
++//     default --mtp-window);
++//   - selections shaped like the drafter's window (consecutive cells, window_ids), like the indexer's (ascending, with
++//     gaps) and unordered with repeats.
++// The scratch is filled with NaN before every chunk pass, so a merge that read a partial the chunk pass did not write
++// (a chunk past the width, say) would differ from the other one or produce a NaN.  ~260 MB of VRAM.
++//
++//   attn_merge_parity [--device N]           the sweep; exit 0 when every case is bit-identical (77: no GPU)
++//   attn_merge_parity [--device N] --bench   plus each merge's time per call at the drafter's shape (cap 32768)
++#include "strata/kernels/kv_q4.hpp"
++#include "strata/kernels/kv_q8.hpp"
++#include "strata/kernels/qsa.hpp"
++#include "strata/kernels/qsa_decode_attn.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++namespace k = strata::kernels;
++
++namespace {
++void ck(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "attn_merge_parity: %s: %s\n", what, cudaGetErrorString(e));
++        std::exit(2);
++    }
++}
++template <typename T> T* dalloc(size_t n) {
++    T* p = nullptr;
++    ck(cudaMalloc((void**) &p, n * sizeof(T) + 256), "cudaMalloc");
++    ck(cudaMemset(p, 0, n * sizeof(T) + 256), "cudaMemset");
++    return p;
++}
++template <typename T> T* upload(const std::vector<T>& h) {
++    T* d = dalloc<T>(h.size());
++    ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "upload");
++    return d;
++}
++
++// fp16 bits drawn directly: a random sign, exponent 11..15 (|x| in [2^-4, 2)), a random mantissa; finite by
++// construction. Scales are positive: INT8 [1/64, 1/32) (codes up to 127 give |x| < 4), Q4_0 [1/4, 1/2).
++uint16_t f16_value(uint32_t r) { return (uint16_t) ((r & 0x8000u) | ((11u + (r >> 16) % 5u) << 10) | (r & 0x3FFu)); }
++uint16_t f16_scale_q8(uint32_t r) { return (uint16_t) ((9u << 10) | (r & 0x3FFu)); }
++uint16_t f16_scale_q4(uint32_t r) { return (uint16_t) ((13u << 10) | (r & 0x3FFu)); }
++
++constexpr int kFmtF16 = 0, kFmtInt8 = 1, kFmtQ4 = 2, kFmtK8V4 = 3;
++const char* fmt_name(int f) { return f == kFmtF16 ? "fp16" : f == kFmtInt8 ? "int8" : f == kFmtQ4 ? "q4_0" : "k8v4"; }
++
++struct DevicePools {   // every format's pools over the same physical rows; `view` picks what a KV mode reads
++    uint16_t *k16 = nullptr, *v16 = nullptr, *k8s = nullptr, *v8s = nullptr;
++    int8_t *k8 = nullptr, *v8 = nullptr;
++    uint8_t *k4 = nullptr, *v4 = nullptr;
++    k::QsaAttnPools view(int fmt, const int32_t* table) const {
++        k::QsaAttnPools p;
++        p.page_table = table;
++        if (fmt == kFmtF16) { p.k_pool = k16; p.v_pool = v16; }
++        else if (fmt == kFmtInt8) { p.k_q = k8; p.v_q = v8; p.k_scale = k8s; p.v_scale = v8s; }
++        else if (fmt == kFmtQ4) { p.k_q4 = k4; p.v_q4 = v4; }
++        else { p.k_q = k8; p.k_scale = k8s; p.v_q4 = v4; }   // K8V4: INT8 K, Q4_0 V (qsa_decode_attn.cu kv_mode 3)
++        return p;
++    }
++};
++
++DevicePools make_pools(int64_t rows, int64_t D, std::mt19937& rng) {
++    DevicePools p;
++    {
++        std::vector<uint16_t> h((size_t) (rows * D));
++        for (auto& x : h) x = f16_value(rng());
++        p.k16 = upload(h);
++        for (auto& x : h) x = f16_value(rng());
++        p.v16 = upload(h);
++    }
++    {
++        std::vector<int8_t> c((size_t) (rows * D));
++        for (auto& x : c) x = (int8_t) ((int) (rng() % 255u) - 127);
++        p.k8 = upload(c);
++        for (auto& x : c) x = (int8_t) ((int) (rng() % 255u) - 127);
++        p.v8 = upload(c);
++        std::vector<uint16_t> sc((size_t) (rows * (D / k::KV_Q8_GROUP)));
++        for (auto& x : sc) x = f16_scale_q8(rng());
++        p.k8s = upload(sc);
++        for (auto& x : sc) x = f16_scale_q8(rng());
++        p.v8s = upload(sc);
++    }
++    {
++        const size_t blocks = (size_t) (rows * (D / k::QK4_0));
++        std::vector<uint8_t> b(blocks * sizeof(k::block_q4_0));
++        for (int side = 0; side < 2; ++side) {
++            for (size_t i = 0; i < blocks; ++i) {
++                k::block_q4_0 blk;
++                blk.d = f16_scale_q4(rng());
++                for (auto& q : blk.qs) q = (uint8_t) (rng() & 0xFFu);
++                std::memcpy(b.data() + i * sizeof(k::block_q4_0), &blk, sizeof(blk));
++            }
++            (side == 0 ? p.k4 : p.v4) = upload(b);
++        }
++    }
++    return p;
++}
++
++struct Case {
++    int fmt = 0;
++    int64_t cap = 0;
++    int n_q = 0;
++    std::vector<int32_t> widths;
++};
++
++// the cells this harness can address, and where the 64 unresident pages in a row sit (cells [kHole, kHole + 256))
++constexpr int64_t kCells = 40960;
++constexpr int64_t kHole = 8192;
++
++// query `i`'s `cap` selection ids. Every entry is a valid cell: a width above the cap makes the chunk kernel read
++// all `cap` of them.
++void selection(int32_t* ids, int64_t cap, int width, int shape, std::mt19937& rng) {
++    const int64_t w = std::max<int64_t>(0, std::min<int64_t>(width, cap));
++    if (shape == 0) {   // the drafter's window: consecutive cells (window_ids), often across the unresident run
++        int64_t start;
++        if (rng() % 2 == 0) start = std::max<int64_t>(0, kHole - 64 * (int64_t) (rng() % 8));   // chunk-aligned on it
++        else start = (int64_t) (rng() % (uint32_t) (kCells - std::max<int64_t>(w, 1)));
++        if (start + w > kCells) start = kCells - w;
++        for (int64_t j = 0; j < cap; ++j) ids[j] = (int32_t) ((start + j) % kCells);
++    } else if (shape == 1) {   // the indexer's: ascending with gaps
++        std::vector<int32_t> v((size_t) cap);
++        for (auto& x : v) x = (int32_t) (rng() % (uint32_t) kCells);
++        std::sort(v.begin(), v.begin() + w);
++        std::copy(v.begin(), v.end(), ids);
++    } else {   // unordered, with repeats
++        for (int64_t j = 0; j < cap; ++j) ids[j] = (int32_t) (rng() % (uint32_t) kCells);
++    }
++}
++
++struct Harness {
++    k::QsaShapes s = k::qsa_real_shapes();
++    DevicePools pools;
++    int32_t* table = nullptr;
++    float *q = nullptr, *scratch = nullptr, *attn_old = nullptr, *attn_new = nullptr;
++    int32_t *ids = nullptr, *steps = nullptr;
++    int64_t max_q = 0, max_cap = 0;
++
++    void init(std::mt19937& rng, int64_t max_q_, int64_t max_cap_) {
++        max_q = max_q_;
++        max_cap = max_cap_;
++        const int64_t PS = s.page_size, pages = kCells / PS, H = s.n_head_kv, D = s.head_dim;
++        // logical page -> physical page: a permutation, ~3% scattered unresident pages, and the 64-page hole
++        std::vector<int32_t> tab((size_t) pages);
++        for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
++        std::shuffle(tab.begin(), tab.end(), rng);
++        for (int64_t i = 0; i < pages; ++i)
++            if (rng() % 32u == 0) tab[(size_t) i] = -1;
++        for (int64_t i = kHole / PS; i < (kHole + 256) / PS; ++i) tab[(size_t) i] = -1;
++        table = upload(tab);
++        pools = make_pools(pages * H * PS, D, rng);
++        q = dalloc<float>((size_t) (max_q * s.n_head * D));
++        ids = dalloc<int32_t>((size_t) (max_q * max_cap));
++        steps = dalloc<int32_t>((size_t) (max_q * k::kStepCount));
++        scratch = dalloc<float>((size_t) (k::qsa_decode_attn_scratch_floats(max_cap, s) * (uint64_t) max_q));
++        attn_old = dalloc<float>((size_t) (max_q * s.n_head * D));
++        attn_new = dalloc<float>((size_t) (max_q * s.n_head * D));
++    }
++
++    // uploads the case's queries, selections and widths, and runs ONE chunk pass into NaN-filled scratch
++    void prepare(const Case& c, std::mt19937& rng) {
++        const int64_t D = s.head_dim, NH = s.n_head;
++        std::normal_distribution<float> nd(0.0f, 1.0f);
++        std::vector<float> hq((size_t) (c.n_q * NH * D));
++        for (auto& x : hq) x = nd(rng);
++        ck(cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "q");
++        std::vector<int32_t> hid((size_t) (c.n_q * c.cap));
++        std::vector<int32_t> hst((size_t) (c.n_q * k::kStepCount), 0);
++        for (int i = 0; i < c.n_q; ++i) {
++            selection(hid.data() + (size_t) i * c.cap, c.cap, c.widths[(size_t) i], (int) (rng() % 3u), rng);
++            hst[(size_t) i * k::kStepCount + k::kStepWidth] = c.widths[(size_t) i];
++        }
++        ck(cudaMemcpy(ids, hid.data(), hid.size() * 4, cudaMemcpyHostToDevice), "ids");
++        ck(cudaMemcpy(steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "steps");
++        const size_t scratch_bytes = (size_t) k::qsa_decode_attn_scratch_floats(c.cap, s) * (size_t) c.n_q * 4;
++        ck(cudaMemset(scratch, 0xFF, scratch_bytes), "scratch NaN fill");
++        ck(cudaMemset(attn_old, 0xFF, (size_t) (c.n_q * NH * D) * 4), "attn_old fill");
++        ck(cudaMemset(attn_new, 0x7F, (size_t) (c.n_q * NH * D) * 4), "attn_new fill");
++        k::qsa_decode_attn_chunks_only(q, pools.view(c.fmt, table), ids, steps, c.cap, s, scratch, c.n_q, nullptr);
++    }
++
++    // true when the two merges' outputs are bit-identical (and the original's has no NaN)
++    bool check(const Case& c, long long& nonzero) {
++        const int64_t D = s.head_dim, NH = s.n_head;
++        k::qsa_decode_attn_merge_only(steps, c.cap, s, scratch, attn_old, c.n_q, 0, nullptr);
++        k::qsa_decode_attn_merge_only(steps, c.cap, s, scratch, attn_new, c.n_q, 1, nullptr);
++        ck(cudaDeviceSynchronize(), "merge sync");
++        const size_t n = (size_t) (c.n_q * NH * D);
++        std::vector<float> a(n), b(n);
++        ck(cudaMemcpy(a.data(), attn_old, n * 4, cudaMemcpyDeviceToHost), "attn_old");
++        ck(cudaMemcpy(b.data(), attn_new, n * 4, cudaMemcpyDeviceToHost), "attn_new");
++        nonzero = 0;
++        long long nan = 0;
++        for (size_t i = 0; i < n; ++i) {
++            if (a[i] != 0.0f) ++nonzero;
++            if (std::isnan(a[i])) ++nan;
++        }
++        const bool same = std::memcmp(a.data(), b.data(), n * 4) == 0;
++        if (!same || nan) {
++            size_t first = 0;
++            while (first < n && std::memcmp(&a[first], &b[first], 4) == 0) ++first;
++            std::printf("FAIL %s cap %lld n_q %d widths", fmt_name(c.fmt), (long long) c.cap, c.n_q);
++            for (int32_t w : c.widths) std::printf(" %d", w);
++            if (first < n) {
++                uint32_t ua, ub;
++                std::memcpy(&ua, &a[first], 4);
++                std::memcpy(&ub, &b[first], 4);
++                std::printf(": first difference at query %lld head %lld dim %lld: %.9g (0x%08x) vs %.9g (0x%08x)",
++                            (long long) (first / (NH * D)), (long long) (first / D % NH), (long long) (first % D),
++                            a[first], ua, b[first], ub);
++            }
++            if (nan) std::printf(" (%lld NaN in the original's output)", nan);
++            std::printf("\n");
++        }
++        return same && nan == 0;
++    }
++};
++
++void bench(Harness& hx, std::mt19937& rng) {
++    std::printf("\n--bench: one merge per call, after one chunk pass (partials hot in L2, so these are the merge's own\n"
++                "latency, not the engine's), CUDA events over 200 calls, cap 32768 (the drafter's)\n");
++    std::printf("%-6s %4s %6s | %10s %10s %10s | %8s\n", "fmt", "n_q", "width", "chunks us", "merge us", "v2 us",
++                "saved us");
++    cudaEvent_t e0, e1;
++    ck(cudaEventCreate(&e0), "event");
++    ck(cudaEventCreate(&e1), "event");
++    const int iters = 200;
++    for (int fmt : {kFmtQ4, kFmtInt8, kFmtF16}) {
++        for (int n_q : {1, 3, 7}) {
++            for (int width : {64, 2051, 16384, 31000, 32768}) {
++                Case c;
++                c.fmt = fmt;
++                c.cap = 32768;
++                c.n_q = n_q;
++                c.widths.assign((size_t) n_q, width);
++                hx.prepare(c, rng);
++                ck(cudaDeviceSynchronize(), "bench prepare");
++                float ms_chunks = 0.0f, ms_old = 0.0f, ms_new = 0.0f;
++                ck(cudaEventRecord(e0, nullptr), "record");
++                for (int i = 0; i < iters; ++i)
++                    k::qsa_decode_attn_chunks_only(hx.q, hx.pools.view(fmt, hx.table), hx.ids, hx.steps, c.cap, hx.s,
++                                                   hx.scratch, n_q, nullptr);
++                ck(cudaEventRecord(e1, nullptr), "record");
++                ck(cudaEventSynchronize(e1), "sync");
++                ck(cudaEventElapsedTime(&ms_chunks, e0, e1), "elapsed");
++                for (int v2 = 0; v2 < 2; ++v2) {
++                    float* out = v2 ? hx.attn_new : hx.attn_old;
++                    k::qsa_decode_attn_merge_only(hx.steps, c.cap, hx.s, hx.scratch, out, n_q, v2, nullptr);   // warm
++                    ck(cudaEventRecord(e0, nullptr), "record");
++                    for (int i = 0; i < iters; ++i)
++                        k::qsa_decode_attn_merge_only(hx.steps, c.cap, hx.s, hx.scratch, out, n_q, v2, nullptr);
++                    ck(cudaEventRecord(e1, nullptr), "record");
++                    ck(cudaEventSynchronize(e1), "sync");
++                    ck(cudaEventElapsedTime(v2 ? &ms_new : &ms_old, e0, e1), "elapsed");
++                }
++                const double us_c = 1000.0 * ms_chunks / iters, us_o = 1000.0 * ms_old / iters,
++                             us_n = 1000.0 * ms_new / iters;
++                std::printf("%-6s %4d %6d | %10.1f %10.1f %10.1f | %8.1f\n", fmt_name(fmt), n_q, width, us_c, us_o,
++                            us_n, us_o - us_n);
++            }
++        }
++    }
++    cudaEventDestroy(e0);
++    cudaEventDestroy(e1);
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++    int device = 0;
++    bool do_bench = false;
++    for (int i = 1; i < argc; ++i) {
++        if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
++        else if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) device = std::atoi(argv[++i]);
++        else {
++            std::fprintf(stderr, "usage: attn_merge_parity [--device N] [--bench]\n");
++            return 2;
++        }
++    }
++    int devices = 0;
++    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
++        std::puts("SKIP: no GPU");
++        return 77;
++    }
++    ck(cudaSetDevice(device), "cudaSetDevice");
++    cudaDeviceProp prop{};
++    ck(cudaGetDeviceProperties(&prop, device), "cudaGetDeviceProperties");
++    std::printf("attn_merge_parity on device %d (%s, %d.%d)\n", device, prop.name, prop.major, prop.minor);
++
++    std::mt19937 rng(20261004u);
++    Harness hx;
++    hx.init(rng, 7, 32768);
++
++    // 1023 / 1024 / 1025 and 16383 / 16385: the v2 merge's U = 16 chunks x 64 cells block edges
++    const int32_t widths[] = {0, 1, 63, 64, 65, 1023, 1024, 1025, 2051, 4096, 16383, 16385, 32768};
++    const int n_widths = (int) (sizeof(widths) / sizeof(widths[0]));
++    long long cases = 0, failed = 0, nonzero_total = 0;
++    for (int fmt = 0; fmt < 4; ++fmt) {
++        long long fmt_cases = 0, fmt_failed = 0;
++        for (int64_t cap : {(int64_t) 2112, (int64_t) 32768}) {
++            for (int n_q = 1; n_q <= 6; ++n_q) {
++                // every width for all queries alike, then three batches of mixed widths
++                for (int wc = 0; wc < n_widths + 3; ++wc) {
++                    Case c;
++                    c.fmt = fmt;
++                    c.cap = cap;
++                    c.n_q = n_q;
++                    for (int i = 0; i < n_q; ++i)
++                        c.widths.push_back(wc < n_widths ? widths[wc] : widths[rng() % (uint32_t) n_widths]);
++                    hx.prepare(c, rng);
++                    long long nz = 0;
++                    const bool ok = hx.check(c, nz);
++                    nonzero_total += nz;
++                    ++cases;
++                    ++fmt_cases;
++                    if (!ok) { ++failed; ++fmt_failed; }
++                }
++            }
++        }
++        std::printf("[%s] %lld cases, %s (%lld differ)\n", fmt_name(fmt), fmt_cases, fmt_failed ? "FAIL" : "bit-identical",
++                    fmt_failed);
++    }
++    std::printf("attn_merge_parity: %lld cases, %lld differ, %lld nonzero output values in all -> %s\n", cases, failed,
++                nonzero_total, failed == 0 && nonzero_total > 0 ? "PASS" : "FAIL");
++    if (do_bench) bench(hx, rng);
++    return failed == 0 && nonzero_total > 0 ? 0 : 1;
++}
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index f487c4f..49b1d69 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -417,6 +417,111 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
+     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+ }
+ 
++// attn_merge_kernel's arithmetic in the same chunk order, with two changes that leave every output bit as it was
++// (attn_merge_parity compares the two kernels on the same partials, all four KV formats):
++//
++// (1) Bounded by the width.  The chunk kernel writes m = -FLT_MAX, l = 0 for every chunk with c0 >= step[kStepWidth]
++//     (its `n_here <= 0` exit) and the merge skips exactly those, so it can stop at n_act = ceil(width / CHUNK):
++//     fmaxf with -FLT_MAX never changes M, and a skipped chunk never touches L or acc.  The drafter's merge walks its
++//     whole capacity (--mtp-window 32768: 512 chunks) at every context, where a short context fills one or two.
++// (2) Loads batched.  attn_merge_kernel loads part_l / part_acc behind its `m == -FLT_MAX` branch, so the compiler
++//     issues each chunk's l and acc loads inside that chunk's branch: a few dependent L2 round trips per chunk.  Here
++//     the m, l and acc of U chunks are loaded first, guarded only by the chunk index, then consumed in chunk order.
++//     The skip is a select on the loaded m instead of a branch, so the loads cannot move back behind it.  The values
++//     selected are the very fmaf's attn_merge_kernel computes (same operands, same order), and a skipped chunk leaves
++//     L and acc as they were, as its `continue` does.
++constexpr int kMergeU = 16;
++
++template <int U, bool TAIL>
++__device__ __forceinline__ void merge_max_block(const float* __restrict__ pm, int c0, int n_act, float& M) {
++    float mm[U];
++#pragma unroll
++    for (int u = 0; u < U; ++u) mm[u] = (!TAIL || c0 + u < n_act) ? pm[(size_t) (c0 + u) * G] : -FLT_MAX;
++#pragma unroll
++    for (int u = 0; u < U; ++u)
++        if (!TAIL || c0 + u < n_act) M = fmaxf(M, mm[u]);
++}
++
++template <int U, bool TAIL>
++__device__ __forceinline__ void merge_sum_block(const float* __restrict__ pm, const float* __restrict__ pl,
++                                                const float* __restrict__ pa, int c0, int n_act, float M, float& L,
++                                                float& acc) {
++    float mm[U], ll[U], aa[U];
++#pragma unroll
++    for (int u = 0; u < U; ++u) {
++        const bool in = !TAIL || c0 + u < n_act;
++        mm[u] = in ? pm[(size_t) (c0 + u) * G] : -FLT_MAX;
++        ll[u] = in ? pl[(size_t) (c0 + u) * G] : 0.0f;
++        aa[u] = in ? pa[(size_t) (c0 + u) * G * HD] : 0.0f;
++    }
++#pragma unroll
++    for (int u = 0; u < U; ++u) {
++        const float w = __expf(mm[u] - M);
++        const float L_next = fmaf(ll[u], w, L);
++        const float acc_next = fmaf(aa[u], w, acc);
++        const bool live = !(mm[u] == -FLT_MAX);   // attn_merge_kernel: `if (m == -FLT_MAX) continue;`
++        L = live ? L_next : L;
++        acc = live ? acc_next : acc;
++    }
++}
++
++template <int U>
++__global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restrict__ part_acc,
++                                                           const float* __restrict__ part_m,
++                                                           const float* __restrict__ part_l, int n_chunks,
++                                                           const int32_t* __restrict__ steps,
++                                                           float* __restrict__ attn, long long scratch_stride = 0) {
++    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
++    part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
++    part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
++    attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
++    // the step record the chunk kernel read for this query (attn_chunk_kernel: step + blockIdx.z * kStepCount)
++    const int width = __ldg(steps + (size_t) blockIdx.y * kStepCount + kStepWidth);
++    const int n_act = width > 0 ? min(n_chunks, (width - 1) / CHUNK + 1) : 0;
++    const int h = blockIdx.x;                 // global query head
++    const int kvh = h / G, hl = h % G;
++    const int d = threadIdx.x;
++    // chunk c of this head: part_m / part_l [(kvh * n_chunks + c) * G + hl], part_acc [that * HD + d]
++    const size_t base = (size_t) kvh * (size_t) n_chunks * G + (size_t) hl;
++    const float* pm = part_m + base;
++    const float* pl = part_l + base;
++    const float* pa = part_acc + base * HD + (size_t) d;
++    const int n_full = n_act - n_act % U;
++    float M = -FLT_MAX;
++    for (int c0 = 0; c0 < n_full; c0 += U) merge_max_block<U, false>(pm, c0, n_act, M);
++    if (n_full < n_act) merge_max_block<U, true>(pm, n_full, n_act, M);
++    float L = 0.0f, acc = 0.0f;
++    for (int c0 = 0; c0 < n_full; c0 += U) merge_sum_block<U, false>(pm, pl, pa, c0, n_act, M, L, acc);
++    if (n_full < n_act) merge_sum_block<U, true>(pm, pl, pa, n_full, n_act, M, L, acc);
++    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
++}
++
++// STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 with attn_merge_kernel.  On by default on NVIDIA, where
++// attn_merge_parity checks the two; opt-in on AMD until it has run there.
++int attn_merge_v2() {
++    static const int on = [] {
++#if defined(__HIPCC__)
++        int r = 0;
++#else
++        int r = 1;
++#endif
++        const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
++        if (v != nullptr && *v != '\0') r = std::atoi(v) != 0 ? 1 : 0;
++        return r;
++    }();
++    return on;
++}
++
++// the merge of `n_q` queries' partials: v2 = 0 attn_merge_kernel, 1 attn_merge_v2_kernel (bitwise the same output)
++void launch_merge(int v2, const float* part_acc, const float* part_m, const float* part_l, int n_chunks,
++                  const int32_t* steps, float* attn, long long stride, unsigned n_head, unsigned n_q, cudaStream_t st) {
++    if (v2)
++        attn_merge_v2_kernel<kMergeU><<<dim3(n_head, n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, steps,
++                                                                         attn, stride);
++    else
++        attn_merge_kernel<<<dim3(n_head, n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn, stride);
++}
++
+ #if defined(STRATA_EXPERIMENTAL_SM60)
+ // the current device is below sm_75 (per device: a layer split can mix cards); STRATA_ATTN_PRE75=0 turns PR #540's
+ // kernel off (A/B)
+@@ -445,16 +550,9 @@ bool pre75_attn() {
+ #define STRATA_ATTN_CHUNK(M) attn_chunk_kernel<M>
+ #endif
+ 
+-}  // namespace
+-
+-void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+-    if (n_q <= 0) return;
+-    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
+-        !pools.page_table || n_q > 65535) {
+-        std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
+-        std::exit(1);
+-    }
++// qsa_decode_attn_batch's chunk pass: `n_q` queries' partials into `scratch` (one stride each)
++void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
++                         int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, cudaStream_t st) {
+     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
+                         : (pools.k_q != nullptr ? 1 : 0));
+     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+@@ -465,7 +563,6 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     float* part_l = part_m + (size_t) n_chunks * s.n_head;
+     const float scale = 1.0f / sqrtf((float) HD);
+     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
+-    cudaStream_t st = (cudaStream_t) stream;
+     if (kv_mode == 3)
+         STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+@@ -478,8 +575,32 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     else
+         STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+-    attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
+-                                                                                  attn, stride);
++}
++
++// qsa_decode_attn_batch's merge pass over the partials launch_chunks_batch wrote; `v2` names the merge kernel
++void launch_merge_batch(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch, float* attn,
++                        int64_t n_q, int v2, cudaStream_t st) {
++    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
++    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
++    const float* part_acc = scratch;
++    const float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
++    const float* part_l = part_m + (size_t) n_chunks * s.n_head;
++    launch_merge(v2, part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head, (unsigned) n_q, st);
++}
++
++}  // namespace
++
++void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
++                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
++    if (n_q <= 0) return;
++    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
++        !pools.page_table || n_q > 65535) {
++        std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
++        std::exit(1);
++    }
++    cudaStream_t st = (cudaStream_t) stream;
++    launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st);
++    launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_v2(), st);
+     const cudaError_t e = cudaGetLastError();
+     if (e != cudaSuccess) {
+         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
+@@ -526,7 +647,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+     else
+         STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+-    attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
++    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st);
+     const cudaError_t e = cudaGetLastError();
+     if (e != cudaSuccess) {
+         std::fprintf(stderr, "qsa_decode_attn: %s\n", cudaGetErrorString(e));
+@@ -534,4 +655,36 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+     }
+ }
+ 
++// attn_merge_parity: qsa_decode_attn_batch's two passes apart, the merge named by `v2` (never the environment), so
++// one chunk pass can be merged by both kernels and the outputs compared bit for bit.  The engine never calls these.
++void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
++                                 int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, void* stream) {
++    if (n_q <= 0 || n_q > 65535 || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch ||
++        !ids || !steps || !pools.page_table) {
++        std::fprintf(stderr, "qsa_decode_attn_chunks_only: unsupported geometry or missing buffers\n");
++        std::exit(1);
++    }
++    launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, (cudaStream_t) stream);
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "qsa_decode_attn_chunks_only: %s\n", cudaGetErrorString(e));
++        std::exit(1);
++    }
++}
++
++void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
++                                float* attn, int64_t n_q, int v2, void* stream) {
++    if (n_q <= 0 || n_q > 65535 || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch ||
++        !steps || !attn) {
++        std::fprintf(stderr, "qsa_decode_attn_merge_only: unsupported geometry or missing buffers\n");
++        std::exit(1);
++    }
++    launch_merge_batch(steps, cap, s, scratch, attn, n_q, v2, (cudaStream_t) stream);
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "qsa_decode_attn_merge_only: %s\n", cudaGetErrorString(e));
++        std::exit(1);
++    }
++}
++
+ }  // namespace strata::kernels
+diff --git a/src/kernels/ngram.cpp b/src/kernels/ngram.cpp
+index 7292dd9..eb2bec5 100644
+--- a/src/kernels/ngram.cpp
++++ b/src/kernels/ngram.cpp
+@@ -7,10 +7,12 @@
+ #include "strata/kernels/f16_bits.hpp"
+ #include "strata/ngram/ple_reader.hpp"
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
++#include <deque>
+ #if !defined(_WIN32)
+ #include <sys/mman.h>
+ #endif
+@@ -164,6 +166,27 @@ struct PleTable::Impl {
+             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) strata::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
+         else iq4nl_dequant_row(row, out160);
+     }
++    // gather_issue_t / gather_ready / gather_collect_t / gather_drop: the handles (indices).  A deque, so a new handle
++    // never moves the ones whose raw buffers the reader is writing into.
++    struct Batch {
++        bool used = false;      // handed out, until collected or dropped (and, dropped, until its reads have landed)
++        bool dropped = false;
++        strata::ngram::PleReader::Ticket ticket;
++        std::vector<uint32_t> rows;
++        std::vector<uint8_t> raw;
++        uint64_t epoch = ~0ull; // the reader's completion count at the last not-ready look (PleReader::ready)
++    };
++    std::deque<Batch> batches;
++    /// The dropped handles whose reads have all landed are free again.
++    void reap() {
++        for (Batch& b : batches)
++            if (b.used && b.dropped && reader.ready(b.ticket)) {
++                std::string e;
++                (void) reader.collect(b.ticket, e);   // returns at once; releases the reader's ticket
++                b.used = false;
++                b.dropped = false;
++            }
++    }
+ };
+ 
+ PleTable::PleTable() : impl_(new Impl) {}
+@@ -315,6 +338,7 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
+ void PleTable::close() {
+     wait_prefetches();
+     impl_->reader.close();
++    impl_->batches.clear();   // after the reader's close: no read is left writing into them
+     impl_->pending = false;
+     impl_->locked = false;   // the unmap below releases the lock
+     impl_->mode = PleIo::Mmap;
+@@ -440,6 +464,97 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
+     return true;
+ }
+ 
++int PleTable::gather_issue_t(const uint32_t* rows, size_t n_tokens, std::string& err) {
++    Impl& m = *impl_;
++    if (m.mode == PleIo::Direct) m.reap();
++    size_t h = 0;
++    while (h < m.batches.size() && m.batches[h].used) ++h;
++    if (h == m.batches.size()) {
++        if (m.batches.size() >= 64) { err = "PleTable::gather_issue_t: 64 batches in flight"; return -1; }
++        m.batches.emplace_back();
++    }
++    Impl::Batch& b = m.batches[h];
++    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
++    b.used = true;
++    b.dropped = false;
++    b.epoch = ~0ull;
++    b.rows.assign(rows, rows + n);
++    if (m.mode == PleIo::Direct) {
++        b.raw.resize(n * m.rb);
++        b.ticket = m.reader.issue(b.rows.data(), n, b.raw.data());
++    }
++    return (int) h;
++}
++
++bool PleTable::gather_ready(int h) {
++    Impl& m = *impl_;
++    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used || m.mode != PleIo::Direct) return true;
++    Impl::Batch& b = m.batches[(size_t) h];
++    return m.reader.ready(b.ticket, &b.epoch);
++}
++
++bool PleTable::gather_collect_t(int h, float* out, std::string& err) {
++    Impl& m = *impl_;
++    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used || m.batches[(size_t) h].dropped) {
++        err = "PleTable::gather_collect_t: not a batch in flight";
++        return false;
++    }
++    Impl::Batch& b = m.batches[(size_t) h];
++    b.used = false;
++    const size_t n = b.rows.size();
++    if (m.mode == PleIo::Direct) {
++        if (!m.reader.collect(b.ticket, err)) return false;
++        for (size_t i = 0; i < n; ++i) m.decode(b.raw.data() + i * m.rb, out + i * PLE_HEAD_DIM);
++        m.bytes_read += (uint64_t) n * m.rb;
++        return true;
++    }
++    for (size_t i = 0; i < n; ++i) read_row(b.rows[i], out + i * PLE_HEAD_DIM);
++    return true;
++}
++
++void PleTable::gather_drop(int h) {
++    Impl& m = *impl_;
++    if (h < 0 || (size_t) h >= m.batches.size() || !m.batches[(size_t) h].used) return;
++    Impl::Batch& b = m.batches[(size_t) h];
++    if (m.mode != PleIo::Direct) { b.used = false; return; }
++    b.dropped = true;   // its reads may still be writing into `raw`: free once they have landed (`reap`)
++    m.reap();
++}
++
++void PleTable::prefetch_tokens(const int32_t* toks, int n, int32_t prev0, int32_t prev1, const PleConsts* consts) {
++    if (impl_->mode != PleIo::Direct || n <= 0 || !impl_->reader.is_open()) return;
++    static const PleConsts artifact = ple_artifact_consts();
++    const PleConsts& c = consts != nullptr ? *consts : artifact;
++    constexpr int kChunk = 8;
++    uint32_t rows[kChunk * PLE_N_HEADS];
++    int32_t prev[2] = {prev0, prev1};
++    for (int done = 0; done < n;) {
++        const int k = std::min(kChunk, n - done);
++        for (int t = 0; t < k; ++t) {   // as a verify window's staging hashes them, token by token
++            ngram_rows(&toks[done + t], prev, 1, c, rows + t * PLE_N_HEADS);
++            prev[0] = prev[1];
++            prev[1] = toks[done + t];
++        }
++        impl_->reader.prefetch(rows, (size_t) k * PLE_N_HEADS);
++        done += k;
++    }
++}
++
++PleTable::IoCounters PleTable::io_counters() const {
++    IoCounters c;
++    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return c;
++    const strata::ngram::ReaderStats s = impl_->reader.snapshot();
++    c.requests = s.requests;
++    c.cache_hits = s.cache_hits;
++    c.attached = s.attached_rows;
++    c.reads = s.reads;
++    c.prefetch_rows = s.prefetch_rows;
++    c.prefetch_skipped = s.prefetch_skipped;
++    c.prefetch_reads = s.prefetch_reads;
++    c.wait_us = s.wait_us;
++    return c;
++}
++
+ void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
+ 
+ std::string PleTable::io_report() const {
+diff --git a/src/ngram/ple_reader.cpp b/src/ngram/ple_reader.cpp
+index a03e4c0..159c319 100644
+--- a/src/ngram/ple_reader.cpp
++++ b/src/ngram/ple_reader.cpp
+@@ -2,6 +2,7 @@
+ #include "strata/ngram/ple_reader.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstring>
+@@ -73,7 +74,7 @@ struct RowCache {
+ struct Use {
+     uint32_t row;
+     uint32_t in_page;      // byte offset of the row inside the read buffer
+-    uint8_t* dst;
++    uint8_t* dst;          // null: a prefetch's row, it only enters the row cache
+ };
+ 
+ struct Job {
+@@ -83,6 +84,11 @@ struct Job {
+     std::vector<Use> uses;
+     double issued_us = 0;
+     bool keepalive = false;// no rows and no ticket: it only keeps the SSD awake (`set_keepalive`)
++    // `prefetch`: a prefetch read has no ticket of its own; tickets that attach to it while it is in flight
++    // are its `waiters` (each counted once in its `pending`).  `id` keys `row_job` / `job_slot` (0: not tracked).
++    bool prefetch = false;
++    uint64_t id = 0;
++    std::vector<uint32_t> waiters;
+ };
+ 
+ struct TicketState {
+@@ -106,6 +112,17 @@ struct PleReader::Impl {
+     std::vector<Job> inflight;            // indexed by slot
+     std::vector<Completion> delayed;      // completed but held back by fault injection
+     std::deque<Job> queue;                // not yet submitted
++    // `prefetch`: prefetch reads not yet submitted - submitted only when `queue` (the tickets' reads) is empty,
++    // so a guess never delays a read a window is staged on - and, once `prefetch` has been called (`track`), which
++    // prefetch job reads which row (`row_job`) and the slot of each submitted one (`job_slot`), so an `issue` can
++    // attach to a read in flight.  Empty and off until the first `prefetch`: the reader is then unchanged.
++    std::deque<Job> pf_queue;
++    bool track = false;
++    uint64_t next_job = 1;
++    std::unordered_map<uint32_t, uint64_t> row_job;
++    std::unordered_map<uint64_t, uint32_t> job_slot;
++    // tickets completed so far (`ready`'s lock-free look: the host loop polls it between doorbells)
++    std::atomic<uint64_t> done_epoch{0};
+     std::unordered_map<uint32_t, TicketState> tickets;
+     uint32_t next_ticket = 1;
+     RowCache cache;
+@@ -130,12 +147,43 @@ struct PleReader::Impl {
+     uint8_t* slot_buf(uint32_t s) { return slab + (size_t) s * 2 * PAGE; }
+     bool busy() const { return free_slots.size() < max_inflight || !delayed.empty(); }
+ 
+-    void cancel_queued() {
+-        for (const Job& job : queue) {
+-            auto it = tickets.find(job.ticket);
+-            if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
++    /// A job is done (landed, failed or cancelled): the ticket that made it and every ticket that attached to it
++    /// have one job fewer to wait for, and (tracked) its rows are no longer being read.
++    void retire(Job& j) {
++        auto drop = [&](uint32_t t) {
++            auto it = tickets.find(t);
++            if (it != tickets.end() && it->second.pending > 0 && --it->second.pending == 0)
++                done_epoch.fetch_add(1, std::memory_order_release);
++        };
++        drop(j.ticket);
++        for (uint32_t t : j.waiters) drop(t);
++        j.waiters.clear();
++        if (j.id != 0) {
++            for (const Use& u : j.uses) {
++                auto r = row_job.find(u.row);
++                if (r != row_job.end() && r->second == j.id) row_job.erase(r);
++            }
++            job_slot.erase(j.id);
++            j.id = 0;
+         }
++    }
++
++    /// The prefetch job reading `row` (submitted, or queued behind the tickets' reads); null when none is.
++    Job* prefetching(uint32_t row) {
++        auto r = row_job.find(row);
++        if (r == row_job.end()) return nullptr;
++        auto s = job_slot.find(r->second);
++        if (s != job_slot.end()) return &inflight[s->second];
++        for (Job& j : pf_queue)
++            if (j.id == r->second) return &j;
++        return nullptr;
++    }
++
++    void cancel_queued() {
++        for (Job& job : queue) retire(job);
+         queue.clear();
++        for (Job& job : pf_queue) retire(job);
++        pf_queue.clear();
+     }
+ 
+     void record_latency(double us) {
+@@ -145,12 +193,14 @@ struct PleReader::Impl {
+     }
+ 
+     bool pump() {
+-        while (!queue.empty() && !free_slots.empty()) {
++        while ((!queue.empty() || !pf_queue.empty()) && !free_slots.empty()) {
++            std::deque<Job>& q = !queue.empty() ? queue : pf_queue;   // the tickets' reads before any prefetch
+             const uint32_t s = free_slots.back();
+             free_slots.pop_back();
+-            inflight[s] = std::move(queue.front());
+-            queue.pop_front();
++            inflight[s] = std::move(q.front());
++            q.pop_front();
+             Job& j = inflight[s];
++            if (j.id != 0) job_slot[j.id] = s;
+             j.issued_us = now_us();
+             std::string kerr;             // a keep-alive read that cannot go out must not fail the reader
+             if (!file.submit(j.offset, slot_buf(s), j.length, s, j.keepalive ? kerr : error)) {
+@@ -160,9 +210,8 @@ struct PleReader::Impl {
+                     free_slots.push_back(s);
+                     continue;
+                 }
++                retire(j);
+                 j.uses.clear();
+-                auto it = tickets.find(j.ticket);
+-                if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
+                 free_slots.push_back(s);
+                 cancel_queued();
+                 return false;
+@@ -171,6 +220,7 @@ struct PleReader::Impl {
+             if (!j.keepalive) {                    // a keep-alive read counts when it completes (`finish`)
+                 stats.submit_us += now_us() - j.issued_us;
+                 ++stats.reads;
++                if (j.prefetch) ++stats.prefetch_reads;
+             }
+         }
+         return true;
+@@ -218,9 +268,8 @@ struct PleReader::Impl {
+         if (!c.ok) {
+             error = "PleReader: a table read failed";
+             cancel_queued();
++            retire(j);
+             j.uses.clear();
+-            auto it = tickets.find(j.ticket);
+-            if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
+             free_slots.push_back(s);
+             return false;
+         }
+@@ -231,19 +280,17 @@ struct PleReader::Impl {
+             if (u.in_page + row_bytes > c.bytes) {
+                 error = "PleReader: short read inside the table";
+                 cancel_queued();
++                retire(j);
+                 j.uses.clear();
+-                auto it = tickets.find(j.ticket);
+-                if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
+                 free_slots.push_back(s);
+                 return false;
+             }
+         }
+         for (const Use& u : j.uses) {
+-            std::memcpy(u.dst, buf + u.in_page, row_bytes);
++            if (u.dst != nullptr) std::memcpy(u.dst, buf + u.in_page, row_bytes);
+             cache.insert(u.row, buf + u.in_page);
+         }
+-        auto it = tickets.find(j.ticket);
+-        if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
++        retire(j);
+         j.uses.clear();
+         free_slots.push_back(s);
+         return error.empty() ? pump() : true;
+@@ -299,7 +346,7 @@ struct PleReader::Impl {
+         std::unique_lock<std::mutex> lk(mu);
+         for (;;) {
+             // Idle: wait for work. While rows are being asked for, the wait ends in time for a keep-alive read.
+-            while (!(stop || !queue.empty() || busy())) {
++            while (!(stop || !queue.empty() || !pf_queue.empty() || busy())) {
+                 const double now = now_us();
+                 const double due = keepalive_due(now);
+                 if (due < 0) cv_work.wait(lk);
+@@ -384,6 +431,7 @@ void PleReader::close() {
+             std::lock_guard<std::mutex> lk(m.mu);
+             m.stop = true;
+             m.queue.clear();                       // unsubmitted work is dropped; in-flight reads still drain
++            m.pf_queue.clear();
+         }
+         m.cv_work.notify_all();
+         m.file.wake();
+@@ -404,6 +452,10 @@ void PleReader::close() {
+     DirectFile::free_aligned(m.slab);
+     m.slab = nullptr;
+     m.queue.clear();
++    m.pf_queue.clear();
++    m.row_job.clear();
++    m.job_slot.clear();
++    m.track = false;
+     m.tickets.clear();
+     m.delayed.clear();
+     m.inflight.clear();
+@@ -430,6 +482,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
+     TicketState& ts = m.tickets[id];
+     std::unordered_map<uint64_t, size_t> by_page;     // aligned offset -> index in `jobs`
+     std::vector<Job> jobs;
++    uint32_t attached = 0;                             // prefetch reads in flight this ticket waits for
+     for (size_t i = 0; i < n; ++i) {
+         const uint32_t rb = m.row_bytes;
+         uint8_t* dst = out_raw + i * rb;
+@@ -446,6 +499,20 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
+         const uint64_t at = m.table_offset + (uint64_t) rows[i] * rb;
+         const uint64_t first = at / PAGE * PAGE;
+         const uint32_t length = (uint32_t) ((at + rb - 1) / PAGE * PAGE - first + PAGE);
++        // a prefetch is reading this row right now - the ticket waits for that read instead of a second one
++        // (the prefetch job reads the row's own page: `prefetch` groups rows by it)
++        if (m.track) {
++            Job* pj = m.prefetching(rows[i]);
++            if (pj != nullptr && pj->offset == first && pj->length >= length) {
++                pj->uses.push_back(Use{rows[i], (uint32_t) (at - first), dst});
++                if (std::find(pj->waiters.begin(), pj->waiters.end(), id) == pj->waiters.end()) {
++                    pj->waiters.push_back(id);
++                    ++attached;
++                }
++                ++m.stats.attached_rows;
++                continue;
++            }
++        }
+         auto f = by_page.find(first);
+         if (f != by_page.end()) {
+             Job& j = jobs[f->second];
+@@ -464,8 +531,8 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
+     }
+     // Sorted by offset: prefill chunks then read the SSD in near-sequential order.
+     std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.offset < b.offset; });
+-    ts.pending = (uint32_t) jobs.size();
+-    const bool has_jobs = ts.pending > 0;
++    ts.pending = (uint32_t) jobs.size() + attached;
++    const bool has_jobs = !jobs.empty();
+     for (Job& j : jobs) m.queue.push_back(std::move(j));
+     if (m.threaded) {
+         lk.unlock();
+@@ -513,6 +580,72 @@ bool PleReader::collect(Ticket t, std::string& err) {
+     return true;
+ }
+ 
++void PleReader::prefetch(const uint32_t* rows, size_t n) {
++    Impl& m = *impl_;
++    if (n == 0 || m.slab == nullptr) return;
++    std::unique_lock<std::mutex> lk(m.mu, std::defer_lock);
++    if (m.threaded) lk.lock();
++    if (!m.error.empty()) return;
++    m.track = true;
++    const uint32_t rb = m.row_bytes;
++    std::unordered_map<uint64_t, size_t> by_page;     // aligned offset -> index in `jobs`
++    std::vector<Job> jobs;
++    for (size_t i = 0; i < n; ++i) {
++        const uint32_t r = rows[i];
++        if (r >= m.n_rows) continue;
++        if (m.cache.find(r) != nullptr || m.row_job.count(r) != 0) {   // cached, or a prefetch is reading it
++            ++m.stats.prefetch_skipped;
++            continue;
++        }
++        const uint64_t at = m.table_offset + (uint64_t) r * rb;
++        const uint64_t first = at / PAGE * PAGE;
++        const uint32_t length = (uint32_t) ((at + rb - 1) / PAGE * PAGE - first + PAGE);
++        auto f = by_page.find(first);
++        if (f == by_page.end()) {
++            Job j;
++            j.offset = first;
++            j.length = length;
++            j.prefetch = true;
++            j.id = m.next_job++;
++            f = by_page.emplace(first, jobs.size()).first;
++            jobs.push_back(std::move(j));
++        }
++        Job& j = jobs[f->second];
++        j.length = std::max(j.length, length);
++        j.uses.push_back(Use{r, (uint32_t) (at - first), nullptr});
++        m.row_job[r] = j.id;
++        ++m.stats.prefetch_rows;
++    }
++    if (jobs.empty()) return;
++    std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.offset < b.offset; });
++    for (Job& j : jobs) m.pf_queue.push_back(std::move(j));
++    if (m.threaded) {
++        lk.unlock();
++        m.cv_work.notify_one();
++        m.file.wake();                             // in case the worker is blocked in the port
++    } else if (!m.pump() && m.error.empty()) {
++        m.error = "PleReader: submit failed";
++    }
++}
++
++bool PleReader::ready(Ticket t, uint64_t* epoch) {
++    Impl& m = *impl_;
++    if (m.threaded) {
++        if (epoch != nullptr) {
++            const uint64_t e = m.done_epoch.load(std::memory_order_acquire);
++            if (e == *epoch) return false;         // no ticket has completed since the caller's last look
++            *epoch = e;
++        }
++        std::lock_guard<std::mutex> lk(m.mu);
++        const auto it = m.tickets.find(t.id);
++        return it == m.tickets.end() || it->second.pending == 0;
++    }
++    // caller-thread mode: whatever has completed is processed now, without waiting
++    if (m.busy() && !m.drain(0) && m.error.empty()) m.error = "PleReader: read failed";
++    const auto it = m.tickets.find(t.id);
++    return it == m.tickets.end() || it->second.pending == 0;
++}
++
+ void PleReader::set_keepalive(double period_ms, double window_s) {
+     Impl& m = *impl_;
+     {
+diff --git a/src/ngram/ple_reader_test.cpp b/src/ngram/ple_reader_test.cpp
+index 87270fd..cb670f0 100644
+--- a/src/ngram/ple_reader_test.cpp
++++ b/src/ngram/ple_reader_test.cpp
+@@ -140,6 +140,49 @@ int selftest(const std::string& dir, uint32_t rb) {
+         CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
+         CHECK(rd.stats().late_injected > 0, "no read was held back");
+     }
++    // STRATA_PL_PLE_PREFETCH / STRATA_PL_PLE_LATE: rows read ahead into the row cache, tickets attached to read-
++    // ahead reads still in flight (some land before the ticket, some after), `ready` polled without blocking - every
++    // ticket's bytes must still be the table's
++    for (bool thr : {false, true})
++    for (uint64_t cache : {0ull, 4096ull})
++    for (uint32_t inflight : {1u, 8u, 64u}) {
++        ng::PleReader rd;
++        std::string err;
++        CHECK(rd.open(path, HEADER, N, inflight, cache, err, thr, rb), "open: %s", err.c_str());
++        for (int t = 0; t < 100; ++t) {
++            std::vector<uint32_t> rows(16);
++            for (auto& r : rows) r = rng() % N;
++            rd.prefetch(rows.data(), rows.size());
++            if (t % 3 == 0) rd.prefetch(rows.data(), 8);   // again: rows in flight or cached are skipped
++            if (t % 2 == 0) std::this_thread::sleep_for(std::chrono::microseconds(300));
++            std::vector<uint32_t> want = rows;              // + a row not read ahead, a duplicate, one out of range
++            want.push_back(rng() % N);
++            want.push_back(rows[0]);
++            want.push_back(N + 3);
++            std::vector<uint8_t> out(want.size() * rb, 0xCC);
++            const auto tk = rd.issue(want.data(), want.size(), out.data());
++            uint64_t epoch = ~0ull;
++            const double t0 = now_us();
++            while (!rd.ready(tk, &epoch)) {
++                if (now_us() - t0 > 5e6) { CHECK(false, "read ahead: the ticket never became ready"); break; }
++            }
++            CHECK(rd.collect(tk, err), "read ahead: collect: %s", err.c_str());
++            std::vector<uint8_t> w(rb);
++            for (size_t i = 0; i < want.size(); ++i) {
++                if (want[i] >= N) std::memset(w.data(), 0, rb);
++                else expected_row(want[i], rb, w.data());
++                CHECK(!std::memcmp(w.data(), &out[i * rb], rb), "read ahead: row %u (index %zu) differs", want[i], i);
++            }
++        }
++        std::vector<uint32_t> pf(64);                       // read ahead and asked for later
++        for (auto& r : pf) r = rng() % N;
++        rd.prefetch(pf.data(), pf.size());
++        std::this_thread::sleep_for(std::chrono::milliseconds(20));
++        check_rows(rd, pf, N, rb, "read ahead, asked for later");
++        const ng::ReaderStats s = rd.snapshot();
++        CHECK(s.prefetch_rows > 0 && s.prefetch_reads > 0, "read ahead: nothing was read ahead");
++        if (cache > 0 && thr) CHECK(s.cache_hits + s.attached_rows > 0, "read ahead: no ticket row came from a read ahead");
++    }
+     // keep-alive: while rows are asked for, a page goes out after `period` without a read; it stops once the
+     // window after the last issue has passed, starts again with the next issue (even one the row cache serves),
+     // and never shows up as a row read or changes a row
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index aa4e147..5850724 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -508,6 +508,10 @@ struct Options {
+     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
+     int adapt_every = 4;
+     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
++    /// --adapt-async 1 (--serve with the resident RAM mode; opt-in): the adaptive tier's rounds advance between verify
++    /// windows on a helper thread instead of one window waiting for a whole round (see the tier in the --serve block).
++    /// Not bit-exact run to run.  0 = the blocking tier.
++    int adapt_async = 0;
+     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
+     /// this probability under the draft layer; 0 = always --spec-1 drafts.
+     double spec_min_p = 0.0;
+@@ -762,7 +766,10 @@ void usage() {
+                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
+                  "  --resident-experts   the low-RAM PC's resident mode (setup): --mmap-experts --resident-cpu-experts\n"
+                  "                       with the copy page-locked when possible, 4 GiB headroom, plain mmap if it\n"
+-                 "                       does not fit.  Same answers as --mmap-experts for the same placement.\n");
++                 "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
++                 "  --adapt-async 1      --serve with the resident RAM mode (opt-in): the adaptive tier's swaps\n"
++                 "                       advance between verify windows instead of a window waiting for a whole\n"
++                 "                       round.  Not bit-exact run to run.  0 (default) = the blocking tier.\n");
+ }
+ 
+ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
+@@ -1090,6 +1097,82 @@ bool adapt_nowait() {
+     return v;
+ }
+ 
++/// --adapt-async: one background job at a time (the asynchronous adaptive tier's copies and memcpys).  `post` hands
++/// it over, `idle` says whether it has finished; the owner never posts while a job runs.
++class JobThread {
++public:
++    JobThread() : th_([this] { loop(); }) {}
++    ~JobThread() {
++        { std::lock_guard<std::mutex> lk(mu_); quit_ = true; }
++        cv_.notify_one();
++        th_.join();
++    }
++    JobThread(const JobThread&) = delete;
++    JobThread& operator=(const JobThread&) = delete;
++    void post(std::function<void()> f) {
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            job_ = std::move(f);
++            has_ = true;
++            done_.store(false, std::memory_order_release);
++        }
++        cv_.notify_one();
++    }
++    bool idle() const { return done_.load(std::memory_order_acquire); }
++    void wait() const { while (!idle()) std::this_thread::yield(); }
++private:
++    // The second logical processor of the last physical core that has two: an SMT sibling no pool worker or host loop
++    // is pinned to (the pool takes the first of every core but the first, the host the first core), or -1.
++    static int smt_spare_cpu() {
++#if defined(_WIN32)
++        DWORD len = 0;
++        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
++        if (len == 0) return -1;
++        std::vector<char> buf(len);
++        if (!GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(),
++                                              &len))
++            return -1;
++        int best = -1, core = 0;
++        for (const char* p = buf.data(); p < buf.data() + len;
++             p += ((const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p)->Size, ++core) {
++            const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
++            const GROUP_AFFINITY& ga = e->Processor.GroupMask[0];
++            int seen = 0;
++            for (int bit = 0; bit < 64; ++bit)
++                if ((ga.Mask & (1ull << bit)) && ++seen == 2 && core > 0) best = ga.Group * 64 + bit;
++        }
++        return best;
++#else
++        return -1;
++#endif
++    }
++    void loop() {
++        // the job's memcpys stay off the host's core and the pool's: by default the spare SMT sibling of the last
++        // two-thread core (Windows); STRATA_ADAPT_JOB_CPU=<logical cpu>, or -1 for no pinning
++        const char* c = std::getenv("STRATA_ADAPT_JOB_CPU");
++        const int cpu = c != nullptr ? std::atoi(c) : smt_spare_cpu();
++        if (cpu >= 0) (void) strata::kernels::cpu::pin_current_thread(cpu);
++        for (;;) {
++            std::function<void()> f;
++            {
++                std::unique_lock<std::mutex> lk(mu_);
++                cv_.wait(lk, [&] { return has_ || quit_; });
++                if (!has_) return;
++                f = std::move(job_);
++                has_ = false;
++            }
++            f();
++            done_.store(true, std::memory_order_release);
++        }
++    }
++    std::mutex mu_;
++    std::condition_variable cv_;
++    std::function<void()> job_;
++    bool has_ = false, quit_ = false;
++    std::atomic<bool> done_{true};
++    std::thread th_;   // last: started once the members above exist
++};
++
+ int argmax(const std::vector<float>& v) {
+     int best = 0;
+     for (size_t i = 1; i < v.size(); ++i)
+@@ -1481,6 +1564,7 @@ int main(int argc, char** argv) {
+         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
+         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
+         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
++        else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
+         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+         else if (a == "--stop-eos") o.stop_eos = true;
+         else if (a == "--spec-split") o.spec_split = true;
+@@ -4674,6 +4758,32 @@ int main(int argc, char** argv) {
+     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
+     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
+     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
++    // --adapt-async (opt-in): where the asynchronous adaptive tier does not apply, the blocking tier runs, said once.
++    // It exchanges experts between the GPU caches and the resident RAM copy only (the copy is checked once it is
++    // built, below).  Not beside the --batch slots (their windows run between a request's prompt chunks), a peer
++    // tier or the helper GPUs' tier, which pick their swaps from the same table.  The pipelined decode loop
++    // (--pipeline-windows 2) has windows in flight at every tick: there the steps that overwrite something a window
++    // may still read wait for those windows (see adapt_tick); STRATA_PIPELINE_ADAPT_ASYNC=0 keeps the blocking tier
++    // beside it instead.
++    auto adapt_async_off = [&](const char* why) {
++        std::fprintf(stderr, "strata generate: --adapt-async 1 is off (%s): the blocking adaptive tier\n", why);
++        o.adapt_async = 0;
++    };
++    if (o.adapt_async) {
++        static const bool pl_async = [] {
++            const char* v = std::getenv("STRATA_PIPELINE_ADAPT_ASYNC");
++            return v == nullptr || std::atoi(v) != 0;
++        }();
++        const char* why = !o.serve ? "it needs --serve"
++                        : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
++                        : !o.resident_cpu_experts ? "it needs the resident RAM mode, --resident-experts"
++                        : o.batch > 0 ? "not with --batch slots"
++                        : peer.valid() ? "not with --peer-device"
++                        : remote_opt ? "not with --remote-expert-opt"
++                        : o.pipeline_windows >= 2 && !pl_async ? "not with --pipeline-windows 2 (STRATA_PIPELINE_ADAPT_ASYNC=0)"
++                        : nullptr;
++        if (why != nullptr) adapt_async_off(why);
++    }
+     if (o.resident_cpu_experts) {
+         int64_t lend_from = -1;
+         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
+@@ -4709,6 +4819,14 @@ int main(int argc, char** argv) {
+                 err = whole_err + "; " + err;
+         }
+         if (resident_ok) {
++            // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
++            // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
++            if (o.adapt_async && !src.reserve_exchanges(2 * std::min<int64_t>(o.adapt_swaps, 96), err))
++                adapt_async_off(err.c_str());
++            // beside the pipelined windows the copies are queued by the decode loop's thread itself (see adapt_tick):
++            // a pageable buffer would make each one a synchronous, staged copy there
++            if (o.adapt_async && o.pipeline_windows >= 2 && !src.exchange_pinned())
++                adapt_async_off("not with --pipeline-windows 2: the exchange buffers are not page-locked");
+             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
+                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
+@@ -4749,6 +4867,7 @@ int main(int argc, char** argv) {
+         }
+ #endif
+     }
++    if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
+     if (o.serve) {
+         if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
+             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
+@@ -5231,6 +5350,10 @@ int main(int argc, char** argv) {
+         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
+         // K+1 while stage 1 still reads window K's hand-off
+         const bool pipe = o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1;
++        // STRATA_PL_PLE_LATE=1 (default off): stage 0's pipelined windows read their PLE rows through a ticket each
++        // (both verifiers of the stage can have one in flight), and layer 0's flag waits for them instead of the host
++        // thread, which serves the other windows meanwhile (Verifier::set_ple_ticketed)
++        static const bool pl_ple_late = [] { const char* v = std::getenv("STRATA_PL_PLE_LATE"); return v != nullptr && std::atoi(v) != 0; }();
+         strata::core::Verifier ver_b;
+         SplitDrive split_drive_b;
+         cudaStream_t pl_stream[2] = {nullptr, nullptr};
+@@ -5244,6 +5367,7 @@ int main(int argc, char** argv) {
+             for (strata::core::Verifier* v : {&ver, &ver_b}) {
+                 v->set_stream(pl_stream[0]);
+                 v->set_always_publish(true);
++                v->set_ple_ticketed(pl_ple_late);
+             }
+             for (strata::core::Verifier* v : {&stages[0]->ver, &stages[0]->ver_b}) {
+                 v->set_stream(pl_stream[1]);
+@@ -5425,6 +5549,9 @@ int main(int argc, char** argv) {
+                                  "windows%s\n", o.pipeline_windows,
+                          pl_snap2[0] == nullptr ? "" : pl_snap_overlap ? " (decode too; the GDN snapshots beside the window)"
+                                                                        : " (decode too; the GDN snapshot on the critical path)");
++        if (pipe && pl_ple_late)
++            std::fprintf(stderr, "strata serve: --pipeline-windows: stage 0's PLE rows through a ticket per window, layer 0 "
++                                 "waiting for them instead of the host (STRATA_PL_PLE_LATE)\n");
+         // the verifiers by [stage][parity], their pool routing, and the drafter's events (in a pipelined prompt read, a
+         // stage-1 window waits until the drafter has read the rows of the same parity's previous window)
+         strata::core::Verifier* PV[2][2] = {{&ver, &ver_b}, {pipe ? &stages[0]->ver : nullptr, pipe ? &stages[0]->ver_b : nullptr}};
+@@ -5454,6 +5581,7 @@ int main(int argc, char** argv) {
+         // INVARIANT: nothing pipelined is in flight outside read_windows_pl and the pipelined decode loop - both end
+         // here (a checkpoint, a park, the next request and the serial paths all find both stages and the drafter idle).
+         // Every window in flight is served to its end (its picks discarded), then both stages and the drafter idle.
++        // (--adapt-async: the decode loop then settles the asynchronous tier's round, a_pl_settle, see its end.)
+         auto pl_drain = [&]() {
+             std::string e2;
+             for (int round = 0; round < 10000000; ++round) {
+@@ -5976,6 +6104,341 @@ int main(int argc, char** argv) {
+             for (float& v : drive.d.usage) v *= o.adapt_decay;
+             return true;
+         };
++        // ---- --adapt-async 1: the asynchronous adaptive tier (opt-in; the resident RAM mode, see the checks where
++        // the RAM copy is built).  adapt() runs a whole round - choose, copy the evicted slots back with a stream sync,
++        // copy the new experts in from the RAM copy - on a thread the decode loop joins after the draft: ~24 ms every
++        // 4th window with ~90 swaps.  Here a round moves through four steps, each started by `adapt_tick` between
++        // windows once the previous step's copies (events) and host work (the job thread) are done:
++        //   1. job: choose (adapt()'s rule, over snapshots of the routing counts and the residency) and copy the
++        //      evicted slots back into exchange buffers (D2H), each from the cache of the card that owns its layer;
++        //   2. stage the exchanges and mark the evicted experts non-resident (the CPU reads them from the exchange
++        //      buffers from the next window on); job: copy the new experts in (straight from a page-locked RAM copy,
++        //      else through a pinned bounce buffer), on the owning card's refill stream;
++        //   3. mark the new experts resident; job: move the evicted blobs into the RAM places the new ones left;
++        //   4. flip the copy's offsets.
++        // A slot is overwritten only after its old expert stopped being planned for the GPU (step 2, between windows,
++        // with the device copies of the residency table uploaded as apply_pending does), and a RAM place only once its
++        // expert is resident (step 3), so no window computes from memory that is changing.  A request starts with the
++        // round drained (adapt_tick(true)), before its prompt lends any slot.  Not bit-exact run to run: which window
++        // first computes a swapped-in expert on the GPU (which rounds differently from the CPU) depends on when its
++        // copy lands.  `j`: the swap's exchange buffer (its copy back) and bounce buffer (a_cap + j).
++        // --pipeline-windows 2: the pipelined decode loop has windows in flight on both cards at every tick (window K+1
++        // on the first while the last verifies or commits K), each one waiting on this thread at every layer (its
++        // doorbell) and planning every layer from the residency table as it is when that layer is served.  There the
++        // tier keeps two rules (a_pl_idle, set by that loop alone; unset, nothing is in flight at a tick):
++        //   - no CUDA call of the tier reaches a card while a window there waits on this thread.  A copy queued to a
++        //     card whose window spins on a host flag can block in the driver until that window ends (issue #31, where
++        //     the host waited forever), and a thread blocked in the driver can hold up this one, which the window
++        //     waits for.  So the job thread does host work alone (the choice, the bounce copies, the RAM moves) and
++        //     this thread queues each card's copies at that card's next gap - a moment its stage has no window in
++        //     flight (a_gap: before a window is launched there, and at every tick) - from page-locked memory only;
++        //   - a gap of a stage after a step is also the step's fence for that card: every window planned there before
++        //     the step has completed.  So step 2's copies into the evicted slots (queued at a gap after step 2)
++        //     overwrite no slot a window may still read, and step 3's RAM moves wait (AState::RamFence) for a gap after
++        //     step 3 on every card whose layers exchanged (a window planned before may still pull an incoming expert
++        //     over PCIe from the RAM place its evicted one takes).  The CPU's reads need no fence: the pool runs inside
++        //     the loop's service calls.
++        // The device copies of the residency table are not uploaded meanwhile (a synchronous copy; the pipelined
++        // verifiers publish every row whatever they say): once, when the loop has drained.  The loop ticks once per
++        // verdict (after the drafter's chain is launched) and, while a round is in flight, every 0.5 ms without
++        // counting a window.
++        struct ASwap { int32_t layer, in, out, slot; int home; int64_t j; bool exchange; const uint8_t* from; };
++        struct AHome { strata::core::ExpertCache* cache; cudaStream_t stream; cudaEvent_t ev; int dev; bool used; };
++        enum class AState { Idle, Pick, CopyBack, SwapIn, RamFence, Commit };
++        AState astate = AState::Idle;
++        std::vector<ASwap> aswaps;
++        std::vector<float> a_usage;
++        std::vector<int32_t> a_res;
++        int64_t a_win = 0, a_last = 0, a_rounds = 0, a_swapped = 0;
++        std::atomic<bool> a_err{false};
++        std::vector<AHome> ahomes;   // [0] = CUDA0's cache, [k] = layer split stage k's
++        std::unique_ptr<JobThread> ajob;
++        const int64_t a_cap = std::min<int64_t>(o.adapt_swaps, 96);   // as the blocking tier's exchange buffers
++        if (o.adapt_async && !drive.d.usage.empty() && src.complement_ready() && src.exchange_capacity() >= 2 * a_cap) {
++            ahomes.push_back({&xcache, adapt_stream, adapt_ev, 0, false});
++            for (auto& st : stages) ahomes.push_back({&st->cache, st->adapt_stream, st->adapt_ev, st->dev, false});
++            ajob = std::make_unique<JobThread>();
++            std::fprintf(stderr, "strata serve: adaptive tier asynchronous (--adapt-async 1): up to %lld swaps per round, "
++                                 "a round every %d windows\n", (long long) a_cap, o.adapt_every);
++        }
++        // the pipelined loop's side (see above): whether stage `st` has no window in flight; per home, the copies back
++        // and in to queue at its next gap, the RAM fence still to pass and the gaps seen
++        std::function<bool(int)> a_pl_idle;
++        std::vector<uint8_t> a_back_due(ahomes.size(), 0), a_in_due(ahomes.size(), 0), a_ram_due(ahomes.size(), 0);
++        std::vector<uint64_t> a_gap_seq(ahomes.size(), 0), a_ram_mark(ahomes.size(), 0);
++        bool a_res_dirty = false;
++        auto a_due = [](const std::vector<uint8_t>& v) {
++            return std::any_of(v.begin(), v.end(), [](uint8_t b) { return b != 0; });
++        };
++        auto a_mark = [&](AHome& h) {   // an event after the copies just queued on h's stream, submitted now (WDDM)
++            const strata::core::OnDevice on(h.dev);
++            if (cudaEventRecord(h.ev, h.stream) != cudaSuccess) a_err = true;
++            (void) cudaStreamQuery(h.stream);
++            h.used = true;
++        };
++        auto a_pick = [&]() {   // step 1's choice (host work)
++            struct C { float gain; int32_t layer, in, out; };
++            std::vector<C> all;
++            std::vector<std::pair<float, int32_t>> cand, vict;
++            for (int64_t l = 0; l < g.n_layers; ++l) {
++                cand.clear();
++                vict.clear();
++                const float* u = a_usage.data() + l * g.n_expert;
++                const int32_t* r = a_res.data() + l * g.n_expert;
++                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
++                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
++                    else vict.emplace_back(u[e], e);
++                }
++                if (cand.empty() || vict.empty()) continue;
++                std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
++                const size_t nc = std::min(cand.size(), vict.size());
++                std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
++                                  [](auto& a, auto& b) { return a.first < b.first; });
++                for (size_t i = 0; i < nc; ++i) {
++                    if (cand[i].first < vict[i].first + 1.5f) break;
++                    all.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
++                }
++            }
++            std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.gain > b.gain; });
++            aswaps.clear();
++            for (const C& c : all) {
++                if ((int64_t) aswaps.size() >= a_cap) break;
++                const int32_t slot = a_res[(size_t) c.layer * g.n_expert + c.out];
++                if (slot < 0) continue;
++                // an exchange (as resident_stage_swaps): `in` from the RAM copy, `out` held by its slot alone takes its
++                // place there; otherwise `out` is in the copy already (the lend region) or `in` is not (a RAM budget)
++                const bool x = src.has_resident(c.layer, c.in) && !src.has_resident(c.layer, c.out);
++                aswaps.push_back({c.layer, c.in, c.out, slot, multi_gpu ? stage_of(c.layer) : 0, (int64_t) aswaps.size(), x,
++                                  nullptr});
++            }
++        };
++        auto a_back = [&](int hi) {   // step 1's copies back (D2H) from home hi's cache, then its event
++            AHome& h = ahomes[(size_t) hi];
++            bool any = false;
++            {
++                const strata::core::OnDevice on(h.dev);
++                for (const ASwap& w : aswaps) {
++                    if (w.home != hi || !w.exchange) continue;
++                    if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(w.j), h.cache->device_slot(w.slot),
++                                                              (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
++                                                              cudaMemcpyDeviceToHost, h.stream); e != cudaSuccess) {
++                        std::fprintf(stderr, "strata serve: adaptive tier: copy back of layer %d slot %d (CUDA%d) failed: %s\n",
++                                     (int) w.layer, (int) w.slot, h.dev, cudaGetErrorString(e));
++                        a_err = true;
++                    }
++                    any = true;
++                }
++            }
++            if (any) a_mark(h);
++        };
++        auto a_from = [&](const ASwap& w) -> const uint8_t* {   // step 2: where `in` is copied from (host work)
++            if (src.pinned(w.layer, w.in))
++                if (const uint8_t* b = src.resident_blob(w.layer, w.in)) return b;
++            // pageable, or not in the RAM copy: through a bounce buffer (an async copy)
++            uint8_t* bb = src.exchange_buffer(a_cap + w.j);
++            if (bb == nullptr || !src.copy_blob(w.layer, w.in, bb)) {
++                std::fprintf(stderr, "strata serve: adaptive tier: layer %d expert %d could not be read\n", (int) w.layer,
++                             (int) w.in);
++                a_err = true;
++                return nullptr;
++            }
++            return bb;
++        };
++        auto a_in_one = [&](const ASwap& w, const uint8_t* b) {   // step 2: one copy in (H2D), on its home's stream
++            AHome& h = ahomes[(size_t) w.home];
++            const strata::core::OnDevice on(h.dev);
++            if (const cudaError_t e = cudaMemcpyAsync(h.cache->device_slot(w.slot), b,
++                                                      (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
++                                                      cudaMemcpyHostToDevice, h.stream); e != cudaSuccess) {
++                std::fprintf(stderr, "strata serve: adaptive tier: copy of layer %d into slot %d (CUDA%d) failed: %s\n",
++                             (int) w.layer, (int) w.slot, h.dev, cudaGetErrorString(e));
++                a_err = true;
++            }
++        };
++        auto a_choose = [&]() {   // step 1 on the job thread (the serial loop)
++            a_pick();
++            for (AHome& h : ahomes) h.used = false;
++            for (size_t hi = 0; hi < ahomes.size(); ++hi) a_back((int) hi);
++        };
++        auto a_copy_in = [&]() {   // step 2 on the job thread (the serial loop): each source read, then copied in
++            std::vector<uint8_t> used(ahomes.size(), 0);
++            for (const ASwap& w : aswaps)
++                if (const uint8_t* b = a_from(w)) {
++                    a_in_one(w, b);
++                    used[(size_t) w.home] = 1;
++                }
++            for (size_t hi = 0; hi < ahomes.size(); ++hi)
++                if (used[hi]) a_mark(ahomes[hi]);
++        };
++        auto a_stage_in = [&]() {   // step 2's host part on the job thread (the pipelined loop: a_in queues the copies)
++            for (ASwap& w : aswaps) w.from = a_from(w);
++        };
++        auto a_in = [&](int hi) {   // step 2's copies in to home hi (the pipelined loop, at its gap)
++            bool any = false;
++            for (const ASwap& w : aswaps)
++                if (w.home == hi && w.from != nullptr) {
++                    a_in_one(w, w.from);
++                    any = true;
++                }
++            if (any) a_mark(ahomes[(size_t) hi]);
++        };
++        auto a_ready = [&](bool wait) -> bool {   // the job and its copies are done
++            if (wait) ajob->wait();
++            else if (!ajob->idle()) return false;
++            for (AHome& h : ahomes)
++                if (h.used) {
++                    const strata::core::OnDevice on(h.dev);
++                    if (wait) { if (cudaEventSynchronize(h.ev) != cudaSuccess) a_err = true; }
++                    else if (const cudaError_t q = cudaEventQuery(h.ev); q == cudaErrorNotReady) return false;
++                    else if (q != cudaSuccess) a_err = true;
++                }
++            return true;
++        };
++        // --pipeline-windows 2: stage `st` has no window in flight (see above) - the copies due on its card are queued
++        // now, and the steps taken before are fenced for it.  On the loop's thread.
++        auto a_gap = [&](int st) {
++            if (!a_pl_idle || st < 0 || st >= (int) ahomes.size() || !a_pl_idle(st)) return;
++            ++a_gap_seq[(size_t) st];
++            if (a_back_due[(size_t) st]) {
++                a_back_due[(size_t) st] = 0;
++                a_back(st);
++            }
++            if (a_in_due[(size_t) st] && ajob->idle()) {   // once the job has read the sources
++                a_in_due[(size_t) st] = 0;
++                a_in(st);
++            }
++        };
++        auto a_picked = [&]() {   // (pipelined) step 1's choice is made: each card's copies back at its next gap
++            for (AHome& h : ahomes) h.used = false;
++            for (const ASwap& w : aswaps)
++                if (w.exchange) a_back_due[(size_t) w.home] = 1;
++            astate = AState::CopyBack;
++            for (int st = 0; st < (int) ahomes.size(); ++st) a_gap(st);
++        };
++        // between windows: `drain` finishes the round in flight and starts none; `count` false (the pipelined loop
++        // between verdicts) moves it on without counting a window.  False when a copy failed.
++        auto adapt_tick = [&](bool drain, bool count = true) -> bool {
++            if (!ajob) return true;
++            if (!drain && count) ++a_win;   // one tick per window
++            const bool pl = (bool) a_pl_idle;
++            if (pl)
++                for (int st = 0; st < (int) ahomes.size(); ++st) a_gap(st);
++            for (;;) {
++                if (a_err.load()) return false;
++                switch (astate) {
++                case AState::Idle:
++                    if (drain || a_win - a_last < (int64_t) o.adapt_every) return true;
++                    a_last = a_win;
++                    ++a_rounds;
++                    a_usage = drive.d.usage;
++                    a_res = host_res;
++                    // #477: the routing counted, as adapt() counts it (--expert-profile-save; else `heat` is empty)
++                    for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
++                    for (float& v : drive.d.usage) v *= o.adapt_decay;
++                    if (pl) {
++                        ajob->post(a_pick);
++                        astate = AState::Pick;
++                    } else {
++                        ajob->post(a_choose);
++                        astate = AState::CopyBack;
++                    }
++                    return true;
++                case AState::Pick:   // (pipelined) step 1: the copies back wait for the choice, then for their card's gap
++                    if (!ajob->idle()) {
++                        if (!drain) return true;
++                        ajob->wait();
++                    }
++                    a_picked();
++                    continue;
++                case AState::CopyBack: {   // step 2: the evicted experts leave the GPU's plan
++                    if (a_due(a_back_due)) return true;   // (pipelined) a card not seen idle since the choice
++                    if (!a_ready(drain)) return true;
++                    if (a_err.load()) return false;
++                    size_t k = 0;
++                    for (size_t i = 0; i < aswaps.size(); ++i) {
++                        const ASwap w = aswaps[i];
++                        const size_t out = (size_t) w.layer * g.n_expert + w.out;
++                        if (host_res[out] != w.slot) continue;   // the table moved since the snapshot: not this one
++                        if (w.exchange && !src.stage_exchange(w.layer, w.in, w.out, w.j)) {
++                            std::fprintf(stderr, "strata serve: adaptive tier: stage_exchange refused layer %d in %d out %d\n",
++                                         (int) w.layer, (int) w.in, (int) w.out);
++                            return false;
++                        }
++                        host_res[out] = strata::core::kNotResident;   // the CPU computes it from the next window on
++                        srcp->prefetch(w.layer, w.out);
++                        aswaps[k++] = w;
++                    }
++                    aswaps.resize(k);
++                    for (AHome& h : ahomes) h.used = false;
++                    if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
++                        a_res_dirty = true;
++                        for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
++                        ajob->post(a_stage_in);
++                    } else {
++                        res_upload();
++                        ajob->post(a_copy_in);
++                    }
++                    astate = AState::SwapIn;
++                    if (!drain) return true;
++                    continue;
++                }
++                case AState::SwapIn:   // step 3: the new experts are in their slots
++                    if (a_due(a_in_due)) return true;   // (pipelined) a card not seen idle since step 2
++                    if (!a_ready(drain)) return true;
++                    if (a_err.load()) return false;
++                    for (const ASwap& w : aswaps) {
++                        host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
++                        srcp->release(w.layer, w.in);
++                    }
++                    if (pl) a_res_dirty = true;
++                    else res_upload();
++                    a_swapped += (int64_t) aswaps.size();
++                    if (pl)   // the RAM moves wait for a gap after this step on every card whose layers exchanged
++                        for (const ASwap& w : aswaps)
++                            if (w.exchange) {
++                                a_ram_due[(size_t) w.home] = 1;
++                                a_ram_mark[(size_t) w.home] = a_gap_seq[(size_t) w.home];
++                            }
++                    astate = AState::RamFence;
++                    continue;
++                case AState::RamFence:   // step 3's RAM moves, once no window may still read the places they fill
++                    if (pl)
++                        for (size_t hi = 0; hi < ahomes.size(); ++hi)
++                            if (a_ram_due[hi] && a_gap_seq[hi] <= a_ram_mark[hi]) return true;
++                    std::fill(a_ram_due.begin(), a_ram_due.end(), (uint8_t) 0);
++                    ajob->post([&] { src.commit_copies(); });
++                    astate = AState::Commit;
++                    if (!drain) return true;
++                    continue;
++                case AState::Commit:   // step 4
++                    if (!a_ready(drain)) return true;
++                    if (a_err.load()) return false;
++                    src.commit_flip();
++                    aswaps.clear();
++                    astate = AState::Idle;
++                    continue;   // a round due now starts at this same boundary
++                }
++            }
++        };
++        // --pipeline-windows 2: the loop has drained (nothing in flight on either card): what waits for a gap goes now,
++        // and the round in flight goes on unfenced (a_pl_idle unset) from the next tick, the next request's drain.  The
++        // job's work is the host's alone, so the wait for it ends.
++        auto a_pl_settle = [&]() {
++            if (!ajob || !a_pl_idle) return;
++            ajob->wait();
++            bool idle = true;
++            for (int st = 0; st < (int) ahomes.size(); ++st) idle = idle && a_pl_idle(st);
++            if (idle) {
++                if (astate == AState::Pick) a_picked();
++                for (int st = 0; st < (int) ahomes.size(); ++st) a_gap(st);
++                if (a_res_dirty) res_upload();
++            } else {   // the loop did not drain (a window failed): the round cannot go on, the next tick says so
++                std::fprintf(stderr, "strata serve: adaptive tier: a window is still in flight after the pipelined loop\n");
++                a_err = true;
++            }
++            a_pl_idle = nullptr;
++            a_res_dirty = false;
++        };
+         // #477: write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).
+         // A swap still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
+         auto save_profile = [&](const char* why) {
+@@ -5983,6 +6446,8 @@ int main(int argc, char** argv) {
+             std::vector<uint8_t> resident(host_res.size(), 0);
+             for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
+             for (const auto& p : pending) resident[(size_t) p.first] = 1;
++            if (astate == AState::SwapIn)   // --adapt-async: the same for a round past its step 2
++                for (const ASwap& w : aswaps) resident[(size_t) w.layer * g.n_expert + w.in] = 1;
+             std::string e;
+             const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
+                                                                    profile_loaded);
+@@ -7475,6 +7940,10 @@ int main(int argc, char** argv) {
+                 return true;
+             };
+             apply_pending(true);
++            if (!adapt_tick(true)) {   // --adapt-async: the round in flight lands before the prompt lends any slot
++                std::printf("ERR an adaptive refill failed\n");
++                return 1;
++            }
+             // per-request sampling for the verify window's head (greedy when temperature is absent)
+             strata::kernels::SamplerParams req_sp;
+             req_sp.greedy = req_temperature <= 0.0f;
+@@ -7738,6 +8207,69 @@ int main(int argc, char** argv) {
+                 int64_t pl_spec = 0, pl_on = 0, pl_undo = 0, pl_gate = 0, pl_fm = 0;
+                 std::vector<int32_t> outp(8, 0);
+                 bool ending = false;
++                // STRATA_PL_PLE_PREFETCH=1 (default off): the PLE rows a stage-0 window will be staged on are read into
++                // the row cache as soon as each token is known - row 0 at the verdict, each draft as the chain lands it,
++                // a lookup B's tokens once A is launched - so its staging finds them cached (or waits for their read in
++                // flight) instead of starting them.  A wrong guess costs SSD reads only: the rows are the table's own
++                // bytes.  Direct mode only.
++                static const bool pl_ple_pf = [] { const char* v = std::getenv("STRATA_PL_PLE_PREFETCH"); return v != nullptr && std::atoi(v) != 0; }();
++                // STRATA_PL_EARLY_CHAIN=1 (default off): a verdict launches the next chain before it prints and flushes
++                // the tokens, feeds the suffix drafter and the policy and ticks the adaptive tier (the chain needs none
++                // of them)
++                static const bool pl_early_chain = [] { const char* v = std::getenv("STRATA_PL_EARLY_CHAIN"); return v != nullptr && std::atoi(v) != 0; }();
++                strata::kernels::PleTable* const pf_table =
++                    pl_ple_pf && ss.ple.ready() && ss.ple.table->mode() == strata::kernels::PleIo::Direct ? ss.ple.table : nullptr;
++                int32_t pf_seq[16] = {};   // the chain's window: the two tokens before it, then its tokens
++                int32_t pf_def_tok[8] = {}, pf_def_prev[2] = {-1, -1};   // a lookup B's tokens, read ahead after A's launch
++                int pf_def_n = 0;
++                int pf_known = 0;          // of its tokens, how many were known at the chain's launch (staged with it)
++                int pf_upto = 0;           // the chain's outputs looked at
++                int64_t pf_tokens = 0, pl_early_n = 0;
++                // the request's line for these switches (STRATA_DECODE_TIMING with one on): the reader's and the
++                // stage-0 verifiers' counters
++                const bool i2_log = dec_timing && (pf_table != nullptr || pl_early_chain || pl_ple_late);
++                const strata::kernels::PleTable::IoCounters pio0 =
++                    i2_log && ss.ple.ready() ? ss.ple.table->io_counters() : strata::kernels::PleTable::IoCounters{};
++                int64_t tk0[5] = {};
++                double tk0_ms = 0;
++                for (int par = 0; par < 2; ++par) {
++                    tk0[0] += PV[0][par]->ple_tk_issued;
++                    tk0[1] += PV[0][par]->ple_tk_now;
++                    tk0[2] += PV[0][par]->ple_tk_late;
++                    tk0[3] += PV[0][par]->ple_tk_dropped;
++                    tk0[4] += PV[0][par]->ple_tk_held;
++                    tk0_ms += PV[0][par]->ms_ple_held;
++                }
++                // the two tokens before the next position: what the session has consumed (ss.ple_prev follows the
++                // stage-0 commits, which may be speculative or about to be undone here)
++                auto pf_tail = [&](int32_t* two) {
++                    const size_t c = consumed.size();
++                    two[0] = c >= 2 ? consumed[c - 2] : -1;
++                    two[1] = c >= 1 ? consumed[c - 1] : -1;
++                };
++                // a chain was launched over the window whose first `n_known` tokens are `known` (staged, or row 0)
++                auto pf_start = [&](const int32_t* known, int n_known) {
++                    if (pf_table == nullptr) return;
++                    pf_tail(pf_seq);
++                    pf_known = std::max(1, std::min(n_known, 8));
++                    for (int i = 0; i < pf_known; ++i) pf_seq[2 + i] = known[i];
++                    pf_upto = 0;
++                };
++                // the chain's outputs [pf_upto, k): output j is the window's token j + 1 (a fresh chain drafts the
++                // window itself; a forced one is forced through its staged drafts, then guesses the next window)
++                auto pf_chain = [&](int k) {
++                    if (pf_table == nullptr) return;
++                    const int32_t* oc = mtp.chain_tok();
++                    for (; pf_upto < k && pf_upto + 1 < 14; ++pf_upto) {
++                        const int idx = pf_upto + 1;
++                        if (idx < pf_known) continue;      // a forced chain's own drafts: staged with its window
++                        const int32_t t = oc[pf_upto];
++                        if (t < 0) break;
++                        pf_seq[2 + idx] = t;
++                        pf_table->prefetch_tokens(&t, 1, pf_seq[idx], pf_seq[idx + 1], &ss.ple.consts);
++                        ++pf_tokens;
++                    }
++                };
+                 A.T = 1;
+                 A.p = p;
+                 A.tok[0] = x;
+@@ -7746,17 +8278,23 @@ int main(int argc, char** argv) {
+                 drive.d.experts = 0;
+                 drive.d.failed = false;
+                 // the adaptive tier beside the pipeline: the serial loop's rule and adapt() on a thread of its own (its
+-                // copies wait for the windows in flight, which this loop keeps serving meanwhile)
++                // copies wait for the windows in flight, which this loop keeps serving meanwhile).  --adapt-async: the
++                // asynchronous tier's steps instead, its copies queued here at each card's gaps (a_pl_idle, a_gap)
+                 std::thread pl_adapt_thr;
+                 std::atomic<bool> pl_adapt_done{true};
+                 bool pl_adapt_ok = true;
+                 // an error ends the engine, as the serial loop's do: every GPU wait is released first (#267), so no
+-                // window in flight keeps spinning on a flag nobody raises, and the tier's thread can finish
++                // window in flight keeps spinning on a flag nobody raises, and the tier's thread can finish (the
++                // asynchronous tier's job does host work alone: it ends)
+                 auto die = [&](const std::string& m) -> int {
+                     std::fprintf(stderr, "strata serve: pipelined decode: %s\n", m.c_str());
+                     strata::core::diag_pipeline_fn().store(nullptr);
+                     strata::core::release_gpu_waits(stderr);
+                     if (pl_adapt_thr.joinable()) pl_adapt_thr.join();
++                    if (ajob) {
++                        ajob->wait();
++                        a_pl_idle = nullptr;
++                    }
+                     std::printf("ERR %s\n", m.c_str());
+                     std::fflush(stdout);
+                     return 1;
+@@ -7877,7 +8415,11 @@ int main(int argc, char** argv) {
+                     stage_record(exch_ev);
+                     exch_wait = true;
+                 };
+-                auto pl_adapt = [&]() -> bool {
++                // --adapt-async: the asynchronous tier beside the windows (see adapt_tick).  A stage is idle when neither
++                // of its verifiers has a window in flight (a commit or a snapshot copy waits on nothing of the host's)
++                if (ajob) a_pl_idle = [&](int st) { return !PV[st][0]->in_flight() && !PV[st][1]->in_flight(); };
++                double a_poll_ms = 0.0;
++                auto pl_adapt = [&]() -> bool {   // the blocking tier (--adapt-async 0)
+                     if (pl_adapt_thr.joinable() && pl_adapt_done.load()) {
+                         pl_adapt_thr.join();
+                         if (!pl_adapt_ok) return false;
+@@ -7916,7 +8458,9 @@ int main(int argc, char** argv) {
+                     w.sfx = true;
+                     w.sfx_match = match;
+                     const int rest = k - (w.T - 1);   // lookup tokens past w: B's row 0 (w's bonus guess) and its drafts
++                    bool lookup_b = false;
+                     if (&w == &A && rest >= 1 && pl_lookup_pon > 0.0f && !b_done) {
++                        lookup_b = true;
+                         B = PW{};
+                         B.seq = A.seq + 1;
+                         B.p = A.p + A.T;
+@@ -7929,6 +8473,23 @@ int main(int argc, char** argv) {
+                         b_done = true;   // the chain in flight makes no B for this A
+                         tre("CD", A.seq + 1, 3, (int) (1000.0f * B.p_on));
+                     }
++                    // STRATA_PL_PLE_PREFETCH: B's lookup tokens, staged at B's launch behind A (a lookup B is never
++                    // prestaged).  Not A's drafts: A is staged right after this and its own staging reads them at the
++                    // same moment.  Issued once A has been launched (pf_def_flush), for the same reason.
++                    if (pf_table != nullptr && lookup_b) {
++                        int32_t two[2];
++                        pf_tail(two);   // the two tokens before A (A.tok[0] is not consumed yet)
++                        pf_def_prev[0] = A.T >= 2 ? A.tok[A.T - 2] : two[1];
++                        pf_def_prev[1] = A.tok[A.T - 1];
++                        pf_def_n = std::min(B.T, 8);
++                        for (int i = 0; i < pf_def_n; ++i) pf_def_tok[i] = B.tok[i];
++                    }
++                };
++                auto pf_def_flush = [&]() {
++                    if (pf_def_n <= 0 || pf_table == nullptr) return;
++                    pf_table->prefetch_tokens(pf_def_tok, pf_def_n, pf_def_prev[0], pf_def_prev[1], &ss.ple.consts);
++                    pf_tokens += pf_def_n;
++                    pf_def_n = 0;
+                 };
+                 const Clock::time_point pl_t0 = Clock::now();
+                 for (int st = 0; st < 2; ++st)
+@@ -7963,6 +8524,14 @@ int main(int argc, char** argv) {
+                     g_pl_diag.chain_live.store(mtp.chain_live() ? 1 : 0, std::memory_order_relaxed);
+                     g_pl_diag.doomed.store(doomed ? 1 : 0, std::memory_order_relaxed);
+                     g_pl_diag.ending.store(ending ? 1 : 0, std::memory_order_relaxed);
++                    // ---- --adapt-async: the round in flight moves on between verdicts too (at most every 0.5 ms)
++                    if (ajob && astate != AState::Idle) {
++                        const double t = ms_now();
++                        if (t - a_poll_ms >= 0.5) {
++                            a_poll_ms = t;
++                            if (!adapt_tick(false, false)) return die("an adaptive refill failed");
++                        }
++                    }
+                     // ---- every window in flight served
+                     if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B)) return die(err);
+                     if (A.s1 && !A.s1_done) {
+@@ -8000,6 +8569,7 @@ int main(int argc, char** argv) {
+                     if (chain_kind != 0) {
+                         const int k_ready = mtp.chain_outputs_ready(err);
+                         if (k_ready < 0) return die(err);
++                        if (pf_table != nullptr && !b_done && !A.sfx) pf_chain(k_ready);   // STRATA_PL_PLE_PREFETCH
+                         if (chain_kind == 2 && !early_used) {
+                             // A's size is decided by its first outputs: a draft below spec_min_p ends it (the serial
+                             // loop's rule), so A goes to stage 0 as soon as that is known, not after all S_mtp - 1
+@@ -8023,6 +8593,7 @@ int main(int argc, char** argv) {
+                         const int r = mtp.chain_poll(err);
+                         if (r < 0) return die(err);
+                         const int k = r == 1 ? chain_n : k_ready;
++                        if (r == 1 && pf_table != nullptr && !b_done && !A.sfx) pf_chain(k);   // the last ones
+                         const int32_t* oc = mtp.chain_tok();
+                         const float* op = mtp.chain_prob();
+                         if (r == 1 && chain_kind == 2 && !early_used) {
+@@ -8077,14 +8648,17 @@ int main(int argc, char** argv) {
+                     // ---- stage 0: A (never while a wrong window still holds stage 0's state)
+                     if (A.ready && !A.launched && !doomed) {
+                         if (A.p + A.T > o.max_context) { ending = true; continue; }
++                        if (ajob) a_gap(0);   // --adapt-async: stage 0 is idle until this launch
+                         if (!snap_take(A.seq)) return die("the GDN snapshot failed");
+                         if (!V0(A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
+                         A.launched = true;
+                         tre("L0", A.seq, A.T, 0);
+                     }
++                    pf_def_flush();   // STRATA_PL_PLE_PREFETCH: a lookup B's rows, now that A is on its way
+                     // ---- stage 0: B, speculatively, right behind A
+                     if (B.ready && !B.launched && A.finished && !A.committed && !doomed) {
+                         if (B.p_on >= theta && B.p + B.T <= o.max_context) {
++                            if (ajob) a_gap(0);   // --adapt-async: stage 0 is idle until this launch
+                             {
+                                 const strata::core::OnDevice on(dev0);
+                                 if (pl_snap_overlap ? cudaStreamWaitEvent(s0, pl_snap_ev[A.seq & 1], 0) != cudaSuccess
+@@ -8110,6 +8684,7 @@ int main(int argc, char** argv) {
+                     // ---- stage 1: A, once its stage 0 is done
+                     if (A.finished && !A.s1) {
+                         if (chain_kind == 1 && !B.ready) ++pl_late;   // stage 0 idles until the chain has B
++                        if (ajob) a_gap(1);   // --adapt-async: stage 1 is idle until this launch
+                         if (!V1(A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
+                         A.s1 = true;
+                         tre("L1", A.seq, A.T);
+@@ -8132,6 +8707,51 @@ int main(int argc, char** argv) {
+                     ++rounds;
+                     ++dec_windows;
+                     dec_T += A.T;
++                    // STRATA_PL_EARLY_CHAIN: the chain first.  The request's end is decided as the loop below decides
++                    // it, without printing; the printing, the suffix drafter, the calibration, the policy and the
++                    // adaptive tier follow the launch.  The chain needs none of them (the suffix drafter is read by
++                    // pick_lookup, after its first outputs), and the tier's synchronous uploads (res_upload, on the
++                    // legacy stream) do not wait for it: the drafter's stream is non-blocking.
++                    const bool on_v = B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
++                    bool e_last = false, e_stop = false, e_launched = false;
++                    double e_now = 0.0;
++                    if (pl_early_chain) {
++                        bool e_eos = false;
++                        int n_emit = 0;
++                        for (int i = 0; i <= a && produced_n + n_emit < max_new && !e_eos; ++i) {
++                            ++n_emit;
++                            e_eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
++                        }
++                        e_stop = stop_req.load();
++                        e_last = e_eos || produced_n + n_emit >= max_new || e_stop;
++                        e_now = ms_now();
++                        tre("V", A.seq, a, on_v ? 1 : (B.launched ? -1 : 0));
++                        if (!e_last) {
++                            mtp.set_source_R(V1(A).final_R(0));
++                            if (on_v) {   // the chain over A, forced through B's drafts (as below)
++                                chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
++                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
++                                    return die(err);
++                                tre("CL", A.seq, 1);
++                            } else {      // fresh (as below)
++                                chain_n = strata::kernels::kVerifyMaxT - 1;
++                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
++                                    return die(err);
++                                tre("CL", A.seq, 2);
++                            }
++                            e_launched = true;
++                            ++pl_early_n;
++                        }
++                    }
++                    // STRATA_PL_PLE_PREFETCH: off the path the next window is fresh and its row 0 is the bonus token
++                    // outp[a], after the tokens just consumed: its rows are read while the chain drafts (else at its
++                    // staging, right before its launch).  After an early chain's launch, which it must not delay.
++                    if (pf_table != nullptr && !on_v) {
++                        int32_t two[2];
++                        pf_tail(two);
++                        pf_table->prefetch_tokens(&outp[(size_t) a], 1, two[0], two[1], &ss.ple.consts);
++                        ++pf_tokens;
++                    }
+                     bool eos = false;
+                     for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                         std::printf("T %d\n", (int) outp[(size_t) i]);
+@@ -8142,8 +8762,10 @@ int main(int argc, char** argv) {
+                     }
+                     std::fflush(stdout);
+                     if (eos) finish = "stop";
+-                    else if (stop_req.load()) finish = "cancel";
+-                    const bool last = eos || produced_n >= max_new || stop_req.load();
++                    else if (pl_early_chain ? e_stop : stop_req.load()) finish = "cancel";
++                    // (early chain: the decision made before the printing - a stop request arriving in between ends
++                    // the request at the next verdict)
++                    const bool last = pl_early_chain ? e_last : (eos || produced_n >= max_new || stop_req.load());
+                     const bool on = B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
+                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+@@ -8151,9 +8773,9 @@ int main(int argc, char** argv) {
+                         cal_n[bin] += 1;
+                         cal_on[bin] += would ? 1 : 0;
+                     }
+-                    tre("V", A.seq, a, on ? 1 : (B.launched ? -1 : 0));
++                    if (!pl_early_chain) tre("V", A.seq, a, on ? 1 : (B.launched ? -1 : 0));
+                     {
+-                        const double now = ms_now();
++                        const double now = pl_early_chain ? e_now : ms_now();
+                         const int c = A.spec ? 1 : 0;
+                         if (A.sfx) { ++sfx_windows; sfx_drafts += A.T - 1; sfx_ok += a; }
+                         if (A.seq > 0 && !last) policy.observe(A.sfx, A.T, a, A.sfx_match, now - last_verdict);
+@@ -8167,16 +8789,19 @@ int main(int argc, char** argv) {
+                                      B.launched ? "launched" : B.ready ? "ready" : "none", on ? " ON" : "");
+                     x = outp[(size_t) a];
+                     p = A.p + a + 1;
+-                    if (!last && !pl_adapt()) return die("an adaptive refill failed");
++                    if (!last && !ajob && !pl_adapt()) return die("an adaptive refill failed");
+                     if (on && !last) {
+                         ++pl_on;
+-                        // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
+-                        mtp.set_source_R(V1(A).final_R(0));
+-                        chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
+-                        if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
+-                            return die(err);
++                        if (!e_launched) {
++                            // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
++                            mtp.set_source_R(V1(A).final_R(0));
++                            chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
++                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
++                                return die(err);
++                            tre("CL", A.seq, 1);
++                        }
++                        pf_start(B.tok, B.T);   // STRATA_PL_PLE_PREFETCH: the chain's window is B (staged)
+                         chain_kind = 1;
+-                        tre("CL", A.seq, 1);
+                         early_used = false;
+                         b_done = false;
+                         A = B;
+@@ -8194,12 +8819,15 @@ int main(int argc, char** argv) {
+                         // would finish it, and the other would wait for it forever)
+                         B = PW{};
+                         if (!last) {
+-                            mtp.set_source_R(V1(A).final_R(0));
+-                            chain_n = strata::kernels::kVerifyMaxT - 1;
+-                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
+-                                return die(err);
++                            if (!e_launched) {
++                                mtp.set_source_R(V1(A).final_R(0));
++                                chain_n = strata::kernels::kVerifyMaxT - 1;
++                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
++                                    return die(err);
++                                tre("CL", A.seq, 2);
++                            }
++                            pf_start(&outp[(size_t) a], 1);   // STRATA_PL_PLE_PREFETCH: row 0 known, the chain drafts the rest
+                             chain_kind = 2;
+-                            tre("CL", A.seq, 2);
+                             early_used = false;
+                             b_done = false;
+                             PW nA;
+@@ -8209,6 +8837,8 @@ int main(int argc, char** argv) {
+                             A = nA;
+                         }
+                     }
++                    // --adapt-async: the verdict's tick, once the drafter's chain is launched (off its critical path)
++                    if (!last && ajob && !adapt_tick(false)) return die("an adaptive refill failed");
+                     if (last) ending = true;
+                 }
+                 pl_drain();   // nothing in flight: both stages' commits and the drafter have landed
+@@ -8216,6 +8846,10 @@ int main(int argc, char** argv) {
+                 if (pl_adapt_thr.joinable()) pl_adapt_thr.join();   // its copies waited only for finished work
+                 adapt_fence = nullptr;
+                 if (exch_wait) pl_release();   // every window has completed (drained)
++                // --adapt-async: both stages idle now: the copies still due are queued and the round in flight goes on
++                // unfenced (the INVARIANT at pl_drain: a checkpoint, a park, the serial loop and the next request find
++                // nothing pipelined in flight) at the next tick, the next request's drain
++                a_pl_settle();
+                 for (cudaEvent_t ev : fence_ev) if (ev) cudaEventDestroy(ev);
+                 for (cudaEvent_t ev : exch_ev) if (ev) cudaEventDestroy(ev);
+                 if (pl_trace_path != nullptr && !pl_trace.empty()) {
+@@ -8256,6 +8890,37 @@ int main(int argc, char** argv) {
+                         }
+                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
+                 }
++                // what STRATA_PL_PLE_PREFETCH / _PLE_LATE / _EARLY_CHAIN did this request.  "window rows": the rows the
++                // stage-0 windows asked the reader for (with the read-ahead on, most should come from the row cache or
++                // attach to a read ahead); "held": windows whose layer-0 flag waited for their rows (the host did not)
++                if (i2_log) {
++                    const strata::kernels::PleTable::IoCounters pio1 =
++                        ss.ple.ready() ? ss.ple.table->io_counters() : strata::kernels::PleTable::IoCounters{};
++                    int64_t tk1[5] = {};
++                    double tk1_ms = 0;
++                    for (int par = 0; par < 2; ++par) {
++                        tk1[0] += PV[0][par]->ple_tk_issued;
++                        tk1[1] += PV[0][par]->ple_tk_now;
++                        tk1[2] += PV[0][par]->ple_tk_late;
++                        tk1[3] += PV[0][par]->ple_tk_dropped;
++                        tk1[4] += PV[0][par]->ple_tk_held;
++                        tk1_ms += PV[0][par]->ms_ple_held;
++                    }
++                    const uint64_t rq = pio1.requests - pio0.requests, rh = pio1.cache_hits - pio0.cache_hits;
++                    std::fprintf(stderr, "strata pipeline ple: read ahead %lld tokens, %llu rows to the SSD (%llu skipped: "
++                                         "cached or in flight), %llu SSD reads | window rows %llu: %.1f%% from the row "
++                                         "cache, %llu attached to a read ahead, reader wait %.3f ms | tickets %lld: %lld in "
++                                         "at staging/launch, %lld by service, %lld dropped; %lld windows held %.3f ms | "
++                                         "early chains %lld\n",
++                                 (long long) pf_tokens, (unsigned long long) (pio1.prefetch_rows - pio0.prefetch_rows),
++                                 (unsigned long long) (pio1.prefetch_skipped - pio0.prefetch_skipped),
++                                 (unsigned long long) (pio1.prefetch_reads - pio0.prefetch_reads), (unsigned long long) rq,
++                                 rq > 0 ? 100.0 * (double) rh / (double) rq : 0.0,
++                                 (unsigned long long) (pio1.attached - pio0.attached), (pio1.wait_us - pio0.wait_us) / 1000.0,
++                                 (long long) (tk1[0] - tk0[0]), (long long) (tk1[1] - tk0[1]), (long long) (tk1[2] - tk0[2]),
++                                 (long long) (tk1[3] - tk0[3]), (long long) (tk1[4] - tk0[4]), tk1_ms - tk0_ms,
++                                 (long long) pl_early_n);
++                }
+             }
+             while (!pl_ran && !cancelled && produced_n < max_new) {
+                 int T = S_mtp;
+@@ -8288,6 +8953,10 @@ int main(int argc, char** argv) {
+                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
+                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
+                 apply_pending(!adapt_nowait());
++                if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
++                    std::printf("ERR an adaptive refill failed\n");
++                    return 1;
++                }
+                 if (hist_n > 0) {
+                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
+                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
+@@ -8311,7 +8980,8 @@ int main(int argc, char** argv) {
+                 const Clock::time_point tw1 = Clock::now();
+                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
+                 bool adapt_ok = true;
+-                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
++                // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
++                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
+                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                 if (!ver.commit(a + 1, err)) {
+                     if (adapt_thr.joinable()) adapt_thr.join();
+@@ -8594,6 +9264,9 @@ int main(int argc, char** argv) {
+                                      "VRAM tier, %lld blob reads from the file\n",
+                              (double) src.resident_bytes() / 1073741824.0, (long long) src.exchanges(),
+                              (long long) src.file_reads());
++            if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
++                std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in\n",
++                             (long long) a_rounds, (long long) a_swapped);
+             // CS-T: the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
+             if (srcp == &src)
+                 std::fprintf(stderr, "strata serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "

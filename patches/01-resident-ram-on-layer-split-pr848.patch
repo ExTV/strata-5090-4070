@@ -1,0 +1,384 @@
+diff --git a/docs/MULTI_GPU.md b/docs/MULTI_GPU.md
+index 1270125..5c12823 100644
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -102,6 +102,29 @@ it goes).
+ A card holding more experts can change which experts run on the GPU, so the output can differ slightly from a run
+ without it.
+ 
++**The resident RAM mode works on a split** (`--resident-experts`, the low-RAM mode). The RAM copy of the experts
++leaves out the ones every card's cache holds, not only the first card's, and when the rest does not fit whole it keeps
++the hottest by the expert profile over all the layers. An adaptive swap copies the evicted expert back into RAM from
++the card that owns its layer. Before, `--resident-experts` with a split ran as `--mmap-experts`, and setup recommended
++one card in the low-RAM mode; with an engine that has it (`RESIDENT_SPLIT_ENGINE` in setup.py), setup keeps the cards
++together and the experts no card holds in RAM. Swift 1.5 IQ3_XXS at
++160K (q4_0 KV, `--prefill 4096`, `--spec 4` with the stock draft layer), RTX 4060 Ti (layers 0-19) + RTX 5080 (20-47),
++i9-14900KF, 32 GB of RAM, Windows 11, four greedy prompts at a time, decode tok/s:
++
++| | first four prompts | after three more rounds |
++|---|---|---|
++| 5080 alone, `--resident-experts` | 25 | 29 |
++| split, `--mmap-experts` (what `--resident-experts` became on a split) | 32 | 64 |
++| split, `--resident-experts` (22 GiB of experts locked in RAM) | 71 | 69 |
++
++The split with `--mmap-experts` catches up once the OS file cache holds the experts, on a PC with nothing else
++running; the resident copy is there from the first request and stays locked when other programs need the RAM. With
++`--pcie-frac 0 --adapt-every 0` the split's greedy output is the same with either mode.
++
++**A separate VRAM reserve for the later cards:** `--vram-reserve-later-mib N` (default: `--vram-reserve-mib`'s value).
++The card that drives the monitors needs more headroom than one that drives none; with the display on the last card,
++`--vram-reserve-mib 300 --vram-reserve-later-mib 1800` gives the first card's cache that VRAM.
++
+ **auto** tries every placement (all of them for two or three cards; proportional to the free VRAM beyond that) and
+ keeps the one whose caches would hold the most of the expert profile, hottest pairs weighted most; ties go to the
+ placement that leaves the fullest card the most room. The startup log prints the choice:
+diff --git a/setup.py b/setup.py
+index 80d1fba..1368f94 100644
+--- a/setup.py
++++ b/setup.py
+@@ -802,9 +802,10 @@ def split_mmap(cfg: dict) -> bool:
+     """#364 #384: the low-RAM mode's resident variant (--resident-experts) has no layer split yet.  A config with it
+     that runs on several GPUs reads the experts the GPUs do not hold through the OS file cache instead
+     (--mmap-experts: the placement those reports measured 1.3-1.6x faster than one GPU), said plainly - the engine
+-    used to refuse the pair.  True when the config changed."""
++    used to refuse the pair.  #642: the engines from RESIDENT_SPLIT_ENGINE run it on a split, so it is kept.  True
++    when the config changed."""
+     a = cfg.get("args", [])
+-    if "--resident-experts" not in a:
++    if "--resident-experts" not in a or resident_split():
+         return False
+     a[a.index("--resident-experts")] = "--mmap-experts"
+     warn("the low-RAM mode's resident variant (--resident-experts) has no layer split yet: on several GPUs the experts "
+@@ -897,8 +898,9 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+         return cfg
+     pair = can[:2]
+     cfg["gpus_asked"] = True
+-    # #364 #384: the resident low-RAM variant stays on one card unless the user says otherwise (its RAM use is steady)
+-    resident = "--resident-experts" in cfg.get("args", [])
++    # #364 #384: the resident low-RAM variant stays on one card unless the user says otherwise (its RAM use is steady);
++    # #642: the engines from RESIDENT_SPLIT_ENGINE keep it on both cards, so they are offered as for any config
++    resident = "--resident-experts" in cfg.get("args", []) and not resident_split()
+     say()
+     say("  This PC has " + " and ".join(gpu_name(g) for g in pair) + ": Strata can share the model across both.")
+     say("  Together they hold about twice the model's experts and read prompts about 20% faster (docs/MULTI_GPU.md).")
+@@ -2342,6 +2344,14 @@ DATA_ITEMS = ("models", "packs", "mtp")
+ 
+ LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other buffers, the server
+ RESIDENT_ENGINE = (0, 1, 30)   # the first engine with --resident-experts (the low-RAM mode's resident variant)
++RESIDENT_SPLIT_ENGINE = (0, 1, 40)   # #642: the first engine that runs it on a layer split
++
++
++def resident_split() -> bool:
++    """#642: the engine setup requires runs the low-RAM mode's resident variant on a layer split - each card's cache
++    holds the most-used experts of its own layers, and the RAM copy leaves out what any card holds.  Before it, a
++    resident config on several GPUs read those experts through the OS file cache (#364 #384)."""
++    return MIN_ENGINE >= RESIDENT_SPLIT_ENGINE
+ 
+ 
+ def low_ram_needed(model, ram) -> bool:
+@@ -3927,9 +3937,11 @@ def main() -> int:
+              "the low-RAM mode")
+     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
+                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
+-    if low_ram and multi and not low_ram_together(a, model, ram, gpu, chosen):
++    # #642: the engines from RESIDENT_SPLIT_ENGINE run the low-RAM mode on the chosen cards as on one (decided below)
++    if low_ram and multi and not resident_split() and not low_ram_together(a, model, ram, gpu, chosen):
+         multi, sel, chosen = [], [gpu["index"]], [gpu]
+-    # (the low-RAM mode's variant is decided once the context is known, below; on several GPUs it is the mapped one)
++    # (the low-RAM mode's variant is decided once the context is known, below; on several GPUs it is the mapped one
++    # before RESIDENT_SPLIT_ENGINE, #642)
+     if not low_ram and budget is None and ram < MODELS[model]["ram_gb"] - 4:
+         confirm_paging(model, ram, a.low_ram, a.yes, bool(a.model))
+     ok(f"size: {model}")
+@@ -4019,16 +4031,24 @@ def main() -> int:
+         share = low_ram_gpu_share(model, vram, ctx, kv)
+         rest = arena - low_ram_gpu_gb(model, vram, ctx, kv)
+         resident = a.low_ram == "resident" or (a.low_ram != "mmap" and low_ram_resident(model, ram, vram, ctx, kv))
+-        if multi:      # #364 #384: every chosen card's share (the image encoder on the main one), the mapped variant
++        if multi:      # every chosen card's share (the image encoder on the main one); #364 #384: the mapped variant
+             held = min(arena, low_ram_gpu_gb(model, vram, ctx, kv) +
+                        sum(low_ram_gpu_gb(model, x["vram_gb"], ctx, kv) for x in chosen[1:]))
+-            share, resident = held / arena, False
+-            ok(f"low-RAM mode on {len(chosen)} GPUs: {model}'s experts ({arena:.0f} GB) are read from the model folder "
+-               f"through the OS file cache instead of a copy in RAM ({ram:.0f} GB); the GPUs hold ~{100 * share:.0f}% "
+-               "of them")
+-            if share < 0.6:
+-                warn("most of the experts are read from the SSD while it answers: expect it to be much slower than "
+-                     "with enough RAM (a faster SSD and a smaller size help)")
++            share, rest = held / arena, arena - held
++            # #642: the resident variant on a split, by the same rule as on one card - what no card holds fits the RAM
++            resident = resident_split() and (a.low_ram == "resident" or
++                                             (a.low_ram != "mmap" and ram >= rest + LOW_RAM_HEADROOM_GB))
++            if resident:
++                ok(f"low-RAM mode on {len(chosen)} GPUs: they hold ~{100 * share:.0f}% of {model}'s experts "
++                   f"({arena:.0f} GB) and the other ~{rest:.0f} GB stay in RAM ({ram:.0f} GB), read once from a copy "
++                   "in the model folder")
++            else:
++                ok(f"low-RAM mode on {len(chosen)} GPUs: {model}'s experts ({arena:.0f} GB) are read from the model "
++                   f"folder through the OS file cache instead of a copy in RAM ({ram:.0f} GB); the GPUs hold "
++                   f"~{100 * share:.0f}% of them")
++                if share < 0.6:
++                    warn("most of the experts are read from the SSD while it answers: expect it to be much slower "
++                         "than with enough RAM (a faster SSD and a smaller size help)")
+         elif resident:
+             ok(f"low-RAM mode: the GPU holds ~{100 * share:.0f}% of {model}'s experts ({arena:.0f} GB) and the other "
+                f"~{rest:.0f} GB stay in RAM ({ram:.0f} GB), read once from a copy in the model folder")
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 085c3d8..a882e39 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -209,13 +209,23 @@ using Clock = std::chrono::steady_clock;
+ // reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
+ // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
+ // GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
+-template <class Swap>
+-bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
+-                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
+-                          cudaStream_t stream) {
++//
++// With a layer split, `host_res` holds slot numbers of WHICHEVER cache owns the layer, so the copy back must read the
++// owning card's cache on that card's stream: `locate(layer)` names them (cache, stream, device; -1 = CUDA0).  Reading
++// a later stage's slot number out of CUDA0's cache copied another expert's bytes into RAM - the resident mode with a
++// split then computed some experts from the wrong weights after the first adaptive swaps (garbage output).
++struct SwapHome {
++    strata::core::ExpertCache* cache;
++    cudaStream_t stream;
++    int dev;
++};
++template <class Swap, class Locate>
++bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
++                          int64_t n_expert, std::vector<Swap>& swaps, Locate locate) {
+     if (!src.complement_ready() || swaps.empty()) return true;
+     struct Staged { int32_t layer, in, out; int64_t q; };
+     std::vector<Staged> staged;
++    std::vector<SwapHome> used;
+     std::vector<Swap> kept;
+     kept.reserve(swaps.size());
+     for (const Swap& s : swaps) {
+@@ -224,17 +234,35 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
+         if (q >= src.exchange_capacity()) continue;
+         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
+         if (slot < 0) continue;
+-        if (cudaMemcpyAsync(src.exchange_buffer(q), cache.device_slot(slot),
++        const SwapHome home = locate(s.layer);
++        const strata::core::OnDevice on(home.dev);
++        if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(q), home.cache->device_slot(slot),
+                             (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
+-                            stream) != cudaSuccess)
++                            home.stream); e != cudaSuccess) {
++            std::fprintf(stderr, "strata: copy back of layer %d slot %d (device %d) failed: %s\n", (int) s.layer,
++                         (int) slot, home.dev, cudaGetErrorString(e));
+             return false;
++        }
++        bool seen = false;
++        for (const SwapHome& u : used) seen = seen || u.stream == home.stream;
++        if (!seen) used.push_back(home);
+         staged.push_back({s.layer, s.in, s.out, q});
+         kept.push_back(s);
+     }
+     if (!staged.empty()) {
+-        if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
++        for (const SwapHome& u : used) {
++            const strata::core::OnDevice on(u.dev);
++            if (const cudaError_t e = cudaStreamSynchronize(u.stream); e != cudaSuccess) {
++                std::fprintf(stderr, "strata: copy back sync (device %d) failed: %s\n", u.dev, cudaGetErrorString(e));
++                return false;
++            }
++        }
+         for (const Staged& x : staged)
+-            if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
++            if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) {
++                std::fprintf(stderr, "strata: stage_exchange refused layer %d in %d out %d\n", (int) x.layer,
++                             (int) x.in, (int) x.out);
++                return false;
++            }
+     }
+     swaps.swap(kept);
+     return true;
+@@ -427,6 +455,9 @@ struct Options {
+     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
+     bool vram_elastic = false;
+     int64_t vram_segment_mib = 512;
++    /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
++    /// A card that drives no display needs less than the one the monitors are on.
++    int vram_reserve_later_mib = -1;
+     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
+     int64_t prefill_chunk = 0;
+     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
+@@ -1376,6 +1407,8 @@ int main(int argc, char** argv) {
+         else if (a == "--expert-cache-remote-placement")
+             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
+         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
++        else if (a == "--vram-reserve-later-mib")
++            o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
+         else if (a == "--prefill") {
+             const std::string v = next("--prefill");
+             o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
+@@ -1607,19 +1640,10 @@ int main(int argc, char** argv) {
+     }
+     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
+                                o.expert_cache_remote[2] > 0;
+-    if (o.resident_cpu_experts && !o.layer_split.empty() && !remote_caches && o.resident_soft &&
+-        !o.resident_cpu_explicit && o.resident_budget == 0) {
+-        // #364 #384: setup's --resident-experts with a layer split (--gpus at start, or a config edited by hand) runs
+-        // as the plain mmap mode - the placement those users measured 1.3-1.6x faster than one GPU - instead of
+-        // refusing.  Exactly --mmap-experts: nothing else reads these flags (the headroom only sizes the copy).
+-        std::fprintf(stderr, "strata generate: WARNING: the resident RAM mode (--resident-experts) does not support a "
+-                             "layer split yet: the experts the GPUs do not hold are read through the OS file cache "
+-                             "(--mmap-experts), and RAM may fill up during long prompts\n");
+-        o.resident_cpu_experts = o.resident_pin = o.resident_soft = false;
+-        o.resident_headroom = 8ull << 30;
+-    }
+-    if (o.resident_cpu_experts && (!o.layer_split.empty() || remote_caches)) {
+-        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
++    // A layer split keeps the resident RAM mode: every stage's GPU cache is left out of the RAM copy, and an adaptive
++    // swap copies an evicted expert back from the card that owns its layer (resident_stage_swaps).
++    if (o.resident_cpu_experts && remote_caches) {
++        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support remote expert caches\n");
+         return 2;
+     }
+     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
+@@ -2743,7 +2767,9 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
+                          cudaGetErrorString(e));
+         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
+-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + pf + (later ? kWindowMib : 0) +
++        const int64_t base_reserve =
++            later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
++        const int64_t reserve = (base_reserve + pf + (later ? kWindowMib : 0) +
+                                  (drafter ? kDrafterMib : 0)) << 20;
+         return std::max<int64_t>((int64_t) fb - reserve, 0);
+     };
+@@ -2850,7 +2876,12 @@ int main(int argc, char** argv) {
+         while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
+         return st;
+     };
++    // the whole ranking, hottest first, before each stage takes its own layers' share: the resident RAM copy ranks
++    // the experts no GPU holds over ALL the layers (with CUDA0's share alone, a copy that did not fit kept only layers
++    // 0..K-1's experts and read every later layer's from the files)
++    std::vector<std::pair<int32_t, int32_t>> profile_all;
+     if (multi_gpu) {
++        profile_all = profile;
+         std::vector<std::pair<int32_t, int32_t>> mine;
+         for (const auto& pr : profile) {
+             const int st = stage_of(pr.first);
+@@ -4544,16 +4575,24 @@ int main(int argc, char** argv) {
+             const int64_t k = plan_lend(chunk);
+             if (k > 0) lend_from = xcache.slots() - k;
+         }
+-        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
+-                                                    o.resident_budget, &profile);
++        // a layer split: the experts every later stage's cache holds are left out of the RAM copy, as CUDA0's are
++        // (with them the copy keeps no lend region: pin_cache_complement turns the loan off)
++        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
++        for (auto& st : stages)
++            for (int64_t l = st->lb; l < st->le; ++l)
++                for (int64_t e = 0; e < g.n_expert; ++e)
++                    if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
++        const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
++        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
++                                                    o.resident_headroom, o.resident_budget, &rank_all);
+         std::string whole_err;
+         if (!resident_ok && o.resident_soft) {
+             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
+             // budget path (sized by the RAM alone) instead of none: the misses outside it read the same file bytes
+             // the mmap fallback reads, so the answers are unchanged.  Nothing pinned: the old fallback below.
+             whole_err = err;
+-            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, -1, o.resident_headroom,
+-                                                   strata::core::FileExpertSource::kResidentWhatFits, &profile);
++            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, -1, o.resident_headroom,
++                                                   strata::core::FileExpertSource::kResidentWhatFits, &rank_all);
+             if (resident_ok)
+                 std::fprintf(stderr, "strata generate: WARNING: the whole resident RAM mode does not fit (%s); %.2f "
+                                      "GiB of the experts the GPU does not hold, the hottest by the expert profile, are "
+@@ -5515,7 +5554,16 @@ int main(int argc, char** argv) {
+             }
+             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
++            // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
++            auto home_of = [&](int64_t layer) -> SwapHome {
++                const int stn = multi_gpu ? stage_of(layer) : 0;
++                if (stn > 0) {
++                    GpuStage* gs = stages[(size_t) stn - 1].get();
++                    return {&gs->cache, gs->adapt_stream, gs->dev};
++                }
++                return {&xcache, adapt_stream, -1};
++            };
++            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
+             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
+                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
+                 for (const Swap& s : swaps)
+@@ -7208,8 +7256,11 @@ int main(int argc, char** argv) {
+                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
+                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
+                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+-                const std::string pr = ver.profile_report();
+-                if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
++                for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
++                    const std::string pr = stage_ver(st).profile_report();
++                    if (!pr.empty())
++                        std::fprintf(stderr, "strata decode GPU stages, stage %d (ms/window):%s\n", st, pr.c_str());
++                }
+             }
+             if (!cancelled) {
+                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
+@@ -7933,7 +7984,9 @@ int main(int argc, char** argv) {
+             }
+             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) {
++            // this (non-serve) path refills CUDA0's cache only, so its copies back read CUDA0's cache too
++            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,
++                                      [&](int64_t) -> SwapHome { return {&xcache, adapt_stream, -1}; })) {
+                 std::fprintf(stderr, "strata generate: an adaptive refill failed (copying evicted experts back)\n");
+                 return false;
+             }
+diff --git a/tools/test_setup_risk.py b/tools/test_setup_risk.py
+index 366421d..3e569a9 100644
+--- a/tools/test_setup_risk.py
++++ b/tools/test_setup_risk.py
+@@ -244,6 +244,24 @@ class LowRamGpus(unittest.TestCase):
+         self.assertEqual(cfg["gpu"], 0)
+         self.assertFalse(any("Low-RAM mode" in q for q in asked), asked)
+ 
++    def test_low_ram_on_gpus_with_a_resident_split_engine(self):
++        """#642: an engine that runs the resident variant on a layer split keeps the cards together, resident."""
++        ram, found = PROFILES["32GB-2x24GB"]
++        with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
++            code, out, cfg, asked = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start"],
++                                            answers="")
++            self.assertEqual(code, 0, out)
++            self.assertEqual(cfg["gpu"], [0, 1])
++            self.assertIn("--resident-experts", cfg["args"])
++            self.assertFalse(any("Low-RAM mode" in q for q in asked), asked)
++            self.assertIn("stay in RAM", out)
++            code, out, cfg, _ = install(ram, found, ["--family", "qwen", "--model", "Q2_0", "--no-start",
++                                                     "--gpus", "0,1", "--low-ram", "resident"])
++            self.assertEqual(code, 0, out)
++            self.assertEqual(cfg["gpu"], [0, 1])
++            self.assertIn("--resident-experts", cfg["args"])
++            self.assertNotIn("no layer split yet", out)
++
+ 
+ class StartOnSeveralGpus(unittest.TestCase):
+     """A resident low-RAM config started on several GPUs reads the experts through the file cache (#364 #384)."""
+@@ -280,6 +298,18 @@ class StartOnSeveralGpus(unittest.TestCase):
+         code, out, asked, cfg = self.offer(["--mmap-experts"], None)           # other configs: as before
+         self.assertEqual(cfg["gpu"], [0, 1])
+ 
++    def test_resident_split_engine_keeps_a_resident_config(self):
++        """#642: from RESIDENT_SPLIT_ENGINE a resident config is offered both cards as any other, and stays resident."""
++        with mock.patch.object(setup, "MIN_ENGINE", setup.RESIDENT_SPLIT_ENGINE):
++            cfg = {"args": ["--pack", "p", "--resident-experts", "--kv", "int8"]}
++            self.assertFalse(setup.split_mmap(cfg))
++            self.assertEqual(cfg["args"], ["--pack", "p", "--resident-experts", "--kv", "int8"])
++            code, out, asked, cfg = self.offer(["--resident-experts"], None)   # --yes: the recommendation
++            self.assertIsNone(code, out)
++            self.assertEqual(cfg["gpu"], [0, 1])
++            self.assertEqual(cfg["args"], ["--resident-experts", "--remote-expert-opt"])
++            self.assertNotIn("OS file cache", out)
++
+     def test_start_with_gpus(self):
+         found = PROFILES["32GB-2x24GB"][1]
+         with tempfile.TemporaryDirectory() as d:

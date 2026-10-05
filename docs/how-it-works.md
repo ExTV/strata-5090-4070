@@ -51,7 +51,7 @@ chats restores it instead of re-reading it, but refuses the option with `--layer
 `--prefill-main` the whole state exists on CUDA0 right after any prompt, so the port parks CUDA0's
 session (after syncing the stage's layers into it) and, on restore, copies the stage's layers back
 to CUDA1. Two conversations of 30K and 15K alternating for four rounds: every answer correct,
-switches 0.6-1.2 s. A snapshot is 0.8-1.7 GB per 30K tokens; the budget is 6 GB / 4 slots, which
+switches 0.6-1.2 s. A snapshot is 0.8-1.7 GB per 30K tokens; the budget is 6 GB / 8 slots, which
 holds two long conversations (a phone and a desktop client, say).
 
 ## Why PR #439 is left out
@@ -82,7 +82,7 @@ either. Two things did:
 1. **Prompt chunk size.** Each chunk re-streams the experts of every layer, so an 80K prompt in
    8,192-token chunks streams the ~15 GB working set ten times. `--prefill auto:32768` streams it
    three times: 510 -> 1,451 tok/s and 24 M -> 1.1 M faults on the same afternoon (16384: 1,337).
-2. **`pread` instead of page faults** (`patches/08-pread-expert-blobs.patch`, on with
+2. **`pread` instead of page faults** (`patches/11-pread-expert-blobs.patch`, on with
    `STRATA_BLOB_PREAD=1`). Strata's pool copied each expert's three role slices out of the mmap with
    `memcpy`, after a `madvise(MADV_WILLNEED)` hint. Under memory pressure the kernel throttles or
    drops that readahead, and the copy then takes one major fault per 4 KB page with 64 KB
@@ -105,8 +105,8 @@ types the kernels cover; this GGUF uses exactly those types in all 48 layers. Ag
 build: 80K 1,826 -> 1,969-1,994 tok/s, 16K 1,080 -> 1,212-1,240, the 80K follow-up 6.7 -> 5.8 s, decode
 unchanged. Upstream's own +23% (#519) was measured with every expert resident in 96 GB of RAM.
 
-0.1.38 (released 2026-10-03) merged PR #385 and brought small prompt gains. Six open PRs are applied on
-top, as patches 01-06: #603 matters most here. Strata's fast top-k over the selected attention blocks
+0.1.38 (released 2026-10-03) merged PR #385 and brought small prompt gains. Six open PRs were applied on
+top: #603 matters most here (it is upstream since 0.1.39). Strata's fast top-k over the selected attention blocks
 holds one query's keys in registers and covers 33,792 blocks, about 135K cells, on NVIDIA; a 262,144
 context has 65,536 blocks, so every prompt batch and every decode window on the 5090 took the old
 six-pass kernel. #603 adds a register-layout kernel with no size limit and the same ids. #547 makes the
@@ -135,7 +135,7 @@ set moves this:
 - parking off, to hand its RAM to the page cache: about 2% on fresh prompts, nothing on follow-ups,
   and every conversation switch becomes a full re-read.
 
-## The dual-GPU fork
+## The dual-GPU fork (2026-10-03 to 2026-10-04)
 
 Hardin22's Strata-DualGPU (Strata issue #642) is the same problem on the same class of box: two cards
 and 32 GB of RAM. It lets `--resident-experts` run with `--layer-split`: the RAM copy is the complement
@@ -157,9 +157,9 @@ decode misses are 0.5% and served from RAM.
 
 ## The fork's second day: each card keeps its own layers' weights
 
-Six more fork commits (pinned now) change the memory picture. A split used to load the dense weights of
+Six more fork commits change the memory picture. A split used to load the dense weights of
 all 48 layers on every card; now each card reloads only its own. Under `--prefill-main` that cannot
-apply to the 5090, which reads every layer of a prompt, so patch 07 makes CUDA0 keep all 48 and lets the
+apply to the 5090, which reads every layer of a prompt, so patch 10 makes CUDA0 keep all 48 and lets the
 later cards trim. The 4070 frees 2,419 MiB and holds all 6,144 expert pairs of layers 36-47 (about 5,200
 before), the RAM copy shrinks from 6.56 to 4.83 GiB, and the draft head's room is kept out of the last
 card's cache, which removes the trap above (700 MiB stays anyway: the 4070 has room to spare). The
@@ -172,7 +172,7 @@ this build: the 4070 then misses 360 to 900 of its pairs, 0.4 GiB of RAM is save
 
 On one GPU the resident mode already keeps the lent slots' experts in RAM "as far as RAM allows", so a
 prompt streams them from pinned memory. On a layer split both upstream and the fork turn that off (the
-copy's budget goes to the experts no card holds). Patch 09 adds `STRATA_RESIDENT_LEND=1`: on a split the
+copy's budget goes to the experts no card holds). Patch 12 adds `STRATA_RESIDENT_LEND=1`: on a split the
 lend region is kept too, from the last slot down (a short prompt borrows only the last slots), with what
 RAM is left after the whole complement and the headroom (`STRATA_RESIDENT_HEADROOM_GIB`). The GPU cache
 is untouched, so decode does not change; the cost is RAM only.
@@ -181,7 +181,7 @@ Locking all 9.77 GiB of it (14.59 GiB with the complement) reads an 80K prompt a
 instead of 2,127 and a 16K one at 2,175 instead of 1,282. But it leaves about 1 GB available, and the
 engine's parking admission keeps a 2,560 MiB floor: every park is refused ("skip parking (physical RAM
 admission ...)"), so a switch between two chats costs a re-read (5-8 s for 15K and 30K instead of 0.4 s),
-and so does every side request a chat app sends between turns. The shipped headroom of 10 GiB locks
+and so does every side request a chat app sends between turns. A headroom of 10 GiB (shipped until 2026-10-05, 14 since) locks
 10.01 GiB, which covers the loan of a chunk up to about 17K tokens: 2K, 16K, follow-ups and tool-result
 steps keep the whole gain, an 80K prompt none (its 32K chunks borrow past the covered part), and
 parking works with about 3 GB of conversations before the floor refuses more. The headroom check reads
@@ -198,7 +198,7 @@ run (it borrows slots, streams the experts the chunk routes to that are not in V
 up front. On the same server, the same conversation and real web text, thresholds of 64 / 256 / 512 /
 1024 read 130-160 new tokens in 1.7 / 0.5 / 0.4 / 0.4 s, 400 in 2.1 / 2.1 / 1.0 / 1.0 s, 640-740 in
 2.0-2.6 s against 1.4-1.6 s at 1024, and 884 in 2.85 against 3.4 s. The config uses 768. From 1,024
-tokens a chunk streams every expert the GPU does not hold, which is the step in the curve that patch 09
+tokens a chunk streams every expert the GPU does not hold, which is the step in the curve that patch 12
 flattens. Text built from a small vocabulary routes to few experts and made the batched path look three
 times cheaper; `tools/step_times.py` takes a file of real text for that reason.
 
@@ -212,7 +212,7 @@ earlier results, the prompt differs right after the user's message, and every st
 checkpoint: in one 30-call research turn the log shows `14362 reused` on 19 requests in a row, the
 re-read growing from 24K to 134K tokens and from 15 to 51 s per step.
 
-Patch 10 makes the server undo this. A tool call id is `call_<16 hex>_<n>`, the 16 hex digits naming
+Patch 13 makes the server undo this. A tool call id is `call_<16 hex>_<n>`, the 16 hex digits naming
 the response that issued it. `openai_to_messages` splits an assistant message whose calls carry two or
 more markers into one assistant message per response, each followed by its results. Text sent with the
 calls stays with the first step while the turn is running and becomes a closing assistant message once
@@ -221,3 +221,34 @@ that are not adjacent, or a result of an unknown call leave the message as it wa
 `tools/merged_tool_turn.py` every step then reuses the whole conversation and reads only the new
 result; with `OLD_IDS=1` each step reuses the first 300 tokens. What still costs a full read: a client
 that changes its system prompt between turns (a memory feature that rewrites it does).
+
+## Back on upstream: v0.1.39 with the fork's work as PRs (2026-10-05)
+
+Hardin22 sent the fork's changes upstream as separate PRs: #848 (the RAM copy on a layer split), #859
+(pipelined verify windows), #851 (AVX2 Q8_K quantizer), #863 (CPU IQ kernels), #876 / #905 / #910
+(the asynchronous expert tier, pipelined decode, fork parity) and #904 (verify-window PDL and graph
+branches). This repo now clones upstream Strata at the v0.1.39 tag and applies, in order, those PRs, the
+five still-open PRs from before (#547, #567, #510, #572, #525) and our four patches; each patch is one
+step of the tested branch, conflict resolutions included, so the series rebuilds that tree byte for byte
+(`patches/MANIFEST.sha256`). Two upstream changes mattered: the fork's defaults are opt-in there, so the
+config now passes `--trim-stage-weights --pipeline-windows 2 --adapt-async 1`; and 0.1.39 made the #525
+rescue of a tool call stranded in an unclosed thinking span opt-in, so the config sets
+`"format_fixes": "stranded-call"`. Patch 10 also changed: under `--prefill-main` CUDA0 skips upstream's
+stage trim, and a parked conversation is one CUDA0 image (the stage state is copied back from it).
+
+Against the fork build on the same text and config, decode was about 9% faster and each tool step about
+0.3 s slower. Two settings then won that back:
+
+- `STRATA_SPLIT_SMALL_OWN=3072` (#340): a read of up to 3,072 tokens keeps 986 of the 5090's cache
+  slots instead of borrowing them, so it streams far fewer experts. Tool steps of 1.5K / 2.7K / 5.9K
+  tokens went 3.79 / 4.29 / 5.81 -> 3.35 / 3.60 / 5.02 s and 2K prompts 496 -> 572 tok/s; decode fell
+  from 193 to 176 (the kept slots are not there for decode). 2,048 tied, 4,096 lost decode (167) for
+  nothing. For an agent that spends its time in tool steps this is the better balance.
+- `MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_ARENA_MAX=4`: glibc returns big buffers to the kernel instead
+  of keeping them in per-thread arenas; about 0.7 GB more available RAM, speed unchanged.
+
+The lend headroom went from 10 to 14 GiB and parking from 4 to 6 GB (8 slots): with less RAM locked a
+long conversation always parks, so switching chats or a client's side request never forces a re-read.
+Measured and not adopted: `STRATA_PM_SHARE=1` (decode 78), `STRATA_MTP_KV=f16`,
+`STRATA_PREFILL_LEND_PCT=60` and `STRATA_PREFILL_HELP=1` (neutral; the helper is inactive under
+`--prefill-main`). 4-bit KV was left out on purpose: the KV stays at 8 bits.

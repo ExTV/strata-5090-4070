@@ -1,23 +1,24 @@
 diff --git a/serve/server.py b/serve/server.py
-index 28c2591..0c1a5ef 100644
+index 9e66982..a3e7879 100644
 --- a/serve/server.py
 +++ b/serve/server.py
-@@ -978,18 +978,25 @@ class ByteTokenizer:
-     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
+@@ -1596,20 +1596,26 @@ class ByteTokenizer:
      SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
  
+     ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
 +    max_special_len = max(len(s) for s in SPECIALS)
-+
-     def encode(self, text, parse_special=False):
+ 
+     def encode(self, text, parse_special=False, plain=()):
 -        out, i = [], 0
-+        return self.encode_marked(text, parse_special)[0]
++        return self.encode_marked(text, parse_special, plain)[0]
 +
-+    def encode_marked(self, text, parse_special=False):
++    def encode_marked(self, text, parse_special=False, plain=()):
 +        """encode() and its resume points (after each special), as strata_tokenizer's for PromptEncoder."""
 +        out, marks, i = [], [], 0
          while i < len(text):
              for k, s in enumerate(self.SPECIALS):
-                 if parse_special and text.startswith(s, i):
+                 if (parse_special or s in self.ALWAYS) and text.startswith(s, i) and not any(
+                         a <= i < b for a, b in plain):
                      out.append(256 + k)
                      i += len(s)
 +                    marks.append((i, len(out)))
@@ -30,7 +31,7 @@ index 28c2591..0c1a5ef 100644
  
      def decode(self, ids, errors="replace"):
          raw = bytearray()
-@@ -1077,6 +1084,17 @@ class Service:
+@@ -1708,6 +1714,18 @@ class Service:
          self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
          self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                              tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -41,36 +42,28 @@ index 28c2591..0c1a5ef 100644
 +            from strata_tokenizer import PromptEncoder
 +            self.prompts = PromptEncoder(tokenizer)
 +
-+    def encode_prompt(self, prompt: str) -> list[int]:
++    def encode_text(self, prompt: str) -> list[int]:
++        """A rendered prompt tokenized, reusing a recent prompt's ids where it can (PromptEncoder)."""
 +        if self.prompts is None:
 +            return self.tok.encode(prompt, parse_special=True)
 +        return self.prompts.encode(prompt)
  
      def loaded(self) -> bool:
          return not hasattr(self.engine, "alive") or self.engine.alive()
-@@ -1423,7 +1441,7 @@ class Service:
-         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-         the rest of the context."""
-         prompt = self.template.render(messages, tools=tools, **kwargs)
--        ids = self.tok.encode(prompt, parse_special=True)
-+        ids = self.encode_prompt(prompt)
-         self.embeddings.path = None
-         images = images_of(messages)
-         if images:
-@@ -2557,7 +2575,7 @@ def make_handler(svc: Service):
-             req = svc.with_shared(req, "anthropic")
-             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-             prompt = svc.template.render(messages, tools=tools, **kw)
--            self._json(200, {"input_tokens": len(svc.tok.encode(prompt, parse_special=True))})
-+            self._json(200, {"input_tokens": len(svc.encode_prompt(prompt))})
+@@ -2138,7 +2156,7 @@ class Service:
+         marked, marked_tools, changed = mark_think_literals(messages, tools)
+         prompt = self.render_prompt(marked, marked_tools, kwargs)
+         if not changed:
+-            return self.tok.encode(prompt, parse_special=True)
++            return self.encode_text(prompt)
+         prompt, plain = unmark_think_literals(prompt)
+         return self.tok.encode(prompt, parse_special=True, plain=plain)
  
-         def _anthropic(self, req):
-             svc.load()
 diff --git a/serve/test_server.py b/serve/test_server.py
-index 1f7ae17..9d6aea1 100644
+index 0ffe2f6..c5ed53f 100644
 --- a/serve/test_server.py
 +++ b/serve/test_server.py
-@@ -655,6 +655,59 @@ class RecordingPrompt(MockEngine):
+@@ -838,6 +838,59 @@ class RecordingPrompt(MockEngine):
          yield from super().generate(ids, max_new, sampling, cancel, embeddings)
  
  
@@ -117,21 +110,21 @@ index 1f7ae17..9d6aea1 100644
 +            for seed in range(3):
 +                for what, prompt in conversation_prompts(self.svc.template, random.Random(seed)):
 +                    with self.subTest(tokenizer=name, seed=seed, what=what):
-+                        self.assertEqual(svc.encode_prompt(prompt), tok.encode(prompt, parse_special=True))
++                        self.assertEqual(svc.encode_text(prompt), tok.encode(prompt, parse_special=True))
 +
 +    def test_a_tokenizer_without_resume_points_encodes_in_full(self):
 +        class Plain:
 +            encode = ByteTokenizer().encode
 +        svc = Service(self.engine, Plain(), self.svc.template)
 +        self.assertIsNone(svc.prompts)
-+        self.assertEqual(svc.encode_prompt("<|im_start|>hi"), ByteTokenizer().encode("<|im_start|>hi", True))
++        self.assertEqual(svc.encode_text("<|im_start|>hi"), ByteTokenizer().encode("<|im_start|>hi", True))
 +
 +
  class DyingEngine(MockEngine):
      """Issue #27: an engine that dies after a few tokens of its first answer, and comes back when restarted."""
  
 diff --git a/tools/strata_tokenizer.py b/tools/strata_tokenizer.py
-index c14492c..eedc297 100644
+index 8b79419..80c41e4 100644
 --- a/tools/strata_tokenizer.py
 +++ b/tools/strata_tokenizer.py
 @@ -15,9 +15,11 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
@@ -155,24 +148,25 @@ index c14492c..eedc297 100644
  
      @staticmethod
      def _alt(literals: list[str]):
-@@ -213,12 +217,15 @@ class Tokenizer:
+@@ -213,13 +217,16 @@ class Tokenizer:
                  out.append(i)
          return out
  
--    def _encode_matching(self, text: str, pat) -> list[int]:
-+    def _encode_matching(self, text: str, pat, marks: list | None = None) -> list[int]:
+-    def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
++    def _encode_matching(self, text: str, pat, plain=(), marks: list | None = None) -> list[int]:
          """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
  
          The split happens on the RAW text, before the byte mapping, because a special token's string is a
          literal to match rather than bytes to decompose.  Everything between the matches is tokenized
-         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.
+         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.  A match that starts
+         inside one of the `plain` (start, end) spans is left to the text around it (#537).
 +
 +        `marks`, when given, receives (end of the match in `text`, ids so far) for every match: the points where
 +        the encoding of a longer text with the same beginning can resume (PromptEncoder).
          """
          if pat is None:
              return self._encode_plain(text)
-@@ -229,6 +236,8 @@ class Tokenizer:
+@@ -232,6 +239,8 @@ class Tokenizer:
                  out.extend(self._encode_plain(text[pos:m.start()]))
              out.append(self.special_tokens[m.group(0)])
              pos = m.end()
@@ -181,19 +175,20 @@ index c14492c..eedc297 100644
          if pos < len(text):
              out.extend(self._encode_plain(text[pos:]))
          return out
-@@ -241,6 +250,11 @@ class Tokenizer:
+@@ -246,6 +255,12 @@ class Tokenizer:
          """
-         return self._encode_matching(text, self._special_re if parse_special else self._always_re)
+         return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
  
 +    def encode_marked(self, text: str, parse_special: bool = False) -> tuple[list[int], list[tuple[int, int]]]:
 +        """encode() and its resume points: (end offset in `text`, ids so far) after every special-token match."""
 +        marks: list[tuple[int, int]] = []
-+        return self._encode_matching(text, self._special_re if parse_special else self._always_re, marks), marks
++        return self._encode_matching(text, self._special_re if parse_special else self._always_re,
++                                    marks=marks), marks
 +
      def token_bytes(self, i: int) -> bytes:
          """The raw bytes of one token (a multi-byte character can be split across tokens)."""
          cache = self.__dict__.setdefault("_bytes_cache", {})
-@@ -261,6 +275,79 @@ class Tokenizer:
+@@ -266,6 +281,79 @@ class Tokenizer:
          return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
  
  

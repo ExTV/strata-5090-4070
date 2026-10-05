@@ -1,17 +1,9 @@
 diff --git a/serve/frontend.py b/serve/frontend.py
-index 89ba71b..204c5b6 100644
+index f198ed6..bd61d62 100644
 --- a/serve/frontend.py
 +++ b/serve/frontend.py
-@@ -16,6 +16,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
- from __future__ import annotations
- 
- import json
-+import re
- import uuid
- from dataclasses import dataclass, field
- from pathlib import Path
-@@ -160,10 +161,61 @@ def _object_list(value, name: str) -> list[dict]:
-     return value
+@@ -257,10 +257,61 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
+     return tools
  
  
 +# A tool call id names the response that issued it (OutputParser.new_id): "call_<16 hex>_<n>".
@@ -73,10 +65,10 @@ index 89ba71b..204c5b6 100644
          role = m.get("role")
          if role == "developer":
              role = "system"
-@@ -389,8 +441,15 @@ class OutputParser:
-         # _rescue_unclosed_call).  Cleared the moment the span closes: a call inside a CLOSED span was a
-         # mention, however valid, and must never be acted on.
-         self.reasoning_tail: str | None = None
+@@ -504,8 +555,15 @@ class OutputParser:
+         # the reply's "adaptations"), and the name of a detected shape no enabled fix covers
+         self.adaptations: list[str] = []
+         self.format_hint: str | None = None
 +        # this response's mark in its tool call ids: a client that later sends the calls of several responses in
 +        # one assistant message can be read back in the order they were written (_split_tool_steps)
 +        self.step, self.ncalls = uuid.uuid4().hex[:16], 0
@@ -89,7 +81,7 @@ index 89ba71b..204c5b6 100644
      def _reset_scan(self):
          self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
          self.ss = "name"             # name -> between -> str|raw -> ... -> done
-@@ -414,7 +473,7 @@ class OutputParser:
+@@ -529,7 +587,7 @@ class OutputParser:
                  if b < 0:
                      return out
                  name = rest[a + 10:b]
@@ -98,15 +90,16 @@ index 89ba71b..204c5b6 100644
                  props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                  self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
                  out.append(Event("tool_start", call=self.scall))
-@@ -555,6 +614,7 @@ class OutputParser:
-                 call = parse_tool_call(body, self.schemas.get(name))
-             except ValueError:
-                 return []                  # not a well-formed act; leave every block as reasoning
+@@ -685,6 +743,8 @@ class OutputParser:
+             self.format_hint = "stranded-call"   # detected but not enabled: the serve says so, changes nothing
+             return []
+         self.adaptations.append("stranded-call")
++        for call in calls:
 +            call.id = self.new_id()
-             calls.append(call)
          return [Event("tool_call", call=call) for call in calls]
  
-@@ -596,6 +656,15 @@ class OutputParser:
+     def feed(self, delta: str) -> list[Event]:
+@@ -725,6 +785,15 @@ class OutputParser:
                          out.append(Event("content", self.buf[:j]))
                          self.buf = self.buf[j:]
                      return out
@@ -122,7 +115,7 @@ index 89ba71b..204c5b6 100644
                  if i and self.buf[:i].strip():
                      out.append(Event("content", self.buf[:i].rstrip("\n")))
                  self.buf = self.buf[i + len(CALL_START):]
-@@ -616,8 +685,7 @@ class OutputParser:
+@@ -745,8 +814,7 @@ class OutputParser:
                  self.buf = self.buf[i + len(CALL_END):]
                  name = body.strip()[len("<function="):].split(">", 1)[0]
                  call = parse_tool_call(body, self.schemas.get(name))

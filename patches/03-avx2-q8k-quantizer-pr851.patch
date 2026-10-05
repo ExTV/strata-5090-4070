@@ -1,0 +1,291 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0121bb0..a85fd9e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1034,6 +1034,13 @@ if(STRATA_NATIVE_EXPERTS)
+     add_test(NAME router_dot_parity COMMAND router_dot_parity)
+     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
+   endif()
++  # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
++  add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
++  target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
++  if(STRATA_BUILD_TESTS)
++    add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
++    add_test(NAME q8k_quant_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:q8k_quant_parity>)
++  endif()
+   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
+   if(STRATA_ORCA_Q4KS_MMQ)
+diff --git a/include/strata/kernels/cpu/iq_avx2.hpp b/include/strata/kernels/cpu/iq_avx2.hpp
+index a9628d3..c933980 100644
+--- a/include/strata/kernels/cpu/iq_avx2.hpp
++++ b/include/strata/kernels/cpu/iq_avx2.hpp
+@@ -18,6 +18,9 @@ void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
+ void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                 float* const* out, int r0, int r1);
+ 
++/// ggml's quantize_row_q8_K (x86 runs the scalar reference), byte-identical, in AVX-2: n values -> n/256 block_q8_K.
++void q8k_quant_avx2(const float* x, void* y, int64_t n);
++
+ /// out[t][r] = w_r . h[t] for IQ4_NL (type 20) rows against Q8_0 activations (ggml's block_q8_0).
+ /// IQ4_NL is a 32-value-block format, so this does not go through iq256_rows (QK_K blocks, Q8_K acts).
+ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
+diff --git a/src/kernels/cpu/iq_avx2.cpp b/src/kernels/cpu/iq_avx2.cpp
+index bb8849b..d2607d7 100644
+--- a/src/kernels/cpu/iq_avx2.cpp
++++ b/src/kernels/cpu/iq_avx2.cpp
+@@ -407,6 +407,75 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void*
+ 
+ }  // namespace
+ 
++// ggml's quantize_row_q8_K_ref (ggml-quants.c), which is also what ggml-cpu runs on x86 (no SIMD version there),
++// in AVX-2: the same per-value arithmetic - one IEEE multiply by the same iscale, the same 1.5*2^23 rounding add,
++// the same clamp - so the bytes are identical (q8k_quant_parity checks it).  The block's sign-carrying max is the
++// FIRST value of the largest magnitude, as in the scalar loop; NaNs are skipped as there (`ax > amax` is false for
++// them, and max_ps returns its second operand for a NaN first one).  A zero block leaves bsums as the reference
++// does.  A verify window quantizes up to 6 tokens per layer on the host before the pool can start.
++void q8k_quant_avx2(const float* x, void* vy, int64_t k) {
++    block_q8_K* y = (block_q8_K*) vy;
++    const int64_t nb = k / QK_K;
++    const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
++    const __m256 magic = _mm256_set1_ps(12582912.f);
++    const __m256i mant = _mm256_set1_epi32(0x007fffff), off = _mm256_set1_epi32(0x00400000);
++    const __m256i c127 = _mm256_set1_epi32(127);
++    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
++    for (int64_t i = 0; i < nb; ++i, x += QK_K) {
++        __m256 m = _mm256_setzero_ps();
++        for (int j = 0; j < QK_K; j += 8) m = _mm256_max_ps(_mm256_and_ps(_mm256_loadu_ps(x + j), absm), m);
++        __m128 h = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
++        h = _mm_max_ps(h, _mm_movehl_ps(h, h));
++        h = _mm_max_ss(h, _mm_movehdup_ps(h));
++        const float amax = _mm_cvtss_f32(h);
++        if (!amax) {
++            y[i].d = 0;
++            std::memset(y[i].qs, 0, QK_K);
++            continue;
++        }
++        float mx = 0.f;
++        const __m256 va = _mm256_set1_ps(amax);
++        for (int j = 0; j < QK_K; j += 8) {
++            const int msk = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_and_ps(_mm256_loadu_ps(x + j), absm), va, _CMP_EQ_OQ));
++            if (msk) {
++                int b = 0;
++                while (!((msk >> b) & 1)) ++b;
++                mx = x[j + b];
++                break;
++            }
++        }
++        const float iscale = -127.f / mx;
++        const __m256 vis = _mm256_set1_ps(iscale);
++        for (int j = 0; j < QK_K; j += 32) {
++            __m256i v[4];
++            for (int q = 0; q < 4; ++q) {
++                __m256 p = _mm256_mul_ps(vis, _mm256_loadu_ps(x + j + 8 * q));
++#if defined(__GNUC__) && !defined(__clang__)
++                // GCC fuses a multiply and an add into an FMA by default (-ffp-contract=fast); the reference rounds
++                // the product before the add, so the product must stay a separate value
++                __asm__("" : "+x"(p));
++#endif
++                const __m256 t = _mm256_add_ps(p, magic);
++                v[q] = _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(t), mant), off), c127);
++                // the reference stores MIN(127, v) into an int8 (keeps the low byte), and its bsums add those bytes:
++                // the same here, so even a degenerate block (iscale overflowing to inf) gives the same bytes
++                v[q] = _mm256_srai_epi32(_mm256_slli_epi32(v[q], 24), 24);
++            }
++            for (int q = 0; q < 2; ++q) {   // two 16-value sums
++                const __m256i s = _mm256_add_epi32(v[2 * q], v[2 * q + 1]);
++                __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
++                s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
++                s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0xB1));
++                y[i].bsums[j / 16 + q] = (int16_t) _mm_cvtsi128_si32(s4);
++            }
++            const __m256i p16a = _mm256_packs_epi32(v[0], v[1]), p16b = _mm256_packs_epi32(v[2], v[3]);
++            const __m256i p8 = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(p16a, p16b), perm);
++            _mm256_storeu_si256((__m256i*) (y[i].qs + j), p8);
++        }
++        y[i].d = 1 / iscale;
++    }
++}
++
+ bool iq256_supported(int type) noexcept {
+     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
+ }
+diff --git a/src/kernels/cpu/native_expert.cpp b/src/kernels/cpu/native_expert.cpp
+index 0dc5d3a..3e8f2b7 100644
+--- a/src/kernels/cpu/native_expert.cpp
++++ b/src/kernels/cpu/native_expert.cpp
+@@ -68,11 +68,24 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
+     return true;
+ }
+ 
++namespace {
++// Q8_K (the activations of every i-quant row): ggml-cpu's x86 quantizer is the scalar reference, ~3 us per token
++// and layer on the host before the pool can start; q8k_quant_avx2 writes the same bytes.  cpu_avx2_ok() too:
++// iq_avx2.cpp is compiled for AVX2 (an AVX-only CPU, or STRATA_FORCE_ISA=avx, keeps ggml's).  STRATA_NO_Q8K_AVX2=1:
++// ggml's on any CPU.
++bool q8k_avx2(int type) {
++    static const bool on = cpu_avx2_ok() && std::getenv("STRATA_NO_Q8K_AVX2") == nullptr;
++    return on && type == (int) GGML_TYPE_Q8_K;
++}
++}  // namespace
++
+ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
++    if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
+     traits(f.gu_act)->from_float(x, dst, f.n_embd);
+ }
+ 
+ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
++    if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
+     traits(f.d_act)->from_float(h, dst, f.n_ff);
+ }
+ 
+diff --git a/src/kernels/cpu/q8k_quant_parity.cpp b/src/kernels/cpu/q8k_quant_parity.cpp
+new file mode 100644
+index 0000000..535b188
+--- /dev/null
++++ b/src/kernels/cpu/q8k_quant_parity.cpp
+@@ -0,0 +1,144 @@
++// src/kernels/cpu/q8k_quant_parity.cpp - the AVX-2 Q8_K activation quantizer (q8k_quant_avx2, iq_avx2.cpp) against
++// ggml's, byte for byte: the reference (ggml-base's from_float_ref) and what ggml-cpu runs (its from_float), over
++// rows of random, scaled, sparse and degenerate values; then the same through native_quant_act / native_quant_h with
++// an IQ3_S expert's format, which is what the engine calls.  No GPU, no model.
++//
++//     q8k_quant_parity            (STRATA_FORCE_ISA=avx: the AVX-2 copy is skipped, native_quant_* must equal ggml's)
++//     q8k_quant_parity --bench    ns per 2560-value row, ggml-cpu's and the AVX-2 copy
++#include "strata/kernels/cpu/expert_layout.hpp"
++#include "strata/kernels/cpu/iq_avx2.hpp"
++#include "strata/kernels/cpu/native_expert.hpp"
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <random>
++#include <string>
++#include <vector>
++
++namespace cpu = strata::kernels::cpu;
++
++// ggml-quants.h (ggml-base): the scalar reference, which ggml-cpu's x86 quantize_row_q8_K calls.  Q8_K has no
++// from_float_ref in ggml's type traits, so it is declared here (block_q8_K* in ggml; the bytes are all this reads).
++extern "C" void quantize_row_q8_K_ref(const float* x, void* y, int64_t k);
++
++namespace {
++
++constexpr int kQK = 256;
++
++std::vector<std::vector<float>> cases(int n) {
++    std::mt19937 rng(11);
++    std::normal_distribution<float> nd(0.f, 1.f);
++    std::uniform_real_distribution<float> ud(-100.f, 100.f);
++    std::vector<std::vector<float>> c;
++    auto add = [&](auto fill) {
++        std::vector<float> x((size_t) n);
++        for (int j = 0; j < n; ++j) x[(size_t) j] = fill(j);
++        c.push_back(std::move(x));
++    };
++    add([&](int) { return nd(rng); });
++    add([&](int) { return nd(rng) * 1e-3f; });
++    add([&](int) { return nd(rng) * 1e4f; });
++    add([&](int) { return ud(rng); });
++    add([&](int) { return 0.f; });                                         // every block zero
++    add([&](int j) { return (j / kQK) % 2 ? nd(rng) : 0.f; });             // zero blocks between random ones
++    add([&](int j) { return j % kQK == 77 ? nd(rng) : 0.f; });             // one value per block
++    add([&](int j) {                                                       // the largest magnitude twice, the
++        const int k = j % kQK;                                             // FIRST one's sign wins
++        return k == 3 ? -5.f : k == 100 ? 5.f : nd(rng);
++    });
++    add([&](int j) {
++        const int k = j % kQK;
++        return k == 3 ? 5.f : k == 100 ? -5.f : nd(rng);
++    });
++    add([&](int j) { return j % kQK == 9 ? 3e38f : nd(rng); });            // extremes beside ordinary values
++    add([&](int j) { return j % kQK == 9 ? -3e38f : nd(rng) * 1e30f; });
++    add([&](int) { return nd(rng) * 1e-40f; });                            // denormals
++    add([&](int j) { return (float) ((j % 255) - 127) / 127.f; });         // the grid itself, and its ties
++    add([&](int j) { return ((float) ((j * 37) % 509) - 254.f) / 508.f; });
++    add([&](int j) { return j % kQK == 5 ? std::numeric_limits<float>::quiet_NaN() : nd(rng); });
++    add([&](int j) { return j % kQK == 5 ? std::numeric_limits<float>::infinity() : nd(rng); });
++    return c;
++}
++
++// both outputs prefilled alike: a zero block leaves bsums unwritten in the reference, and so must the copy
++bool same(const char* tag, int n, int ci, ggml_from_float_t a, void (*b)(const float*, void*, int64_t),
++          const std::vector<float>& x, size_t bytes) {
++    std::vector<uint8_t> ya(bytes, 0xAB), yb(bytes, 0xAB);
++    a(x.data(), ya.data(), n);
++    b(x.data(), yb.data(), n);
++    if (std::memcmp(ya.data(), yb.data(), bytes) == 0) return true;
++    size_t at = 0;
++    while (ya[at] == yb[at]) ++at;
++    std::printf("  %s n=%d case %d: MISMATCH at byte %zu of %zu\n", tag, n, ci, at, bytes);
++    return false;
++}
++
++const cpu::NativeFmt* g_fmt = nullptr;
++void via_act(const float* x, void* y, int64_t) { cpu::native_quant_act(*g_fmt, x, y); }
++void via_h(const float* x, void* y, int64_t) { cpu::native_quant_h(*g_fmt, x, y); }
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
++    ggml_cpu_init();
++    const ggml_from_float_t ref = quantize_row_q8_K_ref;
++    const ggml_from_float_t gcpu = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float;
++    const bool avx2 = cpu::cpu_avx2_ok();
++    int failures = 0, checked = 0;
++    for (const int n : {256, 512, 2560, 6144}) {
++        const size_t bytes = ggml_row_size(GGML_TYPE_Q8_K, n);
++        const auto cs = cases(n);
++        for (int ci = 0; ci < (int) cs.size(); ++ci) {
++            failures += !same("ggml-cpu vs reference", n, ci, ref, gcpu, cs[(size_t) ci], bytes);
++            if (avx2) failures += !same("AVX-2 vs reference", n, ci, ref, cpu::q8k_quant_avx2, cs[(size_t) ci], bytes);
++            ++checked;
++        }
++    }
++    // the engine's entry points: an IQ3_S expert (type 21) quantizes both of its activations to Q8_K
++    cpu::NativeFmt f;
++    std::string err;
++    if (!cpu::native_fmt(21, 21, 2560, 512, f, err)) {
++        std::printf("native_fmt: %s\n", err.c_str());
++        return 1;
++    }
++    g_fmt = &f;
++    for (const auto& x : cases(2560))
++        failures += !same("native_quant_act", 2560, 0, ref, via_act, x, ggml_row_size(GGML_TYPE_Q8_K, 2560));
++    for (const auto& x : cases(512))
++        failures += !same("native_quant_h", 512, 0, ref, via_h, x, ggml_row_size(GGML_TYPE_Q8_K, 512));
++    std::printf("q8k_quant_parity: %d rows x 4 sizes, AVX-2 copy %s: %s\n", checked / 4,
++                avx2 ? "checked" : "skipped (no AVX2, or STRATA_FORCE_ISA)", failures ? "FAILED" : "identical");
++    if (bench && avx2) {
++        std::mt19937 rng(3);
++        std::normal_distribution<float> nd(0.f, 1.f);
++        const int n = 2560, rows = 4096;
++        std::vector<float> x((size_t) n * rows);
++        for (auto& v : x) v = nd(rng);
++        const size_t bytes = ggml_row_size(GGML_TYPE_Q8_K, n);
++        std::vector<uint8_t> y(bytes * rows);
++        auto time = [&](const char* tag, auto fn) {
++            double best = 1e30;
++            for (int rep = 0; rep < 5; ++rep) {
++                const auto t0 = std::chrono::steady_clock::now();
++                for (int r = 0; r < rows; ++r) fn(x.data() + (size_t) r * n, y.data() + bytes * r, n);
++                const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
++                best = std::min(best, ns / rows);
++            }
++            std::printf("  %-10s %7.0f ns per %d-value row\n", tag, best, n);
++            return best;
++        };
++        const double a = time("ggml-cpu", gcpu);
++        const double b = time("AVX-2", cpu::q8k_quant_avx2);
++        std::printf("  %.1fx\n", a / b);
++    }
++    return failures ? 1 : 0;
++}

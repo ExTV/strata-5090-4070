@@ -1,11 +1,11 @@
-name: patches apply to the pinned Strata-DualGPU commit
+name: patches apply to Strata v0.1.39
 on: [push, pull_request]
 jobs:
   dry-run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: git clone https://github.com/Hardin22/Strata-DualGPU.git strata && git -C strata checkout --quiet 03a5ec955ba152a5f499a18a0f2f2ac192309c28
+      - run: git clone https://github.com/Niko1221/Strata.git strata && git -C strata checkout --quiet 6f32ec070f23ced9f50e704d854d775da52591ab
       - name: apply every patch in order, then check the manifest
         run: |
           cd strata

@@ -1,0 +1,16 @@
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 1a7ca8d..b8e5dab 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -1462,7 +1462,10 @@ bool FileExpertSource::pin_cache_complement(
+         lend_from_slot = -1;
+     }
+ 
+-    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
++    // STRATA_RESIDENT_LEND=1 (opt-in, a layer split): the lend region is kept in RAM on a split too, with what the
++    // RAM has left after the complement.  Without it a prompt re-reads the lent experts from the model files.
++    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots &&
++                      (additional_gpu_pairs.empty() || std::getenv("STRATA_RESIDENT_LEND") != nullptr);
+     uint64_t budget = std::numeric_limits<uint64_t>::max();
+     if (bytes > 0 || lend) {
+         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own

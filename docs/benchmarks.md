@@ -1,9 +1,9 @@
 # Benchmarks
 
-All on 2026-10-02 to 2026-10-04, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
+All on 2026-10-02 to 2026-10-05, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
 IQ3_XXS, 262,144 context, layer split 36, int8 KV with 32,768 resident cells, vision on. The Strata base
 moves through the sections: 0.1.33, 0.1.37, 0.1.38 with six PRs, the Strata-DualGPU fork, then the fork's later commits with the
-lend region in RAM (the shipped config).
+lend region in RAM, then upstream 0.1.39 with the fork's work as PRs (the shipped config, last section).
 `tools/bench.py`: five 600-token greedy answers with thinking off (decode median), fresh prompts of
 ~2K (twice), ~16K and ~80K tokens of random words (prefill tok/s), then a 2K follow-up on the 80K
 conversation; `tools/decode_after.py`: five more answers right after the 80K prompt. "faults" is
@@ -59,7 +59,7 @@ synchronous faults; the bytes read barely change (the readahead hint brings whol
 either way), the faults do. The two earlier 16384 boots (`v4-pf16k`, 1,159 tok/s at 1.0 M faults)
 agree. The decode medians are temperature-0 numbers and within the usual boot-to-boot band.
 
-## `pread` expert copies (patch 03), chunk 32768, back to back
+## `pread` expert copies (now patch 11), chunk 32768, back to back
 
 | | decode median | 2K | 16K | 80K | follow-up | decode after 80K | faults | swap-in | NVMe read |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -169,7 +169,7 @@ pipeline's GDN snapshot and second verifiers took the last 500 MiB); the 4070 at
 ## The fork's later commits: per-card weights (2026-10-04)
 
 Fork head of 2026-10-03 21:38 UTC with the same PRs and patches; the 5090 keeps all 48 layers' dense
-weights for `--prefill-main` (patch 07), the 4070 its own 12. Same config otherwise.
+weights for `--prefill-main` (now patch 10), the 4070 its own 12. Same config otherwise.
 
 | | 4070 holds | experts in RAM | decode median | 2K | 16K | 80K | follow-up | decode after 80K |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -181,7 +181,7 @@ weights for `--prefill-main` (patch 07), the 4070 its own 12. Same config otherw
 RAM 20.2 GB used, 11.6 available (23.4 / 8.3 before); VRAM 32,007 / 14,941 MiB. Needle 5/5 and
 parking 6/6 on every row.
 
-## The lend region in locked RAM (patch 09, 2026-10-04, same build, one session)
+## The lend region in locked RAM (now patch 12, 2026-10-04, same build, one session)
 
 `step` columns: `tools/step_times.py` on real web text, a 12.7K-token first message, then three reads
 each of 1.3K, 3.1K and 5.6K tokens (medians).
@@ -192,7 +192,7 @@ each of 1.3K, 3.1K and 5.6K tokens (medians).
 | headroom 4 (all of it), parking 2 GB | 14.59 | 174 / 178 | 566 / 590 | 2,175 | 3,089 | 3.6 s | 5.4 s | 3.32 / 3.47 / 4.18 s | 0.85 GB |
 | the same, parking 4 GB, a 112K chat sent first | 14.59 | 173 / 173 | 598 / 577 | 2,177 | 3,173 | 3.6 s | 5.5 s | 3.50 / 3.78 / 4.46 s | 1.1 GB |
 | headroom 7, parking 4 GB | 13.02 | 176 / 169 | 585 / 588 | 2,212 | 2,491 | 3.6 s | 5.6 s | 3.37 / 4.06 / 4.77 s | 2.1 GB |
-| **headroom 10, parking 4 GB, a 112K chat parked first (shipped)** | 10.01 | 179 / 171 | 563 / 578 | 2,165 | 2,130 | 3.7 s | 5.6 s | 3.33 / 3.56 / 4.16 s | 2.3 GB |
+| **headroom 10, parking 4 GB, a 112K chat parked first (shipped until 2026-10-05)** | 10.01 | 179 / 171 | 563 / 578 | 2,165 | 2,130 | 3.7 s | 5.6 s | 3.33 / 3.56 / 4.16 s | 2.3 GB |
 
 Parking check (two conversations of 30K and 15K alternating): 0.4-0.5 s per switch on the control and
 the shipped row; with everything locked every park was refused by the RAM admission floor and the
@@ -222,18 +222,67 @@ A message part counts a few tokens more than the new text (the turn's header), s
 threshold can fall on either side. Shipped: 768. This was measured before patch 09; with it the
 batched path's fixed cost is lower and the break-even may sit lower too (not re-measured).
 
-## A client that merges a turn's tool calls (patch 10, 2026-10-04)
+## A client that merges a turn's tool calls (now patch 13, 2026-10-04)
 
 `tools/merged_tool_turn.py`, four tool steps of about 3K tokens each, tokens reused of the prompt:
 
 | | step 2 | step 3 | step 4 | the next user turn |
 | --- | --- | --- | --- | --- |
 | ids without a response marker (`OLD_IDS=1`) | 300 of 6,472 | 300 of 9,474 | 300 of 12,641 | |
-| patch 10 | 3,396 of 6,484 | 6,510 of 9,498 | 9,524 of 12,677 | 12,670 of 12,750 |
+| patch 13 | 3,396 of 6,484 | 6,510 of 9,498 | 9,524 of 12,677 | 12,670 of 12,750 |
 
 In real use before the patch, one 30-call turn re-read 24K to 134K tokens on each of 19 requests
 (15-51 s per step); after it, 33 requests over three conversations each reused the whole live
 session. The server suite passes with the patch (180 tests, 10 of them new).
+
+## Upstream 0.1.39 with Hardin22's PRs (2026-10-05, the shipped config)
+
+v0.1.39 plus #848 #859 #851 #863 #876 #904 #905 #910 (the fork's work, sent upstream), the five open PRs
+and our patches 10-13; the config adds `--trim-stage-weights --pipeline-windows 2 --adapt-async 1`
+(fork defaults, opt-in upstream), the PLE prefetch flags, `"format_fixes": "stranded-call"`, headroom 14
+and parking 6 GB / 8 slots. Measured with the abliterated build of the same GGUF
+(`Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS`, same quant format and tensor types as the ISTA file).
+`tools/bench.py` plus `tools/step_times.py` on real text (steps of 1.5K / 2.7K / 5.9K tokens), each
+row pooled over repeated boots:
+
+| | decode median | 2K | 16K | 80K | steps 1.5K / 2.7K / 5.9K |
+| --- | --- | --- | --- | --- | --- |
+| base + malloc env | **193.5** | 496 | 1,350 | 2,168 | 3.79 / 4.29 / 5.81 s |
+| **`STRATA_SPLIT_SMALL_OWN=3072` + malloc env (shipped)** | 176 | **572** | **1,434** | **2,256** | **3.35 / 3.60 / 5.02 s** |
+| `STRATA_SPLIT_SMALL_OWN=2048` | ties 3072 | | | | |
+| `STRATA_SPLIT_SMALL_OWN=4096` | 167 | | | | no gain over 3072 |
+| `STRATA_PM_SHARE=1` | 78 | | | | |
+| `STRATA_MTP_KV=f16`, `STRATA_PREFILL_LEND_PCT=60`, `STRATA_PREFILL_HELP=1` | neutral | | | | neutral |
+
+The malloc env (`MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_ARENA_MAX=4`) gives about 0.7 GB more available
+RAM and is speed-neutral. `--kv q4_0` was not run: the KV stays at 8 bits.
+
+Correctness on the shipped config: the 40K needle with four follow-ups and the 20K extension all right,
+parking 8/8 (restores 0.4-0.5 s), the merged tool turn reuses the live session on every step, no park
+refused during the run.
+
+### Depth table
+
+`tools/depth_bench.py`: at each depth a fresh prompt of real text (Strata's own docs and source, sized
+with the server's token counter, a unique first line so nothing comes from cache), then a 256-token
+answer, streamed, greedy, thinking off. Prefill = prompt tokens / time to first token, decode = answer
+tokens / the rest.
+
+| depth | prefill | decode |
+| --- | --- | --- |
+| 2K | 579 tok/s | 154 tok/s |
+| 32K | 1,742 tok/s | 146 tok/s |
+| 62K | 2,503 tok/s | 138 tok/s |
+| 92K | 2,727 tok/s | 145 tok/s |
+| 122K | 2,792 tok/s | 141 tok/s |
+| 152K | 2,727 tok/s | 129 tok/s |
+| 182K | 3,116 tok/s | 130 tok/s |
+| 212K | 3,131 tok/s | 129 tok/s |
+| 242K | 3,169 tok/s | 121 tok/s |
+| 260K | 3,269 tok/s | 136 tok/s |
+
+The 260K prompt was read in 79.5 s. Decode here is a 256-token answer on code and docs, a different
+text from the bench's 600-token answers, so the two decode columns are not the same measure.
 
 ## VRAM (before the fork)
 

@@ -1,0 +1,562 @@
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 6ecc58c..b606eb6 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -531,6 +531,22 @@ print(r.choices[0].message.content)
+   with no `"thinking"`, effort or budget thinks as the model's template does. `"anthropic_thinking": "on_request"` in
+   `strata-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
+   helper calls (a session title in a few dozen tokens) need; its real turns ask for thinking when it is on there.
++- **Format fixes (opt-in, off by default).** `--format-fixes` to `serve/server.py`, or `"format_fixes"` in
++  `strata-<model>.json`: `off` (the default), `all`, or a comma-separated list of names. The names compensate
++  quirks of the one output format the server speaks - Qwen-style `<think>`/`<tool_call>`:
++  - `stranded-call` - some chat templates render a tool call right after the reasoning block without ever
++    emitting `</think>` before it. The whole call then streams as `reasoning_content`, and a client that runs
++    tools from the content channel ends its turn with nothing to execute - seen live as agents stopping
++    silently mid-task. With the fix on, a complete, well-formed call left in an unclosed thinking span by a
++    reply that ended by itself is delivered as a real tool call at end of turn. It is a rescue of the act, not
++    a guess at one: a call inside a span that closes is a mention and is never acted on, a reply cut by
++    `max_tokens` is never rescued (a call quoted in that reasoning was something the model considered), and
++    prose between or after the blocks - the shape of a disclaimed example - leaves them as reasoning.
++  Nothing that already streamed ever changes, and a fix that fires says so twice: in the server window and in
++  the reply's `"adaptations"` (OpenAI streaming and non-streaming). With the fix off, the same detection still
++  logs - a complete tool call was left in reasoning, and which fix would have delivered it - so the failure is
++  loud either way. An unknown name fails the start with the known ones, so a typo cannot silently disable a
++  fix.
+ - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
+   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
+   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
+diff --git a/serve/frontend.py b/serve/frontend.py
+index b90cd77..f198ed6 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -467,11 +467,22 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+     return ToolCall(name=name, arguments=args)
+ 
+ 
++# The named adaptations --format-fixes may turn on (the flag's grammar is "off" | "all" | a comma list of these;
++# the serve parses it - Service.parse_format_fixes).  Each one is an append-at-end-of-turn correction to a quirk
++# of the one output format the serve speaks, Qwen-style <think>/<tool_call>; nothing that already streamed ever
++# changes, and every adaptation that fires logs and is listed in the reply's "adaptations".
++#   stranded-call  a complete, well-formed tool call left in reasoning by a thinking span that never closed is
++#                  delivered as a real call - a template that renders a call after the reasoning block never
++#                  emits </think> before it, and without this the client's turn ends with nothing to execute
++KNOWN_FORMAT_FIXES = ("stranded-call",)
++
++
+ class OutputParser:
+     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
+     until it is complete, so clients never see `<tool_` or `</thi`."""
+ 
+-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
++    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
++                 fixes=()):
+         self.state = "reasoning" if thinking else "content"
+         self.buf = ""
+         self.lead = False
+@@ -481,6 +492,18 @@ class OutputParser:
+         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
+         # nothing until the call is complete, which for a large file write can be many minutes.
+         self.stream_tools = stream_tools
++        # Reasoning text from the first <tool_call> opener while the thinking span is still open, kept so
++        # finish() can rescue a call stranded by a template that never emits </think> (see
++        # _rescue_unclosed_call).  Cleared the moment the span closes: a call inside a CLOSED span was a
++        # mention, however valid, and must never be acted on.
++        self.reasoning_tail: str | None = None
++        # the enabled format adaptations (KNOWN_FORMAT_FIXES names); off = no adaptation ever fires, and a
++        # detected shape then only raises self.format_hint, which the serve logs fail-loud
++        self.fixes = frozenset(fixes or ())
++        # the names of the adaptations finish() applied, oldest first (the serve logs them and reports them in
++        # the reply's "adaptations"), and the name of a detected shape no enabled fix covers
++        self.adaptations: list[str] = []
++        self.format_hint: str | None = None
+         self._reset_scan()
+ 
+     def _reset_scan(self):
+@@ -603,6 +626,67 @@ class OutputParser:
+                     best = max(best, n)
+         return best
+ 
++    def _track_reasoning(self, text: str) -> None:
++        """Keep the reasoning tail used by _rescue_unclosed_call: everything emitted as reasoning from the
++        first <tool_call> opener, while the thinking span is still open."""
++        if self.reasoning_tail is not None:
++            self.reasoning_tail += text
++        else:
++            c = text.find(CALL_START)
++            if c >= 0:
++                self.reasoning_tail = text[c:]
++
++    def _rescue_calls(self, tail: str) -> "list[ToolCall] | None":
++        """The kept tail as a list of calls, or None when the tail is not ONLY complete, well-formed calls
++        separated by whitespace.  The tail starts at a <tool_call> opener (see _track_reasoning), so anything
++        else in it - prose between or after the blocks, an unfinished block, a body that does not parse - is
++        the model narrating a call it considered, not making one, and stays what it already streamed as."""
++        calls, rest = [], tail
++        while True:
++            rest = rest.lstrip()
++            if not rest:
++                return calls
++            if not rest.startswith(CALL_START):
++                return None
++            b = rest.find(CALL_END, len(CALL_START))
++            if b < 0:
++                return None                  # an unfinished call stays reasoning
++            body, rest = rest[len(CALL_START):b], rest[b + len(CALL_END):]
++            s = body.strip()
++            if not s.startswith("<function="):
++                return None
++            try:
++                calls.append(parse_tool_call(s, self.schemas.get(s[len("<function="):].split(">", 1)[0])))
++            except ValueError:
++                return None                  # not a well-formed act; leave every block as reasoning
++
++    def _rescue_unclosed_call(self, finish_reason: str = "stop") -> list[Event]:
++        """End of generation inside a thinking span that never closed, gated on the "stranded-call" format
++        fix.  A template that renders a call after the reasoning block never emits </think> before it, so
++        the whole call streams out as reasoning_content and a client that runs tools from the content
++        channel ends its turn with nothing to execute.  Three things must hold before a tail counts as a
++        stranded act: the turn ended by itself ("length" most often leaves the span open mid-thought, and a
++        complete call quoted in that reasoning was something the model CONSIDERED, not did), the tail is
++        only complete, well-formed calls separated by whitespace (see _rescue_calls - prose after the last
++        block is a mention's shape; every live sighting of the bug ends ON the block), and every body parses
++        against the request's schemas.  A </think> after the opener clears the tail (a mention inside genuine
++        reasoning).  With the fix off, the same detection only raises self.format_hint: the serve logs it and
++        changes nothing, so the default fails loud instead of leaving a silent stall."""
++        if finish_reason != "stop":
++            self.reasoning_tail = None
++            return []
++        tail, self.reasoning_tail = self.reasoning_tail, None
++        if not tail:
++            return []
++        calls = self._rescue_calls(tail)
++        if calls is None:
++            return []
++        if "stranded-call" not in self.fixes:
++            self.format_hint = "stranded-call"   # detected but not enabled: the serve says so, changes nothing
++            return []
++        self.adaptations.append("stranded-call")
++        return [Event("tool_call", call=call) for call in calls]
++
+     def feed(self, delta: str) -> list[Event]:
+         self.buf += delta
+         out: list[Event] = []
+@@ -610,15 +694,19 @@ class OutputParser:
+             if self.state == "reasoning":
+                 i = self.buf.find(THINK_END)
+                 if i < 0:
+-                    keep = self._hold(self.buf, (THINK_END,))
++                    # Hold a partial </think> or <tool_call> (the tail tracker must see a whole opener).
++                    keep = self._hold(self.buf, (THINK_END, CALL_START))
+                     if len(self.buf) > keep:
+-                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
++                        text = self.buf[:len(self.buf) - keep]
++                        out.append(Event("reasoning", text))
++                        self._track_reasoning(text)
+                         self.buf = self.buf[len(self.buf) - keep:]
+                     return out
+                 if i:
+                     out.append(Event("reasoning", self.buf[:i]))
+                 self.buf = self.buf[i + len(THINK_END):]
+                 self.state, self.lead = "content", True
++                self.reasoning_tail = None   # the span closed: a <tool_call> inside it was a mention
+             elif self.state == "content":
+                 if self.lead:                                   # newlines right after </think> or a call
+                     stripped = self.buf.lstrip("\n")
+@@ -663,9 +751,11 @@ class OutputParser:
+                 self._reset_scan()
+                 self.state, self.lead = "content", True
+ 
+-    def finish(self) -> list[Event]:
++    def finish(self, finish_reason: str = "stop") -> list[Event]:
+         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
+-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211)."""
++        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).
++        `finish_reason` gates the unclosed-thinking rescue (see _rescue_unclosed_call); an applied fix names
++        itself in self.adaptations, and a detected-but-disabled one in self.format_hint."""
+         out = []
+         if self.state == "call" and self.stream_tools and self.scall is not None:
+             out += self._scan()                 # the output ended inside a call that was already announced
+@@ -680,5 +770,7 @@ class OutputParser:
+             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
+             text = self.buf if self.state != "call" else CALL_START + self.buf
+             out.append(Event(kind, text))
++            if self.state == "reasoning":
++                self._track_reasoning(text)
+             self.buf = ""
+-        return out
++        return out + self._rescue_unclosed_call(finish_reason)
+diff --git a/serve/server.py b/serve/server.py
+index fea6705..6cc1b62 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -51,8 +51,9 @@ from urllib.parse import parse_qs, urlsplit
+ ROOT = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(ROOT / "tools"))
+ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+-                            images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
++from serve.frontend import (ChatTemplate, Event, KNOWN_FORMAT_FIXES, OutputParser,  # noqa: E402
++                            anthropic_to_messages, images_of, mark_think_literals, openai_to_messages,
++                            unmark_think_literals)
+ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+ from serve import runconfig  # noqa: E402
+ from serve.winjob import contain  # noqa: E402
+@@ -1711,6 +1712,11 @@ class Service:
+         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
+         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
++        # --format-fixes / the config's "format_fixes" (off by default): the enabled output-format adaptations
++        # (KNOWN_FORMAT_FIXES names, parsed by parse_format_fixes).  Nothing that already streams ever changes;
++        # a fix that fires logs and is listed in the reply's "adaptations", and a detected shape with the fix
++        # off logs fail-loud - the same shape as #530's budget: never guess by default, say what was seen.
++        self.format_fixes: frozenset[str] = frozenset()
+         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
+                             tokenizer.encode("<|endoftext|>", parse_special=True))
+@@ -1767,6 +1773,33 @@ class Service:
+             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
+         return value if value > 0 else None
+ 
++    @staticmethod
++    def parse_format_fixes(value, where: str = "format_fixes") -> frozenset[str]:
++        """A --format-fixes / config "format_fixes" value as a set of adaptation names: "off" (or nothing, the
++        default), "all", or names from KNOWN_FORMAT_FIXES - one string, comma-separated, or a JSON list (a list
++        mixes freely: ["stranded-call"], "all" and "off, stranded-call" all work).  ValueError names the known
++        ones for anything else, so a typo fails the start instead of silently disabling a fix."""
++        known = ", ".join(("off", "all", *KNOWN_FORMAT_FIXES))
++        if value is None or value is False or value == "" or value == "off":
++            return frozenset()
++        if value is True or value == "all":
++            return frozenset(KNOWN_FORMAT_FIXES)
++        if isinstance(value, str):
++            value = value.split(",")
++        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
++            raise ValueError(f"{where}={value!r}: expected \"off\", \"all\" or a list of names ({known})")
++        fixes = []
++        for x in (x.strip() for x in value):
++            if x in ("", "off", "none"):
++                continue
++            if x == "all":
++                return frozenset(KNOWN_FORMAT_FIXES)
++            if x not in KNOWN_FORMAT_FIXES:
++                raise ValueError(f"{where}={value!r}: unknown name {x!r}; known: {known}")
++            if x not in fixes:
++                fixes.append(x)
++        return frozenset(fixes)
++
+     def _vision_down(self) -> bool:
+         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+ 
+@@ -2266,7 +2299,7 @@ class Service:
+         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
+             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
+             sampling = {**defaults, **req_values}
+-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
++        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, fixes=self.format_fixes)
+         detok, n, finish = Detokenizer(self.tok), 0, "length"
+         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
+@@ -2476,10 +2509,20 @@ class Service:
+         finally:
+             if emb:
+                 Path(emb).unlink(missing_ok=True)
+-        for ev in parser.finish():
++        for ev in parser.finish(finish):
+             yield "event", ev
+-        yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+-                       "timings": timings, "reasoning_tokens": thinking_n}
++        if parser.format_hint:   # the shape was detected but no enabled fix covers it: say so, change nothing
++            print(f"[strata] a complete tool call was left in reasoning by an unclosed thinking span; "
++                  f"--format-fixes={parser.format_hint} (or =all) would have delivered it "
++                  f"(also \"format_fixes\" in strata-<model>.json)", flush=True)
++        if parser.adaptations:
++            print(f"[strata] format fixes applied: {', '.join(parser.adaptations)} "
++                  f"(listed in the reply's \"adaptations\")", flush=True)
++        done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
++                "timings": timings, "reasoning_tokens": thinking_n}
++        if parser.adaptations:
++            done["adaptations"] = list(parser.adaptations)
++        yield "done", done
+ 
+ 
+ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
+@@ -2670,6 +2713,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
+                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
+             if x.get("timings"):
+                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
++            if x.get("adaptations"):
++                last["adaptations"] = x["adaptations"]  # the format fixes that fired in this reply
+             yield last
+ 
+ 
+@@ -2714,6 +2759,8 @@ def openai_collect(chunks) -> dict:
+            "usage": last["usage"]}
+     if last.get("timings"):
+         out["timings"] = last["timings"]
++    if last.get("adaptations"):
++        out["adaptations"] = last["adaptations"]        # the format fixes that fired in this reply
+     return out
+ 
+ 
+@@ -3943,6 +3990,12 @@ def main() -> int:
+     ap.add_argument("--api-monitor", action="store_true",
+                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
+                          "memory (also \"api_monitor\": true in the config; off by default)")
++    ap.add_argument("--format-fixes", default=None, metavar="off|all|NAMES",
++                    help="compensate quirks of the Qwen-style output format, off by default (a detected quirk still "
++                         "logs).  Names, one or comma-separated: stranded-call - a complete tool call left in "
++                         "reasoning by an unclosed thinking span is delivered as a real call at end of turn.  "
++                         "Nothing that already streamed changes; every fix that fires logs and is listed in the "
++                         "reply's \"adaptations\" (also \"format_fixes\" in the config)")
+     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
+                     help="unload the model after this many seconds without requests, so other programs (games, other "
+                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
+@@ -4088,6 +4141,14 @@ def main() -> int:
+         if budget:
+             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
+                   flush=True)
++    try:
++        svc.format_fixes = Service.parse_format_fixes(
++            a.format_fixes if a.format_fixes is not None else cfg.get("format_fixes"))
++    except ValueError as e:
++        raise SystemExit(f"[strata] {e}")
++    if svc.format_fixes:
++        print(f"[strata] format fixes on: {', '.join(x for x in KNOWN_FORMAT_FIXES if x in svc.format_fixes)} "
++              f"(format_fixes; every fix that fires logs and is listed in the reply's \"adaptations\")", flush=True)
+     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
+     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
+diff --git a/serve/test_server.py b/serve/test_server.py
+index c0c861b..436af33 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -2799,5 +2799,229 @@ class LostStep(unittest.TestCase):
+         self.run_mode("stop", stream=False)
+ 
+ 
++class ReasoningToolCall(unittest.TestCase):
++    """A tool call stranded in a thinking span that NEVER closes is rescued at end of stream, behind the
++    "stranded-call" format fix (--format-fixes).  Seen live as agents stopping silently: a template that
++    renders a call after the reasoning block never emits </think> before it, so the call streamed out as
++    reasoning_content and the client's turn ended with nothing to run.  A <tool_call> inside a span that
++    DOES close is a mention, however well-formed, and is never acted on; so is a tail that is not only
++    calls - prose between or after the blocks is the model narrating a call it considered."""
++
++    SCHEMA = [{"name": "Read", "parameters": {"properties": {"file_path": {"type": "string"},
++                                                             "offset": {"type": "integer"}}}}]
++
++    def run_parser(self, text, stream_tools, step, finish_reason="stop", fixes=("stranded-call",)):
++        from serve.frontend import OutputParser
++        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools, fixes=fixes)
++        evs = []
++        for i in range(0, len(text), step):
++            evs += p.feed(text[i:i + step])
++        evs += p.finish(finish_reason)
++        return evs
++
++    def test_call_stranded_in_unclosed_thinking_is_rescued(self):
++        text = ("I need to inspect the kernel source first.\n<tool_call>\n<function=Read>\n"
++                "<parameter=file_path>\n/src/moe_mul1.cpp\n</parameter>\n<parameter=offset>\n30\n"
++                "</parameter>\n</function>\n</tool_call>")
++        for stream_tools in (False, True):
++            for step in (1, 7, 10_000):
++                with self.subTest(stream_tools=stream_tools, step=step):
++                    evs = self.run_parser(text, stream_tools, step)
++                    calls = [e.call for e in evs if e.kind == "tool_call"]
++                    self.assertEqual(len(calls), 1)
++                    self.assertEqual(calls[0].name, "Read")
++                    self.assertEqual(calls[0].arguments, {"file_path": "/src/moe_mul1.cpp", "offset": 30})
++                    thought = "".join(e.text for e in evs if e.kind == "reasoning")
++                    self.assertIn("inspect the kernel source", thought)
++                    self.assertFalse([e for e in evs if e.kind == "content" and e.text.strip()])
++
++    def test_valid_example_in_closed_thinking_is_not_a_call(self):
++        # A valid, quoted call example closed by a real </think> stays reasoning.  The first version of
++        # this fix diverted at the opener and fired the example as a real call (and leaked a literal
++        # </think> into the content channel) - the review's false positive.
++        text = ("This is a documentation example, not an action:\n```xml\n<tool_call>\n<function=Read>\n"
++                "<parameter=file_path>\n/example.txt\n</parameter>\n</function>\n</tool_call>\n```\n"
++                "I should explain it without calling any tool.\n</think>Here is the explanation.")
++        for stream_tools in (False, True):
++            for step in (1, 7, 10_000):
++                with self.subTest(stream_tools=stream_tools, step=step):
++                    evs = self.run_parser(text, stream_tools, step)
++                    self.assertFalse([e for e in evs if e.kind == "tool_call"])
++                    thought = "".join(e.text for e in evs if e.kind == "reasoning")
++                    self.assertIn("/example.txt", thought)
++                    self.assertIn("I should explain it", thought)
++                    content = "".join(e.text for e in evs if e.kind == "content")
++                    self.assertEqual(content, "Here is the explanation.")
++
++    def test_call_with_trailing_prose_is_a_mention_even_with_the_fix_on(self):
++        # The tail contract, with the fix ON: prose after the last complete block is a mention's shape (the
++        # model narrated past a call it considered); every live sighting of the bug ends ON the block.  This
++        # flips the first version of this fix, which rescued this shape (the trailing-thought test).
++        text = ("planning<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
++                "</function>\n</tool_call>\nlet me see what comes back.")
++        evs = self.run_parser(text, False, 7)
++        self.assertFalse([e for e in evs if e.kind == "tool_call"])
++        thought = "".join(e.text for e in evs if e.kind == "reasoning")
++        self.assertIn("let me see what comes back", thought)
++
++    def test_review_example_unclosed_with_the_fix_on_stays_reasoning(self):
++        # The review's remaining ambiguity, unclosed and with the fix on: the disclaimed documentation
++        # example with its </think> removed.  The "```" and prose after the block make it a mention under
++        # the tail contract; the fix never sees a stranded act.
++        text = ("This is a documentation example, not an action:\n```xml\n<tool_call>\n<function=Read>\n"
++                "<parameter=file_path>\n/example.txt\n</parameter>\n</function>\n</tool_call>\n```\n"
++                "I should explain it without calling any tool.")
++        for stream_tools in (False, True):
++            for step in (1, 7, 10_000):
++                with self.subTest(stream_tools=stream_tools, step=step):
++                    evs = self.run_parser(text, stream_tools, step)
++                    self.assertFalse([e for e in evs if e.kind == "tool_call"])
++                    thought = "".join(e.text for e in evs if e.kind == "reasoning")
++                    self.assertIn("/example.txt", thought)
++                    self.assertIn("I should explain it", thought)
++
++    def test_quoted_call_in_a_max_tokens_cut_is_not_rescued(self):
++        # The review's case: a reply cut by max tokens most often leaves the thinking span
++        # open mid-thought - a complete call quoted inside that reasoning was something the
++        # model CONSIDERED ("but first let me check..."), not did.  A turn that did not end
++        # by itself never rescues.
++        text = ("I could run <tool_call>\n<function=Bash>\n<parameter=command>\nrm -rf build\n"
++                "</parameter>\n</function>\n</tool_call>\nbut first let me check what build holds...")
++        evs = self.run_parser(text, False, 7, finish_reason="length")
++        self.assertFalse([e for e in evs if e.kind == "tool_call"])
++        thought = "".join(e.text for e in evs if e.kind == "reasoning")
++        self.assertIn("rm -rf build", thought)          # it all stays reasoning
++
++    def test_a_natural_stop_still_rescues_the_same_shape(self):
++        # The same text ending BY ITSELF is the live bug's shape - the model went from
++        # thought to call with no </think> and stopped.  The gate must not lose it.
++        text = ("planning <tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
++                "</function>\n</tool_call>")
++        evs = self.run_parser(text, False, 7, finish_reason="stop")
++        calls = [e.call for e in evs if e.kind == "tool_call"]
++        self.assertEqual([(c.name, c.arguments) for c in calls], [("Read", {"file_path": "/a"})])
++
++    def test_stranded_shape_without_the_fix_stays_reasoning_and_says_so(self):
++        # Off (the default): the stream is byte-identical, nothing is rescued - but the parser names the
++        # detected shape so the serve can log it fail-loud (the #530 pattern: never guess, say what was seen).
++        from serve.frontend import OutputParser
++        text = ("I need the file.\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
++                "</function>\n</tool_call>")
++        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=False)
++        evs = p.feed(text) + p.finish("stop")
++        self.assertFalse([e for e in evs if e.kind == "tool_call"])
++        self.assertEqual(p.adaptations, [])
++        self.assertEqual(p.format_hint, "stranded-call")
++
++    def test_a_rescue_names_itself_in_adaptations(self):
++        # An applied fix records its name: the serve logs it and lists it in the reply's "adaptations",
++        # so a rescued turn is always distinguishable from a clean one.
++        from serve.frontend import OutputParser
++        text = ("planning <tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
++                "</function>\n</tool_call>")
++        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=False, fixes=("stranded-call",))
++        evs = p.feed(text) + p.finish("stop")
++        self.assertTrue([e for e in evs if e.kind == "tool_call"])
++        self.assertEqual(p.adaptations, ["stranded-call"])
++        self.assertIsNone(p.format_hint)
++
++    def test_two_stranded_calls_are_both_rescued(self):
++        text = ("a<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n"
++                "</tool_call>\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/b\n</parameter>\n"
++                "</function>\n</tool_call>")
++        evs = self.run_parser(text, False, 7)
++        calls = [e.call for e in evs if e.kind == "tool_call"]
++        self.assertEqual([c.arguments for c in calls], [{"file_path": "/a"}, {"file_path": "/b"}])
++
++    def test_prose_between_two_calls_is_a_mention_not_two_acts(self):
++        # The tail contract between blocks: only whitespace may separate them - "b" here is the model
++        # narrating between two calls it considered.
++        text = ("a<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n</function>\n"
++                "</tool_call>b<tool_call>\n<function=Read>\n<parameter=file_path>\n/b\n</parameter>\n"
++                "</function>\n</tool_call>")
++        evs = self.run_parser(text, False, 7)
++        self.assertFalse([e for e in evs if e.kind == "tool_call"])
++
++    def test_malformed_mention_in_unclosed_thinking_stays_reasoning(self):
++        text = "the format is<tool_call>\nnot a call body at all\n</tool_call>"
++        for step in (1, 7, 10_000):
++            with self.subTest(step=step):
++                evs = self.run_parser(text, False, step)
++                self.assertFalse([e for e in evs if e.kind == "tool_call"])
++                self.assertIn("not a call body at all",
++                              "".join(e.text for e in evs if e.kind == "reasoning"))
++
++    def test_think_end_still_wins_when_it_comes_first(self):
++        text = ("brief thought</think>prose<tool_call>\n<function=Read>\n"
++                "<parameter=file_path>\n/a\n</parameter>\n</function>\n</tool_call>")
++        for stream_tools in (False, True):
++            with self.subTest(stream_tools=stream_tools):
++                evs = self.run_parser(text, stream_tools, 7)
++                thought = "".join(e.text for e in evs if e.kind == "reasoning")
++                self.assertEqual(thought, "brief thought")
++                contents = "".join(e.text for e in evs if e.kind == "content")
++                self.assertEqual(contents.strip(), "prose")
++                self.assertEqual(len([e for e in evs if e.kind == "tool_call"]), 1)
++
++    def test_unfinished_stranded_call_is_not_rescued(self):
++        # An output cut by max tokens mid-call stays reasoning (the #530 log names the cause).
++        text = "planning<tool_call>\n<function=Read>\n<parameter=file_path>\n/sr"
++        evs = self.run_parser(text, False, 7)
++        self.assertFalse([e for e in evs if e.kind == "tool_call"])
++
++    def test_call_after_think_end_uses_the_content_channel(self):
++        # The span closes FIRST (or there was none): the call that follows is ordinary content-channel
++        # parsing, untouched by the fix.  (An earlier version of this test fed the call into a span it
++        # closed only after finish(), and passed by the rescue - not by the content channel.)
++        for thinking, text in (
++            (True, "x</think>prose<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
++                   "</function>\n</tool_call>"),
++            (False, "prose<tool_call>\n<function=Read>\n<parameter=file_path>\n/a\n</parameter>\n"
++                    "</function>\n</tool_call>"),
++        ):
++            with self.subTest(thinking=thinking):
++                from serve.frontend import OutputParser
++                p = OutputParser(thinking=thinking, tools=self.SCHEMA, stream_tools=False,
++                                 fixes=("stranded-call",))
++                evs = p.feed(text) + p.finish()
++                calls = [e.call for e in evs if e.kind == "tool_call"]
++                self.assertEqual([(c.name, c.arguments) for c in calls], [("Read", {"file_path": "/a"})])
++
++
++
++class FormatFixesOption(unittest.TestCase):
++    """The --format-fixes / config "format_fixes" grammar: off | all | names (one, comma-separated, or a JSON
++    list; the forms mix freely).  A typo fails the start naming the known ones, instead of silently
++    disabling a fix."""
++
++    def parse(self, value):
++        return Service.parse_format_fixes(value)
++
++    def test_grammar(self):
++        from serve.frontend import KNOWN_FORMAT_FIXES
++        for off in (None, False, "", "off"):
++            self.assertEqual(self.parse(off), frozenset(), off)
++        for on in (True, "all"):
++            self.assertEqual(self.parse(on), frozenset(KNOWN_FORMAT_FIXES), on)
++        self.assertEqual(self.parse("stranded-call"), frozenset({"stranded-call"}))
++        self.assertEqual(self.parse(" stranded-call "), frozenset({"stranded-call"}))
++        self.assertEqual(self.parse("off, stranded-call"), frozenset({"stranded-call"}))
++        self.assertEqual(self.parse("stranded-call,stranded-call"), frozenset({"stranded-call"}))
++        self.assertEqual(self.parse(["stranded-call"]), frozenset({"stranded-call"}))
++        self.assertEqual(self.parse(["stranded-call", "all"]), frozenset(KNOWN_FORMAT_FIXES))
++        self.assertEqual(self.parse(["off", "stranded-call"]), frozenset({"stranded-call"}))
++
++    def test_an_unknown_name_fails_naming_the_known_ones(self):
++        # The other members of the format's quirk family (#211's cut call, #530's empty reply) are the
++        # names a user reaches for next; they must fail loudly with the known list, not silently no-op.
++        with self.assertRaises(ValueError) as cm:
++            self.parse("stranded-call,cut-call,empty-reply")
++        self.assertIn("'cut-call'", str(cm.exception))
++        self.assertIn("known: off, all, stranded-call", str(cm.exception))
++        for bad in (7, ["stranded-call", 7], {"stranded-call"}):
++            with self.assertRaises(ValueError):
++                self.parse(bad)
++
++
+ if __name__ == "__main__":
+     unittest.main()

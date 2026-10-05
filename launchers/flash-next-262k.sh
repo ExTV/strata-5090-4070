@@ -3,8 +3,8 @@
 # patched Strata on :8888 (OpenAI and Anthropic compatible, model name qwen3.8-flash-next, images on).
 # Layers 0-35 on the 5090, 36-47 and the drafter on the 4070; prompts read on the 5090 only (--prefill-main);
 # the experts neither card holds sit in a page-locked RAM copy (--resident-experts, ~7 GB) and the two cards
-# overlap decode windows (the fork's --pipeline-windows, on by default); switching between conversations
-# restores a parked one in under a second (--conversation-cache-mib, 4 GB: one 130K-token session, not two).
+# overlap decode windows (--pipeline-windows 2 --adapt-async 1); switching between conversations restores a
+# parked one in under a second (--conversation-cache-mib 6144, 8 slots).
 # Knobs: CONFIG= another config in strata/, PORT=, HOST= (default 127.0.0.1; the server has no authentication, so
 # HOST=0.0.0.0 exposes an unauthenticated 262K-context endpoint with image input to the whole LAN; put it behind
 # a reverse proxy or a firewall rule if you do that).  Measured numbers: docs/benchmarks.md.
