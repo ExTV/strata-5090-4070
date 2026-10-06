@@ -5,7 +5,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: git clone https://github.com/Niko1221/Strata.git strata && git -C strata checkout --quiet 6f32ec070f23ced9f50e704d854d775da52591ab
+      - run: git clone https://github.com/Niko1221/Strata.git strata && git -C strata checkout --quiet a1641e9f77aacad4d201b53c8a7ae8fa21059ebb
       - name: apply every patch in order, then check the manifest
         run: |
           cd strata

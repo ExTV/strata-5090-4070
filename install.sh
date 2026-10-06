@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 STRATA_REPO=${STRATA_REPO:-https://github.com/Niko1221/Strata.git}
-STRATA_COMMIT=${STRATA_COMMIT:-6f32ec070f23ced9f50e704d854d775da52591ab}   # tag v0.1.39 (2026-10-04)
+STRATA_COMMIT=${STRATA_COMMIT:-a1641e9f77aacad4d201b53c8a7ae8fa21059ebb}   # tag v0.1.39 (2026-10-04)
 MODELS=${MODELS:-$PWD/models}
 CUDA_ARCHS=${CUDA_ARCHS:-"89;120"}
 JOBS=${JOBS:-3}          # a cicc/nvcc job takes ~3 GB of RAM; 3 jobs fit a 32 GB box next to a desktop
