@@ -181,7 +181,7 @@ Locking all 9.77 GiB of it (14.59 GiB with the complement) reads an 80K prompt a
 instead of 2,127 and a 16K one at 2,175 instead of 1,282. But it leaves about 1 GB available, and the
 engine's parking admission keeps a 2,560 MiB floor: every park is refused ("skip parking (physical RAM
 admission ...)"), so a switch between two chats costs a re-read (5-8 s for 15K and 30K instead of 0.4 s),
-and so does every side request a chat app sends between turns. A headroom of 10 GiB (shipped until 2026-10-05, 14 since) locks
+and so does every side request a chat app sends between turns. A headroom of 10 GiB (shipped until 2026-10-05, then 14, 4 since 2026-10-06) locks
 10.01 GiB, which covers the loan of a chunk up to about 17K tokens: 2K, 16K, follow-ups and tool-result
 steps keep the whole gain, an 80K prompt none (its 32K chunks borrow past the covered part), and
 parking works with about 3 GB of conversations before the floor refuses more. The headroom check reads
@@ -252,3 +252,37 @@ long conversation always parks, so switching chats or a client's side request ne
 Measured and not adopted: `STRATA_PM_SHARE=1` (decode 78), `STRATA_MTP_KV=f16`,
 `STRATA_PREFILL_LEND_PCT=60` and `STRATA_PREFILL_HELP=1` (neutral; the helper is inactive under
 `--prefill-main`). 4-bit KV was left out on purpose: the KV stays at 8 bits.
+
+## Later PR updates, the prefix cache and headroom 4 (2026-10-06)
+
+Three carried PRs moved upstream and are applied as follow-up patches: #904 makes `STRATA_DF_BRANCH`
+opt-in (graph branches plus any NVML query between requests could stall a verify window on Linux GSP
+drivers; with it on we measured +2-3% decode and no stall in 20 runs, but left it off), #910 makes
+`STRATA_ATTN_MERGE_V2` opt-in, and #525's stranded-call rescue now needs the opener at the start of a
+line outside a code fence and a tool the request declared. Seven new PRs are applied too: four fixes
+(#958, #1049, #1043, #1033), #1050 (`STRATA_PREFILL_CPU_SHARE=auto`, off by default; our patch also sets
+the CPU pool under `--prefill-main`, where it measured neutral), #934 (`--expert-cache-per-layer`, off:
+14,256 slots and faster long prompts, but decode fell to 102 tok/s and tool steps to 4.8 s) and #960.
+
+#960 (`--prefix-cache-dir`) saves the state at the end of each system prompt to disk, so a new chat or a
+server restart restores it instead of reading it: a 20K-token system prompt took 0.63 s instead of 11.65
+s (restore 250 ms from disk, 145 ms from its RAM tier, about 430 MB per 20K tokens on disk). Upstream
+gates it off on a layer split; our version allows it under `--prefill-main`, where only CUDA0 holds a
+session, and resyncs the stage after a restore. Its key does not include RoPE scaling, so a YaRN config
+needs its own directory.
+
+The same binary measured equal to the previous build (decode 177-180, 16K 1,440-1,464, 80K
+2,224-2,254 tok/s). What changed the numbers is the lend headroom. A client's first turn took 24.3 s
+here; a trace split it into reading a new 35.8K system prompt and refilling the lent cache slots after
+it: at headroom 14 only 621 of the 6,232 lent slots fit in locked RAM, so the refill re-read the rest
+from NVMe (6-8 s). At headroom 4 all 6,232 stay in RAM: the refill takes 0.14 s, a fresh 27K prompt
+9.5 s instead of 16.4, and 16K / 80K prompts read about 45% faster. That leaves about 1 GB available,
+so the parking floor (`--conversation-cache-min-free-mib`, default 2,560) refused every park; 1,024
+lets parking work again. With 6 GB of parking the engine heap was pushed to zram harder (6.8 GB swapped,
+more major faults) for no gain on the 30K/15K switch test, so parking went back to 3 GB. The cost of
+headroom 4: about 6 GB of engine memory in zram and about one tool step in nine stalling for 2-3 s on
+page faults. It suits a box that only serves; with a desktop in use, 14 is the safer choice.
+
+3 GB of parking covers a conversation up to about 160K tokens (a snapshot is ~19.5 KB per token). A
+longer one is not parked, so an interleaved second conversation (or a client's side request) makes the
+next turn of the long one re-read it: in real use a 200K agent chat lost 47 s per switch that way.

@@ -10,10 +10,11 @@
 A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific box:
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the 47 GB expert file.
 
-- **Upstream Strata v0.1.39** plus 15 patches: Hardin22's two-GPU PRs, five other open PRs, four of our own
-- **176 tok/s decode**, prompts up to **3,269 tok/s**, a 260K-token prompt read in **80 s**
+- **Upstream Strata v0.1.39** plus 25 patches: Hardin22's two-GPU PRs, twelve other open PRs, four of our own
+- **179 tok/s decode**, prompts up to **3,750 tok/s**: 175K tokens of a real agent chat read in **47 s**
 - Decode never touches the SSD: the experts no card holds sit page-locked in RAM
-- Switching between conversations restores the parked one in **0.4-0.5 s**
+- Switching between conversations restores the parked one in **0.5-1 s**
+- A new chat with a system prompt seen before restores it from disk instead of reading it (**0.6 s** vs 11.7 s for 20K tokens)
 - Agent-friendly: a 2.7K-token tool result is answered in **3.6 s**; three tool-call shapes fixed, merged tool turns split
 - OpenAI and Anthropic compatible API on `:8888`, images on
 
@@ -35,12 +36,17 @@ launchers/flash-next-262k.sh    # serves http://127.0.0.1:8888/v1
 
 | | stock Strata 0.1.33, split 36 | this repo |
 | --- | --- | --- |
-| decode, 600-token answers, greedy | 99-111 tok/s | **176 tok/s** |
-| 2K fresh prompt | 200-240 tok/s | **572 tok/s** |
-| 16K fresh prompt | 470-646 tok/s | **1,434 tok/s** |
-| 80K fresh prompt | 886-928 tok/s | **2,256 tok/s** |
-| tool results of 1.5K / 2.7K / 5.9K tokens | | **3.35 / 3.60 / 5.02 s** |
-| switching between two chats (30K and 15K) | 20-48 s (full re-read) | **0.4-0.5 s** |
+| decode, 600-token answers, greedy | 99-111 tok/s | **179 tok/s** |
+| 2K fresh prompt | 200-240 tok/s | **492-565 tok/s** |
+| 16K fresh prompt | 470-646 tok/s | **2,020 tok/s** |
+| 27K fresh prompt of real text | | **2,842 tok/s** (9.5 s) |
+| 80K fresh prompt | 886-928 tok/s | **2,743 tok/s** |
+| tool results of 1.6K / 2.9K / 4.2K tokens | | **3.4 / 3.6 / 4.0 s** |
+| switching between two chats (30K and 15K) | 20-48 s (full re-read) | **0.5-1.1 s** |
+
+In real use (an agent chat that grew to 200K tokens): follow-up turns read only the new 20-1,200
+tokens and start answering in 0.2-3 s, decode stays at 124-190 tok/s, and a full re-read of 175K
+tokens takes 47 s.
 
 ### By context depth
 
@@ -59,14 +65,17 @@ Fresh prompt of real text at each depth, then a 256-token answer (greedy, thinki
 | 242K | 3,169 tok/s | 121 tok/s |
 | 260K | 3,269 tok/s | 136 tok/s |
 
-Measured 2026-10-05 with the abliterated build of the same GGUF (same quant format and tensor types).
+Measured 2026-10-05 with the abliterated build of the same GGUF (same quant format and tensor types), with
+the lend headroom at 14 GiB. The shipped headroom of 4 GiB reads 27K-36K prompts about 70% faster
+(1,643 -> 2,840 tok/s); this table has not been re-run with it.
 Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Requirements
 
 - **GPUs:** an RTX 5090 (or another 32 GB Blackwell card) plus a 16 GB NVIDIA card; the second one can sit on a chipset x1 slot.
   The layer split (36) and the VRAM reserves are sized for exactly 32 + 16 GB.
-- **RAM:** 32 GB. With the model up, 2-6 GB stays available. Headless box: no VRAM is left for a desktop.
+- **RAM:** 32 GB plus zram swap. With the model up, about 1-2 GB stays available and some engine memory
+  sits in zram. Headless box: no RAM or VRAM is left for a desktop.
 - **Disk:** a fast NVMe with ~80 GB free for the model.
 - **Software:** Linux, NVIDIA driver, CUDA toolkit (`nvcc`), `cmake`, `ninja`, `git`, `patch`, Python 3.10+.
 
@@ -118,7 +127,7 @@ launchers/flash-next-262k.sh
 
 ## What is in the patch series
 
-Each patch is one tested step, conflict resolutions included; applied to v0.1.39 they rebuild the tested tree byte for byte.
+Each patch is one tested step, conflict resolutions included; applied to v0.1.39 they rebuild the tested tree byte for byte (patch 25 leaves out one PNG in upstream's docs).
 
 | # | Source | What it does |
 | --- | --- | --- |
@@ -137,6 +146,16 @@ Each patch is one tested step, conflict resolutions included; applied to v0.1.39
 | 13 | ours | split merged tool turns back into steps, so each step reads only the new result |
 | 14 | PRs #876 #905 #910 | asynchronous expert tier, pipelined decode, fork parity |
 | 15 | PR #904 | verify-window PDL and graph branches |
+| 16 | PR #904 (update) | `STRATA_DF_BRANCH` opt-in: graph branches plus NVML queries could stall a window on Linux |
+| 17 | PR #910 (update) | `STRATA_ATTN_MERGE_V2` opt-in |
+| 18 | PR #525 (update) | stranded-call rescue: opener must start a line outside a code fence, declared tools only |
+| 19 | PR #958 | the fused prompt layout shrinks MoE buffers only when every layer can take the fused path |
+| 20 | PR #1049 | the fused SwiGLU q8_1 quantizers keep scales finite |
+| 21 | PR #1043 | residency-table uploads finish before other streams read the table |
+| 22 | PR #1033 | short prompts gather GPU-resident experts in groups too |
+| 23 | PR #1050 | `STRATA_PREFILL_CPU_SHARE=auto` (off by default); ours: also under `--prefill-main` |
+| 24 | PR #960 | `--prefix-cache-dir`: system prompts saved to disk; ours: works under `--prefill-main` |
+| 25 | PR #934 | `--expert-cache-per-layer` (off: faster prompts, but decode 102 tok/s here) |
 
 PR #439 (batched expert gathers) is left out on purpose: under `--prefill-main` it deadlocks on long prompts.
 Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
@@ -148,14 +167,22 @@ Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
 | `"layer_split": "36"` | layers 0-35 on the 5090, 36-47 + drafter on the 4070, which then holds every expert of its layers |
 | `--prefill auto:32768` | fewer chunks per prompt, so the experts stream fewer times |
 | `--short-read 768` | new text up to 768 tokens goes through the decode windows (a 150-token message: 1.7 to 0.5 s) |
-| `--conversation-cache-mib 6144`, 8 slots | parked chats survive the small side requests chat apps send |
+| `--conversation-cache-mib 3072`, 8 slots | parked chats survive the small side requests chat apps send |
+| `--conversation-cache-min-free-mib 1024` | the default floor (2,560) refuses every park at headroom 4 |
+| `--prefix-cache-dir prefix-cache` | a known system prompt is restored from disk (about 430 MB per 20K tokens) |
 | `STRATA_SPLIT_SMALL_OWN=3072` | reads up to 3K tokens keep 986 cache slots: faster tool steps, decode 193 to 176 |
-| `STRATA_RESIDENT_HEADROOM_GIB=14` | how much RAM the lend region leaves free, so parking keeps working |
+| `STRATA_RESIDENT_HEADROOM_GIB=4` | the RAM the lend region leaves free: every borrowed slot stays in locked RAM, so refilling them after a prompt takes 0.15 s instead of 6 s |
 | `STRATA_PF_FUSED=1` | fused int8 tensor-core prompt kernels for the IQ packs (+9-13% on prompts) |
 | `MALLOC_MMAP_THRESHOLD_`, `MALLOC_ARENA_MAX` | about 0.7 GB more available RAM, speed-neutral |
 | `--kv int8` | the KV cache stays at 8 bits |
 
-With 64 GB of RAM: lower the headroom so every borrowed expert fits in locked RAM; 80K prompts measured up to 3,173 tok/s that way.
+Headroom 4 assumes nothing else runs on the box: about 6 GB of engine memory goes to zram, and roughly
+one tool step in nine stalls for a couple of seconds on page faults. Use 14 if you work on the
+desktop while it serves (prompts ~40% slower, refills 6 s).
+
+Parking 3072 MiB holds chats up to about 160K tokens (a snapshot is ~19.5 KB per token). A longer chat cannot park (its snapshot is
+3.3-3.7 GB), so if a second conversation or a client's side request runs in between, going back to the
+long chat re-reads it (~47 s for 175K). With 64 GB of RAM raise the parking budget to 6144 or more.
 
 ## Tools
 

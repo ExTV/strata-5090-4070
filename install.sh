@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Clones upstream Strata at the v0.1.39 tag into ./strata, applies the patch series in patches/ (Hardin22's two-GPU
-# PRs, five other open PRs and our own patches, in the order they were merged and tested), builds the engine and the vision helper
+# PRs, twelve other open PRs and our own patches, in the order they were merged and tested), builds the engine and the vision helper
 # for an RTX 5090 (sm_120) + RTX 4070 Ti SUPER (sm_89), makes the Python venv, and writes the server config
 # from configs/flash-next-262k.json.in with $MODELS filled in.  Safe to re-run: patches already applied are
 # skipped and cmake only rebuilds what changed.  The expert pack and the MTP drafter are built by prepare.sh.

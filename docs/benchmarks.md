@@ -1,9 +1,9 @@
 # Benchmarks
 
-All on 2026-10-02 to 2026-10-05, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
+All on 2026-10-02 to 2026-10-06, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
 IQ3_XXS, 262,144 context, layer split 36, int8 KV with 32,768 resident cells, vision on. The Strata base
 moves through the sections: 0.1.33, 0.1.37, 0.1.38 with six PRs, the Strata-DualGPU fork, then the fork's later commits with the
-lend region in RAM, then upstream 0.1.39 with the fork's work as PRs (the shipped config, last section).
+lend region in RAM, then upstream 0.1.39 with the fork's work as PRs, then the 2026-10-06 PR updates with headroom 4 (the shipped config, last section).
 `tools/bench.py`: five 600-token greedy answers with thinking off (decode median), fresh prompts of
 ~2K (twice), ~16K and ~80K tokens of random words (prefill tok/s), then a 2K follow-up on the 80K
 conversation; `tools/decode_after.py`: five more answers right after the 80K prompt. "faults" is
@@ -235,7 +235,7 @@ In real use before the patch, one 30-call turn re-read 24K to 134K tokens on eac
 (15-51 s per step); after it, 33 requests over three conversations each reused the whole live
 session. The server suite passes with the patch (180 tests, 10 of them new).
 
-## Upstream 0.1.39 with Hardin22's PRs (2026-10-05, the shipped config)
+## Upstream 0.1.39 with Hardin22's PRs (2026-10-05)
 
 v0.1.39 plus #848 #859 #851 #863 #876 #904 #905 #910 (the fork's work, sent upstream), the five open PRs
 and our patches 10-13; the config adds `--trim-stage-weights --pipeline-windows 2 --adapt-async 1`
@@ -290,3 +290,37 @@ text from the bench's 600-token answers, so the two decode columns are not the s
 is what keeps the expert cache from taking it all). 4070 Ti SUPER: 15,754 MiB. Peak during an 80K
 prompt and during vision requests stays inside those figures; the expert cache lends slots to the
 prompt path instead of allocating more.
+
+## PR updates, prefix cache and headroom 4 (2026-10-06, the shipped config)
+
+Patches 16-25 on the 0.1.39 series, ISTA GSQ-RCO IQ3_XXS with a runtime control vector (speed-neutral).
+New binary against the previous one, same config (headroom 14), interleaved boots: decode 177-180, 2K
+~610, 16K 1,440-1,464, 80K 2,224-2,254 tok/s, steps 3.2 / 3.4 / 4.6 s on both.
+
+Headroom and parking, one boot each, `tools/parking_check.py`, `tools/depth_bench.py` (27K and 36K of
+real text), `tools/step_times.py` (two texts) and `tools/bench.py`; faults = system major faults over
+the run:
+
+| | 27K / 36K fresh | 2K | 16K | 80K | follow-up on 80K | decode | parking switch | faults |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| headroom 14, parking 6 GB (before) | 1,643 / 1,643 | | | | | | 0.4-0.5 s | |
+| headroom 2 | 2,800 / 2,502 | 598-617 | 2,182 | 3,221 | 5.6 s | 177 | | |
+| headroom 2, parking floor 1024 | 2,895 / 3,000 | 269-490 | 2,110 | 3,077 | 4.5 s | 182 | 0.3-0.9 s (first two 12-13 s) | |
+| headroom 4, parking 6 GB, floor 1024 | 2,647 / 2,850 | 336-546 | 1,911 | 3,133 | 5.9 s | 188 | 0.4-0.7 s | 199K |
+| headroom 4, parking 3 GB, floor 1024 | 2,832 / 2,067 | 569-581 | 2,181 | 2,750 | 4.1 s | 176 | 0.4-2.0 s | 148K |
+| **the same, rerun (shipped)** | **2,842 / 2,836** | 492-565 | **2,020** | **2,743** | 4.6 s | **179** | 0.5-1.1 s | 112K |
+
+Parking answers right on every row (8/8). Tool steps on the shipped row: 1.6K / 2.9K / 4.2K tokens
+3.4 / 3.6 / 4.0 s median, with one step in about nine at 4.5-6.3 s (page faults). Refill of the lent
+slots after a prompt: 6.07 s at headroom 14, 0.14 s at headroom 4. The engine had 5.6-6.8 GB in zram
+after the runs at headroom 4.
+
+`--prefix-cache-dir`: a 20K system prompt after a restart 0.63 s (cold read 11.65 s), needle right.
+Rejected: `--expert-cache-per-layer` (#934): 16K 2,042 / 80K 2,519 tok/s, but decode 102 and tool
+steps 4.8 s. `STRATA_DF_BRANCH=1 STRATA_ATTN_MERGE_V2=1`: +2-3% decode (228 vs 220 median over 20
+answers of 1,500 tokens), left off for the upstream hang report.
+
+Real use on the shipped config (an agent session from another machine, one evening): turns of a chat
+growing from 160K to 204K tokens read 21-3,578 new tokens in 0.2-3.7 s, decode 124-190 tok/s; full
+re-reads of 147K-176K tokens ran at 3,670-3,830 tok/s (39-50 s); these happened only when a second
+conversation ran in between and the long one (snapshot 3.3-3.8 GB) could not park in 3 GB.

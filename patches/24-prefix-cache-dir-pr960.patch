@@ -1,0 +1,1175 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0a8bd6b..a5d2b1c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -427,7 +427,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+-    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp)
++    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
++    src/core/prefix_store.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
+@@ -472,6 +473,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
+     add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
+     set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
++    add_executable(prefix_store_test src/core/prefix_store_test.cpp)
++    target_link_libraries(prefix_store_test PRIVATE strata_engine)
++    add_test(NAME prefix_store_test COMMAND prefix_store_test)
++    set_tests_properties(prefix_store_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+     add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
+     target_link_libraries(conversation_validation_test PRIVATE strata_engine)
+     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 802b63f..788d341 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -714,8 +714,25 @@ rather than permission to continue with partial state. Indexer spare keys and th
+ moving spare row are preserved, including checkpoint rewinds.
+ The engine log reports parking, restoration, bytes, evictions, individual snapshot
+ sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
+-retention for diagnostic comparisons. Snapshots are not
+-persisted across restarts.
++retention for diagnostic comparisons. Parked snapshots are not
++persisted across restarts (the prefix snapshots below are).
++
++**Prefix snapshots on disk (opt-in).** The system-prompt checkpoint above lives in the one K/V arena, so it is gone
++once a request with another start comes in (a title request, a subagent, another client), and after every restart;
++a parked conversation that holds it is taken out whole to lend it. `--prefix-cache-dir DIR` keeps it in a file
++instead: when a request that read its system prompt has answered (after `DONE`), the state at that checkpoint - its
++running state and the K/V of every layer and of the draft layer up to it - is streamed from the session into
++`DIR`, once per distinct system prompt. A later request whose prompt starts with a saved one, and which the live
++session or a batch slot cannot serve further, restores it and reads only the rest. It is preferred over a parked
++conversation of the same length, which then stays parked. Restoring leaves the file in place.
++`--prefix-cache-disk-mib N` (default 51200) caps the directory, least recently used first;
++`--prefix-cache-ram-mib N` (default 2048, 0 = disk only) also keeps the most recently used in RAM when
++`--conversation-cache-min-free-mib` allows it - otherwise the file is streamed into the session through a 64 MB
++buffer, so a full RAM never blocks it. Each file records the engine build, the pack, `--native`, `--mtp`, `--kv` and
++`STRATA_BF16_TC`; a file that differs in any of them (a rebuilt engine included) is deleted at start-up, and every
++restore is validated like a parked snapshot before anything is written. A restore that fails before writing keeps
++what the session held; one that fails after reads the whole prompt instead. One GPU without `--batch` only. A file
++is about 118 MB plus 12.4 KB per token with K8V4 (a 30,028-token system prompt: 490 MB).
+ 
+ **Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
+ decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
+diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
+index 1a56680..987dced 100644
+--- a/include/strata/core/conversation_snapshot.hpp
++++ b/include/strata/core/conversation_snapshot.hpp
+@@ -4,7 +4,10 @@
+ #include "strata/core/layer.hpp"
+ #include "strata/core/session.hpp"
+ 
++#include <array>
++#include <functional>
+ #include <string>
++#include <vector>
+ 
+ namespace strata::core {
+ 
+@@ -30,6 +33,25 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
+ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                             int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error);
+ 
++// Streaming (prefix snapshots, docs/DETAILS.md): K/V moves between the session and a byte stream through
++// `bounce` instead of a whole RAM image.  Payloads come in the order k, v, k_scale, v_scale, pooled, each the
++// size conversation_kv_layout reports - the same bytes conversation_kv_save would hold.
++using ConversationKvSizes = std::array<size_t, 5>;
++using ConversationWrite = std::function<bool(const uint8_t*, size_t)>;
++using ConversationRead = std::function<bool(uint8_t*, size_t)>;
++bool conversation_kv_layout(ConversationKv& header, ConversationKvSizes& sizes, const QsaState& state,
++                            const ModelGeometry& g, int64_t upto, bool include_index, std::string& error);
++// conversation_kv_validate with payload sizes in place of the buffers
++bool conversation_kv_validate_sizes(const ConversationKv& header, const ConversationKvSizes& sizes,
++                                    const QsaState& state, const ModelGeometry& g, int64_t upto,
++                                    bool include_index, std::string& error);
++bool conversation_kv_save_stream(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
++                                 std::vector<uint8_t>& bounce, const ConversationWrite& write, std::string& error);
++bool conversation_kv_restore_stream(const ConversationKv& header, const ConversationKvSizes& sizes,
++                                    const QsaState& state, const ModelGeometry& g, int64_t upto,
++                                    bool include_index, std::vector<uint8_t>& bounce,
++                                    const ConversationRead& read, std::string& error);
++
+ struct ConversationStateSizes {
+     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
+ };
+@@ -93,4 +115,21 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
+ ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
+                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+ 
++// Prefix snapshots (docs/DETAILS.md): the session's state at `root`, a checkpoint of the conversation it
++// holds (no pictures), with K/V up to root's length.  `meta` is that image without the K/V payloads: their
++// headers only, and `sizes` per layer (main layers, then the draft).  Single session only (no layer split).
++bool conversation_prefix_header(SavedConversation& meta, std::vector<ConversationKvSizes>& sizes,
++                                const ConversationCheckpoint& root, bool cvec, const SessionState& session,
++                                const ModelGeometry& g, const QsaState& draft, std::string& error);
++// the K/V payloads of conversation_prefix_header's image, every layer in order
++bool conversation_prefix_save_stream(const SessionState& session, const ModelGeometry& g, const QsaState& draft,
++                                     int64_t upto, std::vector<uint8_t>& bounce, const ConversationWrite& write,
++                                     std::string& error);
++// The whole image is validated (as conversation_snapshot_validate) before anything is written.
++ConversationRestore conversation_prefix_restore_stream(const SavedConversation& meta,
++                                                       const std::vector<ConversationKvSizes>& sizes,
++                                                       SessionState& session, const ModelGeometry& g,
++                                                       const QsaState& draft, std::vector<uint8_t>& bounce,
++                                                       const ConversationRead& read, std::string& error);
++
+ } // namespace strata::core
+diff --git a/include/strata/core/prefix_store.hpp b/include/strata/core/prefix_store.hpp
+new file mode 100644
+index 0000000..b09d9d2
+--- /dev/null
++++ b/include/strata/core/prefix_store.hpp
+@@ -0,0 +1,75 @@
++// Persistent prefix snapshots (docs/DETAILS.md): the state at the end of a client's system prompt, so a new
++// conversation that starts with it reads only the rest.  One file per prefix on disk; the most recently used
++// ones also as RAM images.  When RAM is short, saving and restoring stream between the session and the file
++// through one bounce buffer.  Single session (no layer split), not thread safe.
++#pragma once
++
++#include "strata/core/conversation_snapshot.hpp"
++
++#include <algorithm>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++class PrefixStore {
++public:
++    struct Options {
++        std::string dir;        // empty: disabled
++        std::string identity;   // engine build and model; a file with another one is deleted
++        size_t ram_budget = 0, disk_budget = 0, min_free = 0;
++        size_t bounce = 64u << 20;
++    };
++    struct Match {
++        uint64_t key = 0;
++        int64_t tokens = 0;
++    };
++
++    // Scans the directory: files of another identity, unreadable or partial ones are deleted.
++    bool open(const Options& options, std::string& log, std::string& error);
++    bool enabled() const { return !o_.dir.empty(); }
++    // the longest prefix of `prompt` (shorter than it: its last token is always read)
++    template<class Token> Match best(const std::vector<Token>& prompt, bool cvec) const {
++        Match m;
++        for (const auto& e : entries_)
++            if (e.cvec == cvec && (int64_t) e.ids.size() > m.tokens && e.ids.size() < prompt.size() &&
++                std::equal(e.ids.begin(), e.ids.end(), prompt.begin()))
++                m = {e.key, (int64_t) e.ids.size()};
++        return m;
++    }
++    bool contains(const std::vector<int32_t>& ids, bool cvec) const;
++    // Saves the session's state at `root`, a checkpoint of what the session holds, to a new file.
++    bool capture(const ConversationCheckpoint& root, bool cvec, const SessionState& session, const ModelGeometry& g,
++                 const QsaState& draft, std::string& log, std::string& error);
++    // `source`: "ram", "disk>ram" (read into the RAM tier first) or "disk" (streamed).  An invalid file is
++    // deleted.  transfer_failed leaves the session partly written.
++    ConversationRestore restore(uint64_t key, SessionState& session, const ModelGeometry& g, const QsaState& draft,
++                                std::string& source, std::string& error);
++    size_t size() const { return entries_.size(); }
++    size_t ram_bytes() const;
++    size_t disk_bytes() const;
++
++private:
++    struct Entry {
++        uint64_t key = 0;
++        std::vector<int32_t> ids;
++        bool cvec = true;
++        size_t file_bytes = 0;
++        std::shared_ptr<SavedConversation> ram;
++        size_t ram_bytes = 0;
++        uint64_t used = 0;
++    };
++    std::string path(uint64_t key) const;
++    Entry* find(uint64_t key);
++    void erase(uint64_t key);
++    void trim_disk(size_t incoming);
++    bool trim_ram(size_t incoming);
++
++    Options o_;
++    std::vector<Entry> entries_;
++    uint64_t clock_ = 0;
++};
++
++} // namespace strata::core
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 759daa6..d413838 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -106,6 +106,8 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
+     return true;
+ }
+ 
++bool restore_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error);
++
+ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+     if (!n) return true;
+     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+@@ -178,21 +180,27 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
+ 
+ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                               int64_t upto, bool index, std::string& error) {
++    const ConversationKvSizes sizes = {image.k.size(), image.v.size(), image.k_scale.size(), image.v_scale.size(),
++                                       image.pooled.size()};
++    return conversation_kv_validate_sizes(image, sizes, st, g, upto, index, error);
++}
++
++bool conversation_kv_validate_sizes(const ConversationKv& image, const ConversationKvSizes& payload, const QsaState& st,
++                                    const ModelGeometry& g, int64_t upto, bool index, std::string& error) {
+     Layout l{};
+     if (!layout(st, g, upto, index, l, error)) return false;
+     if (!valid(st, l, upto, error)) return false;
+     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+-    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+     if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
+         image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
+         image.idx_dim != g.idx_key_dim) {
+         error = "conversation snapshot: incompatible K/V geometry";
+         return false;
+     }
+-    for (size_t i = 0; i < src.size(); ++i)
+-        if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
++    for (size_t i = 0; i < sizes.size(); ++i)
++        if (payload[i] != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+     const auto dst = pools(st);
+-    for (size_t i = 0; i < src.size(); ++i)
++    for (size_t i = 0; i < sizes.size(); ++i)
+         if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+     return true;
+ }
+@@ -206,6 +214,11 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
+         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+             })) return false;
++    return restore_residency(st, g, upto, error);
++}
++
++namespace {
++bool restore_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+     // VRAM slots still contain the outgoing conversation. Resolve must refill
+     // them from the restored authoritative pools before any attention reads.
+     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+@@ -221,6 +234,54 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
+     error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+     return false;
+ }
++} // namespace
++
++bool conversation_kv_layout(ConversationKv& header, ConversationKvSizes& sizes, const QsaState& st,
++                            const ModelGeometry& g, int64_t upto, bool index, std::string& error) {
++    Layout l{};
++    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
++    header = {};
++    header.format = l.format;
++    header.cells = l.cells;
++    header.heads = g.n_head_kv;
++    header.head_dim = g.head_dim;
++    header.page_size = l.page_size;
++    header.pooled_rows = l.pooled_rows;
++    header.idx_dim = g.idx_key_dim;
++    sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
++    return true;
++}
++
++bool conversation_kv_save_stream(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
++                                 std::vector<uint8_t>& bounce, const ConversationWrite& write, std::string& error) {
++    ConversationKv header;
++    ConversationKvSizes sizes{};
++    if (!conversation_kv_layout(header, sizes, st, g, upto, index, error) || bounce.empty()) return false;
++    const auto src = pools(st);
++    for (size_t i = 0; i < sizes.size(); ++i)
++        for (size_t at = 0; at < sizes[i];) {
++            const size_t n = std::min(bounce.size(), sizes[i] - at);
++            if (!transfer(bounce.data(), static_cast<const uint8_t*>(src[i]) + at, n, error)) return false;
++            if (!write(bounce.data(), n)) { error = "conversation snapshot: stream write failed"; return false; }
++            at += n;
++        }
++    return true;
++}
++
++bool conversation_kv_restore_stream(const ConversationKv& header, const ConversationKvSizes& sizes, const QsaState& st,
++                                    const ModelGeometry& g, int64_t upto, bool index, std::vector<uint8_t>& bounce,
++                                    const ConversationRead& read, std::string& error) {
++    if (!conversation_kv_validate_sizes(header, sizes, st, g, upto, index, error) || bounce.empty()) return false;
++    const auto dst = pools(st);
++    for (size_t i = 0; i < sizes.size(); ++i)
++        for (size_t at = 0; at < sizes[i];) {
++            const size_t n = std::min(bounce.size(), sizes[i] - at);
++            if (!read(bounce.data(), n)) { error = "conversation snapshot: stream read failed"; return false; }
++            if (!transfer(static_cast<uint8_t*>(dst[i]) + at, bounce.data(), n, error)) return false;
++            at += n;
++        }
++    return restore_residency(st, g, upto, error);
++}
+ 
+ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                             int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index 981beca..cf9b0aa 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -304,6 +304,70 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
+     return ConversationRestore::restored;
+ }
+ 
++bool conversation_prefix_header(SavedConversation& meta, std::vector<ConversationKvSizes>& sizes,
++                                const ConversationCheckpoint& root, bool cvec, const SessionState& ss,
++                                const ModelGeometry& g, const QsaState& draft, std::string& error) {
++    if (!root.imgs.empty() || !root.stage_parts.empty())
++        return fail(error, "a prefix holds no pictures or stage parts");
++    if (!conversation_checkpoint_validate(root, ss, g, error)) return false;
++    SavedConversation m;
++    m.geometry = geometry_key(g);
++    m.layer_lo = ss.layer_lo; m.layer_hi = ss.layer_hi;
++    m.live = root;
++    m.live.used = 0;
++    m.cvec = cvec;
++    const size_t layers = owned_qsa(ss);
++    m.kv.resize(layers + 1);
++    std::vector<ConversationKvSizes> z(layers + 1);
++    const int64_t upto = (int64_t) root.ids.size();
++    for (size_t j = 0; j <= layers; ++j)
++        if (!conversation_kv_layout(m.kv[j], z[j], j < layers ? owned(ss, j) : draft, g, upto, j < layers, error))
++            return false;
++    meta = std::move(m);
++    sizes = std::move(z);
++    return true;
++}
++
++bool conversation_prefix_save_stream(const SessionState& ss, const ModelGeometry& g, const QsaState& draft,
++                                     int64_t upto, std::vector<uint8_t>& bounce, const ConversationWrite& write,
++                                     std::string& error) {
++    if (!sync(error)) return false;
++    const size_t layers = owned_qsa(ss);
++    for (size_t j = 0; j <= layers; ++j)
++        if (!conversation_kv_save_stream(j < layers ? owned(ss, j) : draft, g, upto, j < layers, bounce, write, error))
++            return false;
++    return true;
++}
++
++ConversationRestore conversation_prefix_restore_stream(const SavedConversation& meta,
++                                                       const std::vector<ConversationKvSizes>& sizes,
++                                                       SessionState& ss, const ModelGeometry& g,
++                                                       const QsaState& draft, std::vector<uint8_t>& bounce,
++                                                       const ConversationRead& read, std::string& error) {
++    auto invalid = [&](const char* message) { fail(error, message); return ConversationRestore::invalid; };
++    if (!meta.live.stage_parts.empty() || !meta.live.imgs.empty() || !meta.checkpoints.empty() ||
++        !meta.stage_images.empty()) return invalid("not a prefix image");
++    if (meta.geometry != geometry_key(g)) return invalid("incompatible runtime geometry");
++    if (meta.layer_lo != ss.layer_lo || meta.layer_hi != ss.layer_hi)
++        return invalid("snapshot from another session layer range");
++    const ConversationView view{meta.live.ids, meta.live.imgs, meta.checkpoints, meta.cvec};
++    if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(meta.live, ss, g, error))
++        return ConversationRestore::invalid;
++    const size_t layers = owned_qsa(ss);
++    if (meta.kv.size() != layers + 1 || sizes.size() != layers + 1) return invalid("invalid K/V layer count");
++    const int64_t upto = (int64_t) meta.live.ids.size();
++    for (size_t j = 0; j <= layers; ++j)
++        if (!conversation_kv_validate_sizes(meta.kv[j], sizes[j], j < layers ? owned(ss, j) : draft, g, upto,
++                                            j < layers, error)) return ConversationRestore::invalid;
++    if (!sync(error)) return ConversationRestore::transfer_failed;
++    for (size_t j = 0; j <= layers; ++j)
++        if (!conversation_kv_restore_stream(meta.kv[j], sizes[j], j < layers ? owned(ss, j) : draft, g, upto,
++                                            j < layers, bounce, read, error))
++            return ConversationRestore::transfer_failed;
++    if (!conversation_checkpoint_restore(meta.live, ss, g, error)) return ConversationRestore::transfer_failed;
++    return ConversationRestore::restored;
++}
++
+ // the draft layer's K/V included (the stage that owns the draft head, or no layer split)
+ bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                  const QsaState& draft, size_t& bytes, std::string& error) {
+diff --git a/src/core/prefix_store.cpp b/src/core/prefix_store.cpp
+new file mode 100644
+index 0000000..ce2b7eb
+--- /dev/null
++++ b/src/core/prefix_store.cpp
+@@ -0,0 +1,355 @@
++#include "strata/core/prefix_store.hpp"
++#include "strata/core/conversation_memory.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <new>
++#include <system_error>
++#ifdef _WIN32
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
++
++namespace strata::core {
++namespace {
++namespace fs = std::filesystem;
++using Clock = std::chrono::steady_clock;
++
++// file: magic, identity, cvec, ids | running state and K/V headers | K/V payloads (conversation_kv_layout order)
++constexpr char kMagic[8] = {'S', 'T', 'R', 'P', 'F', 'X', '0', '1'};
++
++uint64_t key_of(const std::vector<int32_t>& ids, bool cvec) {
++    uint64_t h = 1469598103934665603ull ^ (cvec ? 1 : 0);
++    for (int32_t id : ids)
++        for (int b = 0; b < 4; ++b) { h ^= (uint8_t) ((uint32_t) id >> (8 * b)); h *= 1099511628211ull; }
++    return h;
++}
++
++struct File {
++    std::FILE* f = nullptr;
++    uint64_t left = 0;   // bytes a reader may still take: a corrupt length never allocates past the file
++    File(const std::string& path, const char* mode) : f(std::fopen(path.c_str(), mode)) {
++        std::error_code ec;
++        if (f && mode[0] == 'r') left = fs::file_size(path, ec);
++    }
++    ~File() { if (f) std::fclose(f); }
++    bool put(const void* p, size_t n) { return n == 0 || std::fwrite(p, 1, n, f) == n; }
++    bool get(void* p, size_t n) {
++        if (n > left || (n && std::fread(p, 1, n, f) != n)) return false;
++        left -= n;
++        return true;
++    }
++    template<class T> bool put_pod(const T& v) { return put(&v, sizeof v); }
++    template<class T> bool get_pod(T& v) { return get(&v, sizeof v); }
++    template<class T> bool put_vec(const std::vector<T>& v) {
++        return put_pod<uint64_t>(v.size()) && put(v.data(), v.size() * sizeof(T));
++    }
++    template<class T> bool get_vec(std::vector<T>& v) {
++        uint64_t n = 0;
++        if (!get_pod(n) || n > left / sizeof(T)) return false;
++        v.resize((size_t) n);
++        return get(v.data(), v.size() * sizeof(T));
++    }
++    template<class T> bool skip_vec() {   // the index needs no running state
++        uint64_t n = 0;
++        if (!get_pod(n) || n > left / sizeof(T) || std::fseek(f, (long) (n * sizeof(T)), SEEK_CUR) != 0) return false;
++        left -= n * sizeof(T);
++        return true;
++    }
++    bool close() {   // flushed to the disk before the rename publishes it
++        bool ok = std::fflush(f) == 0;
++#ifdef _WIN32
++        ok = ok && _commit(_fileno(f)) == 0;
++#else
++        ok = ok && fsync(fileno(f)) == 0;
++#endif
++        ok = std::fclose(f) == 0 && ok;
++        f = nullptr;
++        return ok;
++    }
++};
++
++bool put_head(File& w, const std::string& identity, const std::vector<int32_t>& ids, bool cvec) {
++    return w.put(kMagic, sizeof kMagic) && w.put_pod<uint64_t>(identity.size()) &&
++           w.put(identity.data(), identity.size()) && w.put_pod<uint8_t>(cvec ? 1 : 0) && w.put_vec(ids);
++}
++
++bool get_head(File& r, const std::string& identity, std::vector<int32_t>& ids, bool& cvec) {
++    char magic[sizeof kMagic];
++    uint64_t n = 0;
++    uint8_t c = 0;
++    if (!r.get(magic, sizeof magic) || !std::equal(magic, magic + sizeof magic, kMagic) || !r.get_pod(n) ||
++        n != identity.size()) return false;
++    std::string id(identity.size(), '\0');
++    if (!r.get(id.data(), id.size()) || id != identity || !r.get_pod(c) || c > 1 || !r.get_vec(ids) || ids.empty())
++        return false;
++    cvec = c != 0;
++    return true;
++}
++
++bool put_meta(File& w, const SavedConversation& m, const std::vector<ConversationKvSizes>& sizes) {
++    bool ok = w.put(m.geometry.data(), sizeof m.geometry) && w.put_pod(m.layer_lo) && w.put_pod(m.layer_hi);
++    for (const auto* v : {&m.live.gdn, &m.live.ple, &m.live.tails, &m.live.dead, &m.live.block_pos})
++        ok = ok && w.put_vec(*v);
++    ok = ok && w.put_pod<uint64_t>(m.kv.size());
++    for (size_t i = 0; ok && i < m.kv.size(); ++i) {
++        const auto& k = m.kv[i];
++        ok = w.put_pod<int32_t>(k.format) && w.put_pod(k.cells) && w.put_pod(k.heads) && w.put_pod(k.head_dim) &&
++             w.put_pod(k.page_size) && w.put_pod(k.pooled_rows) && w.put_pod(k.idx_dim) &&
++             w.put(sizes[i].data(), sizeof sizes[i]);
++    }
++    return ok;
++}
++
++bool get_meta(File& r, SavedConversation& m, std::vector<ConversationKvSizes>& sizes, bool skip_state = false) {
++    bool ok = r.get(m.geometry.data(), sizeof m.geometry) && r.get_pod(m.layer_lo) && r.get_pod(m.layer_hi);
++    for (auto* v : {&m.live.gdn, &m.live.ple, &m.live.tails, &m.live.dead, &m.live.block_pos})
++        ok = ok && (skip_state ? r.skip_vec<uint8_t>() : r.get_vec(*v));
++    uint64_t layers = 0;
++    if (!ok || !r.get_pod(layers) || layers > 4096) return false;
++    m.kv.resize((size_t) layers);
++    sizes.resize((size_t) layers);
++    uint64_t payload = 0;
++    for (size_t i = 0; i < m.kv.size(); ++i) {
++        auto& k = m.kv[i];
++        int32_t format = 0;
++        if (!r.get_pod(format) || !r.get_pod(k.cells) || !r.get_pod(k.heads) || !r.get_pod(k.head_dim) ||
++            !r.get_pod(k.page_size) || !r.get_pod(k.pooled_rows) || !r.get_pod(k.idx_dim) ||
++            !r.get(sizes[i].data(), sizeof sizes[i])) return false;
++        k.format = format;
++        for (size_t n : sizes[i]) payload += n;
++    }
++    return payload == r.left;   // the payloads, exactly: a partial file restores nothing
++}
++} // namespace
++
++std::string PrefixStore::path(uint64_t key) const {
++    char name[32];
++    std::snprintf(name, sizeof name, "%016llx.pfx", (unsigned long long) key);
++    return (fs::path(o_.dir) / name).string();
++}
++
++PrefixStore::Entry* PrefixStore::find(uint64_t key) {
++    for (auto& e : entries_) if (e.key == key) return &e;
++    return nullptr;
++}
++
++void PrefixStore::erase(uint64_t key) {
++    std::error_code ec;
++    fs::remove(path(key), ec);
++    entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry& e) { return e.key == key; }),
++                   entries_.end());
++}
++
++size_t PrefixStore::ram_bytes() const {
++    size_t n = 0;
++    for (const auto& e : entries_) n += e.ram_bytes;
++    return n;
++}
++
++size_t PrefixStore::disk_bytes() const {
++    size_t n = 0;
++    for (const auto& e : entries_) n += e.file_bytes;
++    return n;
++}
++
++// least recently used first, until `incoming` more fits the budget
++void PrefixStore::trim_disk(size_t incoming) {
++    while (!entries_.empty() && disk_bytes() + incoming > o_.disk_budget)
++        erase(std::min_element(entries_.begin(), entries_.end(),
++                               [](const Entry& a, const Entry& b) { return a.used < b.used; })->key);
++}
++
++bool PrefixStore::trim_ram(size_t incoming) {
++    if (incoming > o_.ram_budget) return false;
++    while (ram_bytes() + incoming > o_.ram_budget) {
++        Entry* oldest = nullptr;
++        for (auto& e : entries_)
++            if (e.ram && (!oldest || e.used < oldest->used)) oldest = &e;
++        oldest->ram.reset();
++        oldest->ram_bytes = 0;
++    }
++    return true;
++}
++
++bool PrefixStore::open(const Options& options, std::string& log, std::string& error) {
++    o_ = options;
++    entries_.clear();
++    if (!enabled()) return true;
++    std::error_code ec;
++    fs::create_directories(o_.dir, ec);
++    if (ec || !fs::is_directory(o_.dir, ec)) {
++        error = "prefix cache: cannot use directory " + o_.dir;
++        o_.dir.clear();
++        return false;
++    }
++    struct Found { Entry e; fs::file_time_type t; };
++    std::vector<Found> found;
++    size_t dropped = 0;
++    for (const auto& d : fs::directory_iterator(o_.dir, ec)) {
++        const auto p = d.path();
++        if (p.extension() == ".tmp") { fs::remove(p, ec); ++dropped; continue; }
++        if (p.extension() != ".pfx") continue;
++        Entry e;
++        bool ok = false;
++        {
++            File r(p.string(), "rb");
++            SavedConversation m;
++            std::vector<ConversationKvSizes> sizes;
++            ok = r.f && get_head(r, o_.identity, e.ids, e.cvec) && get_meta(r, m, sizes, true);
++        }
++        e.key = key_of(e.ids, e.cvec);
++        if (!ok || p.filename().string() != fs::path(path(e.key)).filename().string()) {
++            fs::remove(p, ec);
++            ++dropped;
++            continue;
++        }
++        e.file_bytes = (size_t) fs::file_size(p, ec);
++        found.push_back({std::move(e), fs::last_write_time(p, ec)});
++    }
++    std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.t < b.t; });
++    for (auto& f : found) {
++        f.e.used = ++clock_;
++        entries_.push_back(std::move(f.e));
++    }
++    trim_disk(0);
++    char text[160];
++    std::snprintf(text, sizeof text, "%zu snapshots (%.1f MB) in %s, %zu other files deleted", entries_.size(),
++                  (double) disk_bytes() / 1e6, o_.dir.c_str(), dropped);
++    log = text;
++    return true;
++}
++
++bool PrefixStore::contains(const std::vector<int32_t>& ids, bool cvec) const {
++    for (const auto& e : entries_) if (e.cvec == cvec && e.ids == ids) return true;
++    return false;
++}
++
++bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const SessionState& ss,
++                          const ModelGeometry& g, const QsaState& draft, std::string& log, std::string& error) {
++    if (!enabled() || contains(root.ids, cvec)) return true;
++    const auto t0 = Clock::now();
++    SavedConversation meta;
++    std::vector<ConversationKvSizes> sizes;
++    if (!conversation_prefix_header(meta, sizes, root, cvec, ss, g, draft, error)) return false;
++    size_t bytes = root.bytes();
++    for (const auto& z : sizes) for (size_t n : z) bytes += n;
++    if (bytes > o_.disk_budget) {
++        log = "skipped: larger than the disk budget";
++        return true;
++    }
++    const uint64_t key = key_of(root.ids, cvec);
++    if (find(key)) erase(key);   // a hash collision: the newer prefix replaces it
++    trim_disk(bytes);
++    const std::string final_path = path(key), tmp = final_path + ".tmp";
++    std::error_code ec;
++    bool ok = false;
++    try {
++        std::vector<uint8_t> bounce(o_.bounce);
++        File w(tmp, "wb");
++        ok = w.f && put_head(w, o_.identity, root.ids, cvec) && put_meta(w, meta, sizes) &&
++             conversation_prefix_save_stream(ss, g, draft, (int64_t) root.ids.size(), bounce,
++                                             [&](const uint8_t* p, size_t n) { return w.put(p, n); }, error) &&
++             w.close();
++        if (!ok && error.empty()) error = "prefix cache: writing " + tmp + " failed";
++    } catch (const std::bad_alloc&) {
++        error = "prefix cache: no memory for the write buffer";
++    }
++    if (ok) fs::rename(tmp, final_path, ec);
++    if (!ok || ec) {
++        fs::remove(tmp, ec);
++        if (error.empty()) error = "prefix cache: publishing " + final_path + " failed";
++        return false;
++    }
++    Entry e;
++    e.key = key;
++    e.ids = root.ids;
++    e.cvec = cvec;
++    e.file_bytes = (size_t) fs::file_size(final_path, ec);
++    e.used = ++clock_;
++    entries_.push_back(std::move(e));
++    char text[160];
++    std::snprintf(text, sizeof text, "saved %zu tokens (%.1f MB) in %.1f ms; snapshots=%zu disk=%.1f MB",
++                  root.ids.size(), (double) entries_.back().file_bytes / 1e6,
++                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), entries_.size(),
++                  (double) disk_bytes() / 1e6);
++    log = text;
++    return true;
++}
++
++ConversationRestore PrefixStore::restore(uint64_t key, SessionState& ss, const ModelGeometry& g,
++                                         const QsaState& draft, std::string& source, std::string& error) {
++    Entry* e = find(key);
++    if (!e) { error = "prefix cache: no such snapshot"; return ConversationRestore::invalid; }
++    e->used = ++clock_;
++    std::error_code ec;
++    fs::last_write_time(path(key), fs::file_time_type::clock::now(), ec);   // the LRU order across restarts
++    if (e->ram) {
++        source = "ram";
++        const auto r = conversation_snapshot_restore(*e->ram, ss, g, draft, error);
++        if (r == ConversationRestore::invalid) erase(key);
++        return r;
++    }
++    File r(path(key), "rb");
++    auto drop = [&] {   // closed first: Windows does not delete an open file
++        if (r.f) std::fclose(r.f);
++        r.f = nullptr;
++        erase(key);
++    };
++    SavedConversation m;
++    std::vector<ConversationKvSizes> sizes;
++    bool cvec = true;
++    if (!r.f || !get_head(r, o_.identity, m.live.ids, cvec) || !get_meta(r, m, sizes) || m.live.ids != e->ids ||
++        cvec != e->cvec) {
++        error = "prefix cache: unreadable snapshot file";
++        drop();
++        return ConversationRestore::invalid;
++    }
++    m.cvec = cvec;
++    size_t bytes = m.live.bytes() + m.kv.size() * sizeof(ConversationKv);
++    for (const auto& z : sizes) for (size_t n : z) bytes += n;
++    // the RAM tier when it has room and the machine has the memory; else straight from the file
++    if (trim_ram(bytes) && conversation_memory_admit(conversation_available_memory(), bytes, o_.min_free)) {
++        try {
++            auto image = std::make_shared<SavedConversation>(std::move(m));
++            bool ok = true;
++            for (size_t i = 0; ok && i < image->kv.size(); ++i) {
++                auto& k = image->kv[i];
++                ConversationBuffer* parts[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
++                for (size_t j = 0; ok && j < 5; ++j) {
++                    parts[j]->resize(sizes[i][j]);
++                    ok = parts[j]->visit(0, sizes[i][j], [&](uint8_t* p, size_t n, size_t) { return r.get(p, n); });
++                }
++            }
++            if (!ok) {
++                error = "prefix cache: reading the snapshot file failed";
++                drop();
++                return ConversationRestore::invalid;
++            }
++            source = "disk>ram";
++            const auto result = conversation_snapshot_restore(*image, ss, g, draft, error);
++            if (result == ConversationRestore::invalid) { drop(); return result; }
++            e->ram_bytes = image->bytes();
++            e->ram = std::move(image);
++            return result;
++        } catch (const std::bad_alloc&) {
++            error = "prefix cache: no memory to read the snapshot";
++            return ConversationRestore::invalid;   // nothing written yet: read the prompt instead
++        }
++    }
++    source = "disk";
++    std::vector<uint8_t> bounce;
++    try { bounce.resize(o_.bounce); } catch (const std::bad_alloc&) {
++        error = "prefix cache: no memory for the read buffer";
++        return ConversationRestore::invalid;
++    }
++    const auto result = conversation_prefix_restore_stream(m, sizes, ss, g, draft, bounce,
++                                                           [&](uint8_t* p, size_t n) { return r.get(p, n); }, error);
++    if (result == ConversationRestore::invalid) drop();
++    return result;
++}
++
++} // namespace strata::core
+diff --git a/src/core/prefix_store_test.cpp b/src/core/prefix_store_test.cpp
+new file mode 100644
+index 0000000..1bf6acc
+--- /dev/null
++++ b/src/core/prefix_store_test.cpp
+@@ -0,0 +1,234 @@
++#include "strata/core/prefix_store.hpp"
++#include "strata/kernels/kv_q4.hpp"
++#include <cuda_runtime.h>
++
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <iterator>
++#include <string>
++#include <limits>
++#include <vector>
++
++using namespace strata::core;
++using namespace strata::kernels;
++
++namespace {
++int checks = 0;
++void check(bool ok, const char* label) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
++}
++void cuda_check(cudaError_t e) {
++    if (e != cudaSuccess) { std::fprintf(stderr, "CUDA: %s\n", cudaGetErrorString(e)); std::exit(1); }
++}
++struct Fixture {
++    ModelGeometry g;
++    QsaState state;
++    std::vector<void*> device, host;
++    std::array<void*,5> sources{};
++    std::array<size_t,5> sizes{};
++
++    template<class T> void alloc(T*& p, size_t n, bool pinned = false) {
++        if (!n) return;
++        void* raw = nullptr;
++        if (pinned) {
++            cuda_check(cudaHostAlloc(&raw, n, cudaHostAllocMapped));
++            host.push_back(raw);
++            void* mapped = nullptr;
++            cuda_check(cudaHostGetDevicePointer(&mapped, raw, 0));
++            p = static_cast<T*>(mapped);
++        } else {
++            cuda_check(cudaMalloc(&raw, n)); device.push_back(raw); p = static_cast<T*>(raw);
++        }
++    }
++    Fixture(int fmt, int mode) {
++        auto& st = state;
++        st.kv_mode = mode; st.kv_int8 = fmt==kKvInt8; st.kv_q4 = fmt==kKvQ4; st.kv_hybrid = fmt==3;
++        st.n_pages = 24; st.n_slots = mode ? 4 : st.n_pages;
++        st.max_cells = st.n_pages * 4; st.idx_pooled_rows = mode==2 ? 2 : st.max_cells/4+2;
++        const size_t per = fmt==kKvQ4 ? kv_q4_bytes_per_head((int)g.head_dim) : g.head_dim*((st.kv_int8 || st.kv_hybrid) ? 1:2);
++        const size_t rows = st.max_cells*g.n_head_kv, slot_rows = st.n_slots*4*g.n_head_kv;
++        sizes = {rows*per, rows*per, fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0,
++                 fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0, (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
++        if (fmt==3) {
++            sizes = {rows*per, rows*kv_q4_bytes_per_head((int)g.head_dim), rows*(g.head_dim/64)*2, 0,
++                     (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
++            alloc(st.k_q,sizes[0]); alloc(st.v_q4,sizes[1]); alloc(st.k_scale,sizes[2]);
++            sources[0]=st.k_q; sources[1]=st.v_q4; sources[2]=st.k_scale;
++        } else if (fmt==kKvQ4) {
++            alloc(st.k_q4,slot_rows*per); alloc(st.v_q4,slot_rows*per);
++            if (mode) {alloc(st.host.k_q4,sizes[0],true); alloc(st.host.v_q4,sizes[1],true);}
++            sources[0]=mode?st.host.k_q4:st.k_q4; sources[1]=mode?st.host.v_q4:st.v_q4;
++        } else if (fmt==kKvInt8) {
++            alloc(st.k_q,slot_rows*per); alloc(st.v_q,slot_rows*per);
++            alloc(st.k_scale,slot_rows*(g.head_dim/64)*2); alloc(st.v_scale,slot_rows*(g.head_dim/64)*2);
++            if (mode) {
++                alloc(st.host.k_q,sizes[0],true); alloc(st.host.v_q,sizes[1],true);
++                alloc(st.host.k_scale,sizes[2],true); alloc(st.host.v_scale,sizes[3],true);
++            }
++            sources[0]=mode?st.host.k_q:st.k_q; sources[1]=mode?st.host.v_q:st.v_q;
++            sources[2]=mode?st.host.k_scale:st.k_scale; sources[3]=mode?st.host.v_scale:st.v_scale;
++        } else {
++            alloc(st.k_pool,slot_rows*per); alloc(st.v_pool,slot_rows*per);
++            if (mode) {alloc(st.host.k_pool,sizes[0],true); alloc(st.host.v_pool,sizes[1],true);}
++            sources[0]=mode?st.host.k_pool:st.k_pool; sources[1]=mode?st.host.v_pool:st.v_pool;
++        }
++        alloc(st.idx_pooled,sizes[4]); sources[4]=st.idx_pooled;
++        alloc(st.page_table,st.n_pages*4);
++        if (mode==1) {
++            auto& m=st.map;
++            m.page_table=st.page_table; m.n_blocks=st.n_pages; m.n_slots=st.n_slots;
++            alloc(m.slot_block,st.n_slots*4); alloc(m.slot_stamp,st.n_slots*4); alloc(m.slot_ref,st.n_slots*4);
++            alloc(m.miss_block,st.n_slots*4); alloc(m.miss_slot,st.n_slots*4); alloc(m.ctl,kKvCtlInts*4);
++        } else if (mode==2) {
++            kv_ring_table(st.page_table,st.n_pages,st.n_slots,nullptr);
++        }
++    }
++    void fill(uint8_t salt) {
++        for (size_t i=0;i<sources.size();++i) {
++            std::vector<uint8_t> data(sizes[i]);
++            for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
++            if (!data.empty()) cuda_check(cudaMemcpy(sources[i],data.data(),data.size(),cudaMemcpyDefault));
++        }
++    }
++    void fill_after(uint8_t salt, int64_t first_dirty) {
++        for (size_t i=0;i<sources.size();++i) {
++            const size_t offset = i == 4 ? size_t(first_dirty/4)*g.idx_key_dim*4
++                                         : (sizes[i]/size_t(state.max_cells))*size_t((first_dirty/4)*4);
++            if (sizes[i] > offset)
++                cuda_check(cudaMemset(static_cast<uint8_t*>(sources[i])+offset, salt, sizes[i]-offset));
++        }
++    }
++    ~Fixture() { for (void* p:device) cudaFree(p); for (void* p:host) cudaFreeHost(p); }
++};
++bool equal(const ConversationKv& a,const ConversationKv& b) {
++    return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
++}
++bool same_state(const SavedConversation& a,const SavedConversation& b) {
++    if (a.kv.size()!=b.kv.size() || a.live.ids!=b.live.ids) return false;
++    for (size_t i=0;i<a.kv.size();++i) if (!equal(a.kv[i],b.kv[i])) return false;
++    return a.live.gdn==b.live.gdn && a.live.ple==b.live.ple && a.live.tails==b.live.tails &&
++           a.live.dead==b.live.dead && a.live.block_pos==b.live.block_pos;
++}
++
++// docs/DETAILS.md: a prefix saved from a session that holds more than it comes back byte for byte by every
++// path (streamed from the file, read into RAM, from RAM), the index survives a restart, and files of another
++// identity, over the disk budget or cut short are dropped.
++void prefix_session(int fmt, int mode, const std::string& dir) {
++    namespace fs = std::filesystem;
++    fs::remove_all(dir);
++    Fixture main(fmt,mode), draft(fmt==3?kKvInt8:fmt,2);
++    auto& g=main.g;
++    g.n_layers=4; g.n_expert=256;
++    g.ssm_state_size=2; g.ssm_v_heads=2; g.ssm_conv_channels=8;
++    SessionState ss;
++    ss.max_cells=96; ss.qsa_states=&main.state;
++    ss.layer_hi=g.n_layers; ss.gdn_alloc=g.n_gdn_layers(); ss.qsa_alloc=g.n_qsa_layers();
++    std::string err,log,source;
++    ConversationStateSizes sizes;
++    check(conversation_state_sizes(g,sizes,err),"geometry sizes");
++    main.alloc(ss.gdn_state,sizes.gdn); main.alloc(ss.ple_hist,sizes.ple);
++    main.alloc(main.state.idx_tail,sizes.tail); main.alloc(main.state.idx_dead,sizes.dead);
++    main.alloc(main.state.idx_block_pos,sizes.block_pos);
++    std::vector<int32_t> ids(65);
++    for (size_t i=0;i<ids.size();++i) ids[i]=(int32_t)i+1;
++    auto fill=[&](uint8_t salt) {
++        main.fill(salt); draft.fill(salt);
++        for (const auto& [p,n] : std::vector<std::pair<void*,size_t>>{
++                 {ss.gdn_state,sizes.gdn},{ss.ple_hist,sizes.ple},{main.state.idx_tail,sizes.tail},
++                 {main.state.idx_dead,sizes.dead},{main.state.idx_block_pos,sizes.block_pos}})
++            cuda_check(cudaMemset(p,salt,n));
++        cuda_check(cudaDeviceSynchronize());
++    };
++    const std::vector<ConversationImageKey> none;
++    const std::vector<ConversationCheckpoint> no_checks;
++    // the state at a root of `L` tokens, as a whole-session image: what a restore must reproduce
++    auto at_root=[&](uint8_t salt,int64_t L,ConversationCheckpoint& root,SavedConversation& ref) {
++        fill(salt);
++        root={}; root.ids.assign(ids.begin(),ids.begin()+L);
++        check(conversation_checkpoint_save(root,ss,g,err),"save root checkpoint");
++        check(conversation_checkpoint_restore(root,ss,g,err),"root spare row");
++        const ConversationView view{root.ids,none,no_checks,true};
++        check(conversation_snapshot_save(ref,view,ss,g,draft.state,err),"reference image");
++        fill(salt);   // the session goes on past the root
++    };
++    auto restored=[&](const SavedConversation& ref) {
++        SavedConversation now;
++        const ConversationView view{ref.live.ids,none,no_checks,true};
++        cuda_check(cudaDeviceSynchronize());
++        check(conversation_snapshot_save(now,view,ss,g,draft.state,err),"read back");
++        return same_state(now,ref);
++    };
++    PrefixStore::Options o;
++    o.dir=dir; o.identity="engine A"; o.disk_budget=size_t(1)<<30; o.bounce=4096;   // many chunks per payload
++    ConversationCheckpoint root;
++    SavedConversation ref;
++    at_root(13,40,root,ref);
++    {
++        PrefixStore store;
++        check(store.open(o,log,err) && store.size()==0,"open empty directory");
++        check(store.capture(root,true,ss,g,draft.state,log,err) && store.size()==1,"capture straight to disk");
++        check(store.contains(root.ids,true) && !store.contains(root.ids,false),"cvec is part of the identity");
++        check(store.best(ids,true).tokens==40 && store.best(ids,false).tokens==0,"longest prefix match");
++        check(store.best(root.ids,true).tokens==0,"never the whole prompt");
++        fill(177);
++        check(store.restore(store.best(ids,true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
++              source=="disk","no RAM budget: streamed from the file");
++        check(restored(ref),"streamed restore is exact");
++    }
++    o.ram_budget=size_t(1)<<30;
++    {
++        PrefixStore store;
++        check(store.open(o,log,err) && store.size()==1,"the index survives a restart");
++        const auto key=store.best(ids,true).key;
++        fill(91);
++        check(store.restore(key,ss,g,draft.state,source,err)==ConversationRestore::restored && source=="disk>ram",
++              "read into the RAM tier");
++        check(restored(ref) && store.ram_bytes()>0,"exact through the RAM tier");
++        fill(92);
++        check(store.restore(key,ss,g,draft.state,source,err)==ConversationRestore::restored && source=="ram",
++              "then from RAM");
++        check(restored(ref),"exact from RAM");
++        // a disk budget for one: the second prefix pushes out the least recently used
++        ConversationCheckpoint root2;
++        SavedConversation ref2;
++        at_root(29,20,root2,ref2);
++        PrefixStore::Options one=o;
++        one.disk_budget=store.disk_bytes()+store.disk_bytes()/4;
++        PrefixStore small;
++        check(small.open(one,log,err) && small.size()==1,"reopen with a small budget");
++        check(small.capture(root2,true,ss,g,draft.state,log,err) && small.size()==1 &&
++              small.best(ids,true).tokens==20,"the older prefix leaves for the newer");
++        fill(93);
++        check(small.restore(small.best(ids,true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
++              restored(ref2),"the newer prefix restores");
++    }
++    {
++        PrefixStore::Options other=o;
++        other.identity="engine B";
++        PrefixStore store;
++        check(store.open(other,log,err) && store.size()==0,"another engine or model deletes the files");
++        check(std::distance(fs::directory_iterator(dir),fs::directory_iterator{})==0,"and nothing is left");
++        check(store.capture(root,true,ss,g,draft.state,log,err),"capture again");
++    }
++    {
++        PrefixStore::Options other=o;
++        other.identity="engine B";
++        for (const auto& d : fs::directory_iterator(dir)) fs::resize_file(d.path(),fs::file_size(d.path())-1);
++        PrefixStore store;
++        check(store.open(other,log,err) && store.size()==0,"a file cut short is dropped");
++    }
++    fs::remove_all(dir);
++}
++}
++
++int main() {
++    int devices=0;
++    if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
++    const std::string dir=(std::filesystem::temp_directory_path()/"strata_prefix_store_test").string();
++    for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) prefix_session(fmt,mode,dir);
++    prefix_session(3,0,dir);
++    std::printf("prefix_store_test: %d checks passed\n",checks);
++}
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 600609f..27a54ee 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -18,6 +18,7 @@
+ #include "strata/core/remote_expert_opt.hpp"
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/conversation_snapshot.hpp"
++#include "strata/core/prefix_store.hpp"
+ #include "strata/core/conversation_memory.hpp"
+ #include "strata/core/coupled_draft.hpp"
+ #include "strata/core/expert_source.hpp"
+@@ -541,6 +542,10 @@ struct Options {
+     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
+     int conversation_cache_slots = 4;
+     int64_t conversation_cache_min_free_mib = 2560;
++    /// --serve: persistent prefix snapshots (docs/DETAILS.md): the state at the end of each system prompt, on disk
++    /// in this directory (empty = off) and the most recently used ones also in RAM
++    std::string prefix_cache_dir;
++    int64_t prefix_cache_ram_mib = 2048, prefix_cache_disk_mib = 51200;
+     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
+     int64_t prompt_cache_every = 16384;
+     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
+@@ -661,6 +666,10 @@ void usage() {
+                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
+                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
++                 "  --prefix-cache-dir DIR  --serve: keep the state at the end of each system prompt in DIR, so a new\n"
++                 "                       chat with it reads only the rest (default off; one GPU, no --batch)\n"
++                 "  --prefix-cache-ram-mib N  --serve: of those, keep the latest in N MiB of RAM (default 2048)\n"
++                 "  --prefix-cache-disk-mib N  --serve: at most N MiB of them in DIR (default 51200)\n"
+                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
+                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
+                  "                       give VRAM back to other programs between requests and take it back later\n"
+@@ -1575,8 +1584,10 @@ int main(int argc, char** argv) {
+         else if (a == "--serve") o.serve = true;
+         else if (a == "--vision") o.vision = true;
+         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
++        else if (a == "--prefix-cache-dir") o.prefix_cache_dir = next("--prefix-cache-dir");
+         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
+-                 a == "--conversation-cache-min-free-mib") {
++                 a == "--conversation-cache-min-free-mib" || a == "--prefix-cache-ram-mib" ||
++                 a == "--prefix-cache-disk-mib") {
+             const std::string value = next(a.c_str());
+             int64_t number = 0;
+             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+@@ -1587,6 +1598,8 @@ int main(int argc, char** argv) {
+             }
+             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
+             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
++            else if (a == "--prefix-cache-ram-mib") o.prefix_cache_ram_mib = number;
++            else if (a == "--prefix-cache-disk-mib") o.prefix_cache_disk_mib = number;
+             else o.conversation_cache_slots = (int) number;
+         }
+         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+@@ -5660,6 +5673,25 @@ int main(int argc, char** argv) {
+         auto pm_main_whole = [&](std::string& e, int64_t cell_hi) -> bool {
+             return !prefill_main || !pm_stage_ahead || pm_sync(false, e, cell_hi);
+         };
++        // docs/DETAILS.md: one GPU without --batch; a build or model change makes the files unusable
++        strata::core::PrefixStore prefixes;
++        // --prefill-main: CUDA0's session holds every layer at rest, so its state is the whole model's, as on one GPU
++        if (!o.prefix_cache_dir.empty() && o.prompt_cache > 0 && (stages.empty() || prefill_main) && o.batch <= 0) {
++            strata::core::PrefixStore::Options po;
++            po.dir = o.prefix_cache_dir;
++            po.identity = std::string(STRATA_VERSION " " __DATE__ " " __TIME__) + "|" + o.pack + "|" +
++                          o.native_preset + "|" + o.mtp + "|" + o.kv + "|" +
++                          (std::getenv("STRATA_BF16_TC") ? std::getenv("STRATA_BF16_TC") : "");
++            po.ram_budget = (size_t) o.prefix_cache_ram_mib << 20;
++            po.disk_budget = (size_t) o.prefix_cache_disk_mib << 20;
++            po.min_free = (size_t) o.conversation_cache_min_free_mib << 20;
++            std::string log;
++            if (prefixes.open(po, log, err)) std::fprintf(stderr, "strata serve: prefix cache: %s\n", log.c_str());
++            else std::fprintf(stderr, "strata serve: prefix cache off: %s\n", err.c_str());
++            err.clear();
++        } else if (!o.prefix_cache_dir.empty()) {
++            std::fprintf(stderr, "strata serve: prefix cache off (it needs --prompt-cache, one GPU and no --batch)\n");
++        }
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+         auto park_current = [&](size_t held) -> bool {
+@@ -7345,9 +7377,20 @@ int main(int argc, char** argv) {
+                         }
+                 }
+             const auto parked = conversations.best(ids, req_imgs, want_cvec);
++            // docs/DETAILS.md: a saved system prompt, when it covers more of this prompt than the session or a
++            // slot holds, and at least as much as a parked conversation - taking that one would leave it to read
++            // its whole history again on its next turn
++            strata::core::PrefixStore::Match prefix;
++            if (prefixes.enabled() && o.prompt_cache > 0) {
++                const auto m = prefixes.best(ids, want_cvec);
++                if (m.tokens > std::max(resume, slot_tokens) && m.tokens >= parked.tokens &&
++                    imgs_below(req_imgs, m.tokens).empty())
++                    prefix = m;
++            }
+             std::optional<strata::core::SavedConversation> incoming;
+-            if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+-            if (incoming) slot_source = -1;
++            if (prefix.tokens == 0 && parked.tokens > std::max(resume, slot_tokens))
++                incoming.emplace(conversations.take(parked.index));
++            if (incoming || prefix.tokens > 0) slot_source = -1;
+             // Reject the entire image before parking/overwriting the outgoing
+             // state. Invalid entries can safely fall back to its existing prefix.
+             const size_t n_park = prefill_main ? 0 : stages.size();   // local: images per parked conversation
+@@ -7374,7 +7417,8 @@ int main(int argc, char** argv) {
+             }
+             // Preserve the outgoing branch before any checkpoint rewind, reset,
+             // or incoming restore overwrites the positional state it requires.
+-            if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
++            if ((!from_live || incoming || slot_source >= 0 || prefix.tokens > 0) &&
++                !park_current(incoming ? incoming->bytes() : 0)) {
+                 std::printf("ERR %s\n", err.c_str());
+                 return 1;
+             }
+@@ -7479,6 +7523,46 @@ int main(int argc, char** argv) {
+                     return 1;
+                 }
+             }
++            if (prefix.tokens > 0) {
++                const auto t0 = Clock::now();
++                std::string source;
++                const auto r = prefixes.restore(prefix.key, ss, g, mtp.kv_state(), source, err);
++                conversations.limit_reuse(0);   // retained K/V pages no longer match the cells
++                ConvCheckpoint root;
++                root.ids.assign(ids.begin(), ids.begin() + prefix.tokens);
++                if (r == strata::core::ConversationRestore::restored && checkpoint_save(root, ss, g)) {
++                    root.used = ++check_clock;
++                    live = root.ids;
++                    live_imgs.clear();
++                    checks.clear();
++                    checks.push_back(std::move(root));   // the chain's root again, as if this chat had read it
++                    cvec_cached = want_cvec;
++                    resume = prefix.tokens;
++                    from_live = true;
++                    pm_synced = 0;   // --prefill-main: the stage's copy is replaced whole
++                    if (prefill_main && !pm_sync(true, err, resume)) {
++                        std::printf("ERR restoring a saved system prompt: %s\n", err.c_str());
++                        return 1;
++                    }
++                    std::fprintf(stderr, "strata serve: prefix cache: restored %lld tokens (%s) in %.1f ms\n",
++                                 (long long) resume, source.c_str(),
++                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
++                } else {
++                    // invalid: nothing was written, what the session holds still stands; otherwise it may be
++                    // half written, so this prompt is read from the start
++                    std::fprintf(stderr, "strata serve: prefix cache: not restored (%s)%s\n",
++                                 err.empty() ? "running state" : err.c_str(),
++                                 r == strata::core::ConversationRestore::invalid ? "" : "; reading the whole prompt");
++                    if (r != strata::core::ConversationRestore::invalid) {
++                        live.clear();
++                        live_imgs.clear();
++                        checks.clear();
++                        resume = 0;
++                        from_live = false;
++                    }
++                }
++                err.clear();
++            }
+             if (want_cvec != cvec_cached) {
+                 live_ok = false;
+                 checks.clear();
+@@ -9205,6 +9289,24 @@ int main(int argc, char** argv) {
+                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
+                         (long long) req_offload);
+             std::fflush(stdout);
++            // docs/DETAILS.md: the first time a system prompt is read whole, the state at its end (the chain's
++            // root) goes to the prefix cache - after DONE, so the client does not wait for it
++            if (prefixes.enabled() && live_ok && o.turn_token >= 0 && o.prompt_cache_root > 0) {
++                int64_t root_at = -1;
++                for (size_t i = 1; i < live.size(); ++i)
++                    if (live[i] == o.turn_token) { root_at = (int64_t) i; break; }
++                if (root_at >= o.prompt_cache_root && imgs_below(live_imgs, root_at).empty())
++                    for (const ConvCheckpoint& c : checks)
++                        if ((int64_t) c.ids.size() == root_at && !prefixes.contains(c.ids, cvec_cached)) {
++                            std::string log;
++                            if (prefixes.capture(c, cvec_cached, ss, g, mtp.kv_state(), log, err))
++                                std::fprintf(stderr, "strata serve: prefix cache: %s\n", log.c_str());
++                            else
++                                std::fprintf(stderr, "strata serve: prefix cache: save failed (%s)\n", err.c_str());
++                            err.clear();
++                            break;
++                        }
++            }
+             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
+                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
+                             (int64_t) live.size() == p;
