@@ -324,3 +324,26 @@ Real use on the shipped config (an agent session from another machine, one eveni
 growing from 160K to 204K tokens read 21-3,578 new tokens in 0.2-3.7 s, decode 124-190 tok/s; full
 re-reads of 147K-176K tokens ran at 3,670-3,830 tok/s (39-50 s); these happened only when a second
 conversation ran in between and the long one (snapshot 3.3-3.8 GB) could not park in 3 GB.
+
+### Depth table on the shipped config (2026-10-06)
+
+`tools/depth_bench.py` as above, same corpus (Strata's source, now with patches 16-25), on the server
+under its normal load; run in two parts (2K-62K, then 92K-260K) because the first run was stopped at
+92K by a memory-pressure guard in the client tooling, not the server.
+
+| depth | prefill | prefill, headroom 14 (2026-10-05) | decode |
+| --- | --- | --- | --- |
+| 2K | 516 tok/s | 579 tok/s | 156 tok/s |
+| 32K | 3,048 tok/s | 1,742 tok/s | 141 tok/s |
+| 62K | 3,982 tok/s | 2,503 tok/s | 136 tok/s |
+| 92K | 3,826 tok/s | 2,727 tok/s | 136 tok/s |
+| 122K | 2,366 tok/s | 2,792 tok/s | 133 tok/s |
+| 152K | 2,614 tok/s | 2,727 tok/s | 128 tok/s |
+| 182K | 3,163 tok/s | 3,116 tok/s | 136 tok/s |
+| 212K | 3,117 tok/s | 3,131 tok/s | 132 tok/s |
+| 242K | 2,707 tok/s | 3,169 tok/s | 127 tok/s |
+| 260K | 3,045 tok/s | 3,269 tok/s | 128 tok/s |
+
+The 260K prompt was read in 85.3 s (79.5 at headroom 14). Headroom 4 wins clearly up to 92K and
+not past it: chunks of the longest prompts borrow beyond what locked RAM covers in both configs, and
+with about 1 GB available the engine pays more page faults. Decode is unchanged.

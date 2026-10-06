@@ -11,7 +11,7 @@ A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the 47 GB expert file.
 
 - **Upstream Strata v0.1.39** plus 25 patches: Hardin22's two-GPU PRs, twelve other open PRs, four of our own
-- **179 tok/s decode**, prompts up to **3,750 tok/s**: 175K tokens of a real agent chat read in **47 s**
+- **179 tok/s decode**, prompts up to **3,982 tok/s**, a 260K-token prompt read in **85 s**
 - Decode never touches the SSD: the experts no card holds sit page-locked in RAM
 - Switching between conversations restores the parked one in **0.5-1 s**
 - A new chat with a system prompt seen before restores it from disk instead of reading it (**0.6 s** vs 11.7 s for 20K tokens)
@@ -52,22 +52,24 @@ tokens takes 47 s.
 
 Fresh prompt of real text at each depth, then a 256-token answer (greedy, thinking off, `tools/depth_bench.py`):
 
-| depth | prefill | decode |
-| ---: | ---: | ---: |
-| 2K | 579 tok/s | 154 tok/s |
-| 32K | 1,742 tok/s | 146 tok/s |
-| 62K | 2,503 tok/s | 138 tok/s |
-| 92K | 2,727 tok/s | 145 tok/s |
-| 122K | 2,792 tok/s | 141 tok/s |
-| 152K | 2,727 tok/s | 129 tok/s |
-| 182K | 3,116 tok/s | 130 tok/s |
-| 212K | 3,131 tok/s | 129 tok/s |
-| 242K | 3,169 tok/s | 121 tok/s |
-| 260K | 3,269 tok/s | 136 tok/s |
+| depth | prefill | prefill, headroom 14 (2026-10-05) | decode |
+| ---: | ---: | ---: | ---: |
+| 2K | 516 tok/s | 579 tok/s | 156 tok/s |
+| 32K | 3,048 tok/s | 1,742 tok/s | 141 tok/s |
+| 62K | 3,982 tok/s | 2,503 tok/s | 136 tok/s |
+| 92K | 3,826 tok/s | 2,727 tok/s | 136 tok/s |
+| 122K | 2,366 tok/s | 2,792 tok/s | 133 tok/s |
+| 152K | 2,614 tok/s | 2,727 tok/s | 128 tok/s |
+| 182K | 3,163 tok/s | 3,116 tok/s | 136 tok/s |
+| 212K | 3,117 tok/s | 3,131 tok/s | 132 tok/s |
+| 242K | 2,707 tok/s | 3,169 tok/s | 127 tok/s |
+| 260K | 3,045 tok/s | 3,269 tok/s | 128 tok/s |
 
-Measured 2026-10-05 with the abliterated build of the same GGUF (same quant format and tensor types), with
-the lend headroom at 14 GiB. The shipped headroom of 4 GiB reads 27K-36K prompts about 70% faster
-(1,643 -> 2,840 tok/s); this table has not been re-run with it.
+Measured 2026-10-06 on the shipped config (headroom 4). From 32K to 92K prompts read 40-75% faster than with
+headroom 14; past that the two are within noise of each other or a little slower (the 260K prompt took
+85.3 s against 79.5), because those prompts borrow more slots than locked RAM covers either way and the
+engine has less RAM to work with.
+
 Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Requirements
