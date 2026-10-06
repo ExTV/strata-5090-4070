@@ -6,12 +6,14 @@ Why each piece is there, in the order the problems appeared. Hardware: RTX 5090 
 
 ## The model and Strata's layout
 
-Qwen3.8-Flash-Next is a 48-layer MoE with 128 experts per layer, 4 active, plus a PLE table. The
+Qwen3.8-Flash-Next is a 48-layer MoE with 512 experts per layer, 10 routed plus 1 shared per token,
+plus a PLE table. The
 ISTA GSQ-RCO IQ3_XXS GGUF is 76 GB: 47 GB of experts in shard 1, 28.8 GB of PLE in shard 2. Strata
 keeps a dense pack (attention, norms, embeddings, 1.5 GB) and an expert cache in VRAM, and reads
 the experts it does not have from the GGUF, which is mmap'd (`--mmap-experts`), through a CPU
-pool of 19 workers. The 5090's expert cache holds 15,233 expert pairs (23.86 GiB) and the 4070's
-5,217 (9.49 GiB) for its 12 layers. KV is int8 with 32,768 cells per attention layer resident in
+pool of 19 workers. On stock 0.1.33 the 5090's expert cache held 15,233 expert pairs (23.86 GiB) and
+the 4070's 5,217 (9.49 GiB) of the 6,144 in its 12 layers; since the fork's per-card weights (below)
+the 4070 holds all 6,144. KV is int8 with 32,768 cells per attention layer resident in
 VRAM and the rest in 3 GB of pinned RAM (`--kv int8 --kv-resident 32768`). The MTP drafter
 (`--spec 4`, the base model's head packed to Q2_0) runs on the last stage.
 
@@ -19,8 +21,8 @@ VRAM and the rest in 3 GB of pinned RAM (`--kv int8 --kv-resident 32768`). The M
 
 With `--layer-split`, CUDA0 runs layers 0-35 and CUDA1 layers 36-47 plus the head and the drafter.
 Splits 35 to 39 were swept on stock 0.1.33 with the same 80K-prompt bench: 36 had the best decode
-(109 median), 38 the best prefill (+33%) at -14% decode. The 4070 cannot cache all 6,144 pairs of
-12 layers (5,217 fit), so moving layers off it helps prompts and hurts decode. 36 is the decode
+(109 median), 38 the best prefill (+33%) at -14% decode. On that build the 4070 could not cache all 6,144
+pairs of 12 layers (5,217 fit), so moving layers off it helped prompts and hurt decode. 36 is the decode
 pick; prompts were fixed another way.
 
 ## The prompt bottleneck and `--prefill-main`
@@ -51,8 +53,10 @@ chats restores it instead of re-reading it, but refuses the option with `--layer
 `--prefill-main` the whole state exists on CUDA0 right after any prompt, so the port parks CUDA0's
 session (after syncing the stage's layers into it) and, on restore, copies the stage's layers back
 to CUDA1. Two conversations of 30K and 15K alternating for four rounds: every answer correct,
-switches 0.6-1.2 s. A snapshot is 0.8-1.7 GB per 30K tokens; the budget is 6 GB / 8 slots, which
-holds two long conversations (a phone and a desktop client, say).
+switches 0.6-1.2 s. A snapshot is 0.8-1.7 GB per 30K tokens (about 19.5 KB per token at 200K). The shipped budget is
+3 GB / 8 slots (6 GB until 2026-10-06, see the last section): it holds conversations up to about 160K
+tokens; a longer one is not parked, and going back to it after another chat re-reads it (~47 s at
+175K).
 
 ## Why PR #439 is left out
 
