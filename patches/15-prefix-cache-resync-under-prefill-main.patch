@@ -1,0 +1,16 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 07d1d2c..711ad89 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -8716,6 +8716,11 @@ int main(int argc, char** argv) {
+                     cvec_cached = want_cvec;
+                     resume = prefix.tokens;
+                     from_live = true;
++                    pm_synced = 0;   // --prefill-main: the stage's copy is replaced whole
++                    if (prefill_main && !pm_sync(true, err, resume)) {
++                        std::printf("ERR restoring a saved system prompt: %s\n", err.c_str());
++                        return 1;
++                    }
+                     std::fprintf(stderr, "strata serve: prefix cache: restored %lld tokens (%s) in %.1f ms\n",
+                                  (long long) resume, source.c_str(),
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());

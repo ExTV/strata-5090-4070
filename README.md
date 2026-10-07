@@ -10,10 +10,12 @@
 A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific box:
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the 47 GB expert file.
 
-- **Upstream Strata v0.1.39** plus 25 patches: Hardin22's two-GPU PRs, twelve other open PRs, four of our own
-- **179 tok/s decode**, prompts up to **3,982 tok/s**, a 260K-token prompt read in **85 s**
+- **Upstream Strata v0.1.40.1** plus 20 patches: ten open upstream PRs and our own work
+- **190-205 tok/s decode**, prompts up to **4,040 tok/s**, a 260K-token prompt read in **83 s**
 - Decode never touches the SSD: the experts no card holds sit page-locked in RAM
-- Switching between conversations restores the parked one in **0.5-1 s**
+- Switching between conversations restores the parked one in **0.2-1.6 s**; a 200K conversation too big
+  to park goes to the SSD and comes back in **3 s** instead of a 47 s re-read
+- The image encoder runs on the 4070, so the 5090 keeps more experts
 - A new chat with a system prompt seen before restores it from disk instead of reading it (**0.6 s** vs 11.7 s for 20K tokens)
 - Agent-friendly: a 2.7K-token tool result is answered in **3.6 s**; three tool-call shapes fixed, merged tool turns split
 - OpenAI and Anthropic compatible API on `:8888`, images on
@@ -22,7 +24,7 @@ a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the 47 GB exp
 
 ```bash
 git clone https://github.com/ExTV/strata-5090-4070.git && cd strata-5090-4070
-./install.sh                    # clone Strata v0.1.39, apply patches, build engine + vision helper, venv
+./install.sh                    # clone Strata v0.1.40.1, apply patches, build engine + vision helper, venv
 # download the model (step 2 below), then:
 ./prepare.sh                    # dense pack + MTP drafter
 launchers/flash-next-262k.sh    # serves http://127.0.0.1:8888/v1
@@ -36,49 +38,54 @@ launchers/flash-next-262k.sh    # serves http://127.0.0.1:8888/v1
 
 | | stock Strata 0.1.33, split 36 | this repo |
 | --- | --- | --- |
-| decode, 600-token answers, greedy | 99-111 tok/s | **179 tok/s** |
-| 2K fresh prompt | 200-240 tok/s | **492-565 tok/s** |
-| 16K fresh prompt | 470-646 tok/s | **2,020 tok/s** |
-| 27K fresh prompt of real text | | **2,842 tok/s** (9.5 s) |
-| 80K fresh prompt | 886-928 tok/s | **2,743 tok/s** |
-| tool results of 1.6K / 2.9K / 4.2K tokens | | **3.4 / 3.6 / 4.0 s** |
-| switching between two chats (30K and 15K) | 20-48 s (full re-read) | **0.5-1.1 s** |
+| decode, 600-token answers, greedy | 99-111 tok/s | **188-205 tok/s** |
+| 2K fresh prompt | 200-240 tok/s | **597-655 tok/s** |
+| 16K fresh prompt | 470-646 tok/s | **2,117-2,284 tok/s** |
+| 27K fresh prompt of real text | | **2,650-2,840 tok/s** (~10 s) |
+| 80K fresh prompt | 886-928 tok/s | **3,146-3,281 tok/s** |
+| 2K follow-up on the 80K chat | 7.9 s | **3.9-4.6 s** |
+| tool results of 1.2K / 2.5K / 5.3K tokens | | **3.1-3.5 / 3.2-3.3 / 3.9 s** |
+| switching between two chats (30K and 15K) | 20-48 s (full re-read) | **0.3-1.6 s** |
+| switching back to a 200K chat from a 5K one | ~47 s (full re-read) | **3.0-3.2 s** (from the SSD) |
 
-In real use (an agent chat that grew to 200K tokens): follow-up turns read only the new 20-1,200
-tokens and start answering in 0.2-3 s, decode stays at 124-190 tok/s, and a full re-read of 175K
-tokens takes 47 s.
+Measured 2026-10-07 on the shipped config. In real use the evening before (an agent chat that grew to
+200K tokens): follow-up turns read only the new 20-1,200 tokens and start answering in 0.2-3 s.
 
 ### By context depth
 
-Fresh prompt of real text at each depth, then a 256-token answer (greedy, thinking off, `tools/depth_bench.py`):
+Fresh prompt of real text at each depth, then a 256-token answer (greedy, thinking off, `tools/depth_bench.py`),
+each depth a new conversation:
 
-| depth | prefill | prefill, headroom 14 (2026-10-05) | decode |
-| ---: | ---: | ---: | ---: |
-| 2K | 516 tok/s | 579 tok/s | 156 tok/s |
-| 32K | 3,048 tok/s | 1,742 tok/s | 141 tok/s |
-| 62K | 3,982 tok/s | 2,503 tok/s | 136 tok/s |
-| 92K | 3,826 tok/s | 2,727 tok/s | 136 tok/s |
-| 122K | 2,366 tok/s | 2,792 tok/s | 133 tok/s |
-| 152K | 2,614 tok/s | 2,727 tok/s | 128 tok/s |
-| 182K | 3,163 tok/s | 3,116 tok/s | 136 tok/s |
-| 212K | 3,117 tok/s | 3,131 tok/s | 132 tok/s |
-| 242K | 2,707 tok/s | 3,169 tok/s | 127 tok/s |
-| 260K | 3,045 tok/s | 3,269 tok/s | 128 tok/s |
+| depth | prefill | the previous build (0.1.39, split 36) | decode | previous chat written to the SSD first |
+| ---: | ---: | ---: | ---: | ---: |
+| 2K | 553 tok/s | 516 tok/s | 170 tok/s | |
+| 32K | 2,911-3,939 tok/s | 3,048 tok/s | 159-165 tok/s | |
+| 62K | 4,040 tok/s | 3,982 tok/s | 150 tok/s | |
+| 92K | 4,018 tok/s | 3,826 tok/s | 151 tok/s | 0.7 s |
+| 122K | 3,924 tok/s | 2,366 tok/s | 149 tok/s | 0.9 s |
+| 152K | 3,766 tok/s | 2,614 tok/s | 142 tok/s | 1.2 s |
+| 182K | 3,741 tok/s | 3,163 tok/s | 140 tok/s | 6.8 s |
+| 212K | 3,393 tok/s | 3,117 tok/s | 147 tok/s | 9.3 s |
+| 242K | 3,552 tok/s | 2,707 tok/s | 139 tok/s | 13.2 s |
+| 260K | 3,127 tok/s | 3,045 tok/s | 140 tok/s | 18.9 s |
 
-Measured 2026-10-06 on the shipped config (headroom 4). From 32K to 92K prompts read 40-75% faster than with
-headroom 14; past that the two are within noise of each other or a little slower (the 260K prompt took
-85.3 s against 79.5), because those prompts borrow more slots than locked RAM covers either way and the
-engine has less RAM to work with.
+Measured 2026-10-07 on the shipped config; the 260K prompt is read in 83 s (85 s before). The last
+column is from the run before patch 20: back then a new conversation first wrote the one before it to
+the SSD, and on this 94%-full drive those writes slowed to 170-360 MB/s after the first few GB, so the
+260K prompt waited 18.9 s (102 s to its first token). Since patch 20 the write happens while the server
+is idle, 2 s after the previous answer, and the next conversation finds the file already there. Prefill
+above leaves the write out. The first 32K run, right after a quiet period, read at 1,933 tok/s.
 
 Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Requirements
 
 - **GPUs:** an RTX 5090 (or another 32 GB Blackwell card) plus a 16 GB NVIDIA card; the second one can sit on a chipset x1 slot.
-  The layer split (36) and the VRAM reserves are sized for exactly 32 + 16 GB.
+  The layer split (37) and the VRAM reserves are sized for exactly 32 + 16 GB.
 - **RAM:** 32 GB plus zram swap. With the model up, about 1-2 GB stays available and some engine memory
   sits in zram. Headless box: no RAM or VRAM is left for a desktop.
-- **Disk:** a fast NVMe with ~80 GB free for the model.
+- **Disk:** a fast NVMe with ~80 GB free for the model, plus up to 32 GB for conversations spilled to disk
+  (`--conversation-spill-mib`, default 32768; the oldest file goes first).
 - **Software:** Linux, NVIDIA driver, CUDA toolkit (`nvcc`), `cmake`, `ninja`, `git`, `patch`, Python 3.10+.
 
 ## Install
@@ -89,7 +96,7 @@ Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 ./install.sh
 ```
 
-- Clones upstream Strata at tag v0.1.39 into `./strata` and applies `patches/` in order
+- Clones upstream Strata at tag v0.1.40.1 into `./strata` and applies `patches/` in order
 - Builds the engine and the vision helper for sm_89 + sm_120, creates the venv
 - Checks the patched files against `patches/MANIFEST.sha256` (the tested tree)
 - Safe to re-run
@@ -129,36 +136,35 @@ launchers/flash-next-262k.sh
 
 ## What is in the patch series
 
-Each patch is one tested step, conflict resolutions included; applied to v0.1.39 they rebuild the tested tree byte for byte (patch 25 leaves out one PNG in upstream's docs).
+Each patch is one tested step, conflict resolutions included; applied to v0.1.40.1 they rebuild the tested tree byte for byte.
 
 | # | Source | What it does |
 | --- | --- | --- |
-| 01 | PR #848 | the page-locked RAM copy of the experts works with a layer split |
-| 02 | PR #859 | pipelined verify windows: the 5090 runs window K+1 while the 4070 verifies K |
-| 03 | PR #851 | AVX2 Q8_K quantizer |
-| 04 | PR #863 | CPU IQ kernels |
-| 05 | PR #547 | the prompt path borrows 1.25 GiB fewer expert slots per 32K chunk |
-| 06 | PR #567 | tokenise only the new turn of a conversation |
-| 07 | PR #510 | malformed tool arguments in history |
-| 08 | PR #572 | an unfinished tool call comes back as content |
-| 09 | PR #525 | a tool call stranded in an unclosed thinking span |
-| 10 | ours | `--prefill-main`: every prompt read on the 5090; conversation parking with a layer split |
-| 11 | ours | `STRATA_BLOB_PREAD=1`: one `pread` per cold expert instead of up to 500 page faults |
-| 12 | ours | `STRATA_RESIDENT_LEND=1`: experts the prompt path borrows stay in locked RAM on a split |
-| 13 | ours | split merged tool turns back into steps, so each step reads only the new result |
-| 14 | PRs #876 #905 #910 | asynchronous expert tier, pipelined decode, fork parity |
-| 15 | PR #904 | verify-window PDL and graph branches |
-| 16 | PR #904 (update) | `STRATA_DF_BRANCH` opt-in: graph branches plus NVML queries could stall a window on Linux |
-| 17 | PR #910 (update) | `STRATA_ATTN_MERGE_V2` opt-in |
-| 18 | PR #525 (update) | stranded-call rescue: opener must start a line outside a code fence, declared tools only |
-| 19 | PR #958 | the fused prompt layout shrinks MoE buffers only when every layer can take the fused path |
-| 20 | PR #1049 | the fused SwiGLU q8_1 quantizers keep scales finite |
-| 21 | PR #1043 | residency-table uploads finish before other streams read the table |
-| 22 | PR #1033 | short prompts gather GPU-resident experts in groups too |
-| 23 | PR #1050 | `STRATA_PREFILL_CPU_SHARE=auto` (off by default); ours: also under `--prefill-main` |
-| 24 | PR #960 | `--prefix-cache-dir`: system prompts saved to disk; ours: works under `--prefill-main` |
-| 25 | PR #934 | `--expert-cache-per-layer` (off: faster prompts, but decode 102 tok/s here) |
+| 01 | PR #1122 | the asynchronous expert tier together with pipelined verify windows (0.1.40 otherwise turns `--adapt-async` off with them) |
+| 02 | PR #1125 | AVX2 Q8_K quantizer for the CPU i-quant layers |
+| 03 | PR #547 | the prompt path borrows 1.25 GiB fewer expert slots per 32K chunk |
+| 04 | PR #567 | tokenise only the new turn of a conversation |
+| 05 | PR #572 | an unfinished tool call comes back as content |
+| 06 | ours | `--prefill-main`: every prompt read on the 5090; conversation parking with a layer split |
+| 07 | ours | `STRATA_BLOB_PREAD=1`: one `pread` per cold expert instead of up to 500 page faults |
+| 08 | ours | `STRATA_RESIDENT_LEND=1`: experts the prompt path borrows stay in locked RAM on a split |
+| 09 | ours | split merged tool turns back into steps, so each step reads only the new result |
+| 10 | PR #910 (parts) | bounded attention merge, `STRATA_MTP_KV`, pipelined decode with PLE prefetch (opt-in flags) |
+| 11 | PR #958 | the fused prompt layout shrinks MoE buffers only when every layer can take the fused path |
+| 12 | PR #1033 | short prompts gather GPU-resident experts in groups too |
+| 13 | PR #1050 | `STRATA_PREFILL_CPU_SHARE=auto` (off by default) |
+| 14 | PR #1090 | `--prefix-cache-dir`: system prompts saved to disk, keyed by the full config fingerprint |
+| 15 | ours | the prefix cache under `--prefill-main` (the stage resyncs after a restore) |
+| 16 | ours | merge fixes: two stray parentheses, one test updated for 0.1.40's prompt encoding |
+| 17 | ours | `--conversation-spill-dir`: a conversation the RAM cache cannot park goes to the SSD; the Monitor page shows it |
+| 18 | PR #1269 | a session file restores in 16 MiB blocks instead of being read into RAM whole |
+| 19 | ours | the spill restores through 18 |
+| 20 | ours | the spill is written while the engine is idle (a new request cancels it), and the files are deleted when the server stops |
 
+Already in v0.1.40.1, so no longer patches: the RAM copy on a layer split (#848), pipelined verify windows
+(#859), the asynchronous tier and pipelined decode (#876), CPU IQ kernels (#863), #510, #525 (and its
+stranded-call rescue, now built in), #934, #1043, #1049. Left out: #904 (verify-window PDL; conflicts
+with upstream's kernel rewrite, and decode is faster without it).
 PR #439 (batched expert gathers) is left out on purpose: under `--prefill-main` it deadlocks on long prompts.
 Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
 
@@ -166,10 +172,12 @@ Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
 
 | Setting | Why |
 | --- | --- |
-| `"layer_split": "36"` | layers 0-35 on the 5090, 36-47 + drafter on the 4070, which then holds every expert of its layers |
+| `"layer_split": "37"` | layers 0-36 on the 5090, 37-47 + drafter on the 4070, which holds every expert of its layers; 37 gives the 5090 1,063 more cached experts than 36 (38 tested: fewer, slower 2K prompts) |
+| `"vision": {"cuda_device": 1}` | the image encoder runs on the 4070 (1.28 GB there, 1.7 GB on the 5090), which is what makes room for split 37 |
 | `--prefill auto:32768` | fewer chunks per prompt, so the experts stream fewer times |
 | `--short-read 768` | new text up to 768 tokens goes through the decode windows (a 150-token message: 1.7 to 0.5 s) |
-| `--conversation-cache-mib 3072`, 8 slots | parked chats survive the small side requests chat apps send |
+| `--conversation-cache-mib 1024`, 8 slots | parked chats survive the small side requests chat apps send; kept small so the engine has RAM |
+| `--conversation-spill-dir conversation-spill` | a chat too big to park is written to the SSD (~16 KB per token) and read back from there |
 | `--conversation-cache-min-free-mib 1024` | the default floor (2,560) refuses every park at headroom 4 |
 | `--prefix-cache-dir prefix-cache` | a known system prompt is restored from disk (about 430 MB per 20K tokens) |
 | `STRATA_SPLIT_SMALL_OWN=3072` | reads up to 3K tokens keep 986 cache slots: faster tool steps, decode 193 to 176 |
@@ -178,13 +186,17 @@ Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
 | `MALLOC_MMAP_THRESHOLD_`, `MALLOC_ARENA_MAX` | about 0.7 GB more available RAM, speed-neutral |
 | `--kv int8` | the KV cache stays at 8 bits |
 
-Headroom 4 assumes nothing else runs on the box: about 6 GB of engine memory goes to zram, and roughly
-one tool step in nine stalls for a couple of seconds on page faults. Use 14 if you work on the
+Headroom 4 assumes nothing else runs on the box: about 3.5 GB of engine memory goes to zram (5.6-6.8 GB
+on the v0.1.39 build), and now and then a tool step stalls for a couple of seconds on page faults. Use 14 if you work on the
 desktop while it serves (prompts ~40% slower, refills 6 s).
 
-Parking 3072 MiB holds chats up to about 160K tokens (a snapshot is ~19.5 KB per token). A longer chat cannot park (its snapshot is
-3.3-3.7 GB), so if a second conversation or a client's side request runs in between, going back to the
-long chat re-reads it (~47 s for 175K). With 64 GB of RAM raise the parking budget to 6144 or more.
+Parking 1024 MiB holds chats up to about 50K tokens. Anything longer is written to the spill directory
+instead (a 200K chat is a 3.1 GB file, written in 1.6-2.5 s while the server is idle; a request that
+arrives meanwhile cancels the write), and the file is kept after it is read back,
+so the next switch reuses it while the chat is at most 8,192 tokens past it. Going back to a 200K chat
+takes 3 s instead of the 47 s re-read it cost before. The files belong to one server run: they are
+deleted when it stops and when it starts. With 64 GB of RAM raise the parking budget to 6144
+or more.
 
 ## Tools
 
@@ -198,13 +210,14 @@ All talk to `127.0.0.1:8888` unless `STRATA_URL` is set.
 | `tools/decode_after.py NAME` | decode right after a big prompt |
 | `tools/needle_followups.py` | 40K needle, four follow-ups, a 20K extension |
 | `tools/parking_check.py` | two alternating conversations: correctness and switch time |
+| `tools/spill_check.py` | a 200K and a 5K conversation alternating: the spill to disk and back |
 | `tools/merged_tool_turn.py` | a client that merges a turn's tool calls (`OLD_IDS=1` shows the re-reads patch 13 removes) |
 | `tools/spec_min_p_sweep.py NAME` | per-request drafter threshold A/B, no restart |
 | `tools/snapshot.py` | page faults, swap, direct reclaim, NVMe, GPU counters; diff them around a run |
 
 ## Status
 
-- The patch series is checked in CI against a pristine v0.1.39 checkout.
+- The patch series is checked in CI against a pristine v0.1.40.1 checkout.
 - `install.sh` and `prepare.sh` have not been run end to end from a clean checkout yet; reports welcome.
 
 ## License

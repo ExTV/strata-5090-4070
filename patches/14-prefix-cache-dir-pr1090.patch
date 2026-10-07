@@ -1,18 +1,18 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 0a8bd6b..a5d2b1c 100644
+index b82d99d..c085d57 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -427,7 +427,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+@@ -447,7 +447,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
      src/core/remote_expert_opt.cu
      src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
--    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp)
-+    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
++    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
 +    src/core/prefix_store.cpp)
    target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
    target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
-   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
-@@ -472,6 +473,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
+@@ -504,6 +505,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
      target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
      add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
      set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
@@ -24,18 +24,22 @@ index 0a8bd6b..a5d2b1c 100644
      target_link_libraries(conversation_validation_test PRIVATE strata_engine)
      add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
 diff --git a/docs/DETAILS.md b/docs/DETAILS.md
-index 802b63f..788d341 100644
+index c20067d..4d324da 100644
 --- a/docs/DETAILS.md
 +++ b/docs/DETAILS.md
-@@ -714,8 +714,25 @@ rather than permission to continue with partial state. Indexer spare keys and th
- moving spare row are preserved, including checkpoint rewinds.
+@@ -773,7 +773,7 @@ moving spare row are preserved, including checkpoint rewinds.
  The engine log reports parking, restoration, bytes, evictions, individual snapshot
  sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
--retention for diagnostic comparisons. Snapshots are not
--persisted across restarts.
-+retention for diagnostic comparisons. Parked snapshots are not
-+persisted across restarts (the prefix snapshots below are).
-+
+ retention for diagnostic comparisons. Parked snapshots are not
+-persisted across restarts; the session files below are.
++persisted across restarts; the session files and the prefix snapshots below are.
+ 
+ **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
+ restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
+@@ -887,6 +887,24 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one
+ `--rope-freq-base` refused the file and then answered; a save with a RAM floor above the machine's RAM was refused as
+ `memory` before any copy, the file it would have replaced untouched. The times are single runs.
+ 
 +**Prefix snapshots on disk (opt-in).** The system-prompt checkpoint above lives in the one K/V arena, so it is gone
 +once a request with another start comes in (a title request, a subagent, another client), and after every restart;
 +a parked conversation that holds it is taken out whole to lend it. `--prefix-cache-dir DIR` keeps it in a file
@@ -47,19 +51,21 @@ index 802b63f..788d341 100644
 +`--prefix-cache-disk-mib N` (default 51200) caps the directory, least recently used first;
 +`--prefix-cache-ram-mib N` (default 2048, 0 = disk only) also keeps the most recently used in RAM when
 +`--conversation-cache-min-free-mib` allows it - otherwise the file is streamed into the session through a 64 MB
-+buffer, so a full RAM never blocks it. Each file records the engine build, the pack, `--native`, `--mtp`, `--kv` and
-+`STRATA_BF16_TC`; a file that differs in any of them (a rebuilt engine included) is deleted at start-up, and every
++buffer, so a full RAM never blocks it. Each file records the engine build, the pack, `--native`, `--mtp`, `--kv`,
++`STRATA_BF16_TC` and the settings a session file is bound to (the rope scaling, `STRATA_KV_ROT`, the control vector,
++the arithmetic switches); a file that differs in any of them (a rebuilt engine included) is deleted at start-up, and every
 +restore is validated like a parked snapshot before anything is written. A restore that fails before writing keeps
 +what the session held; one that fails after reads the whole prompt instead. One GPU without `--batch` only. A file
 +is about 118 MB plus 12.4 KB per token with K8V4 (a 30,028-token system prompt: 490 MB).
- 
++
  **Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
  decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
+ re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
-index 1a56680..987dced 100644
+index 80b1de8..378bfd7 100644
 --- a/include/strata/core/conversation_snapshot.hpp
 +++ b/include/strata/core/conversation_snapshot.hpp
-@@ -4,7 +4,10 @@
+@@ -5,7 +5,10 @@
  #include "strata/core/layer.hpp"
  #include "strata/core/session.hpp"
  
@@ -70,9 +76,9 @@ index 1a56680..987dced 100644
  
  namespace strata::core {
  
-@@ -30,6 +33,25 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
- bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                             int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error);
+@@ -44,6 +47,25 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
+                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                       std::string& error);
  
 +// Streaming (prefix snapshots, docs/DETAILS.md): K/V moves between the session and a byte stream through
 +// `bounce` instead of a whole RAM image.  Payloads come in the order k, v, k_scale, v_scale, pooled, each the
@@ -96,7 +102,7 @@ index 1a56680..987dced 100644
  struct ConversationStateSizes {
      size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
  };
-@@ -93,4 +115,21 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
+@@ -113,4 +135,21 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
  ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
  
@@ -200,10 +206,10 @@ index 0000000..b09d9d2
 +
 +} // namespace strata::core
 diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
-index 759daa6..d413838 100644
+index 0ae7362..a3e77eb 100644
 --- a/src/core/conversation_snapshot.cpp
 +++ b/src/core/conversation_snapshot.cpp
-@@ -106,6 +106,8 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
+@@ -109,6 +109,8 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
      return true;
  }
  
@@ -212,7 +218,7 @@ index 759daa6..d413838 100644
  bool transfer(void* dst, const void* src, size_t n, std::string& error) {
      if (!n) return true;
      if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
-@@ -178,21 +180,27 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
+@@ -181,21 +183,27 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
  
  bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                int64_t upto, bool index, std::string& error) {
@@ -244,7 +250,7 @@ index 759daa6..d413838 100644
          if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
      return true;
  }
-@@ -206,6 +214,11 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
+@@ -209,6 +217,11 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
          if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                  return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
              })) return false;
@@ -256,7 +262,7 @@ index 759daa6..d413838 100644
      // VRAM slots still contain the outgoing conversation. Resolve must refill
      // them from the restored authoritative pools before any attention reads.
      if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
-@@ -221,6 +234,54 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
+@@ -224,6 +237,54 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
      error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
      return false;
  }
@@ -309,13 +315,13 @@ index 759daa6..d413838 100644
 +    return restore_residency(st, g, upto, error);
 +}
  
- bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                             int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
+ bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                 std::array<uint64_t, 5>& sizes, std::string& error) {
 diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
-index 981beca..cf9b0aa 100644
+index ae40f3a..f21a188 100644
 --- a/src/core/conversation_state.cpp
 +++ b/src/core/conversation_state.cpp
-@@ -304,6 +304,70 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
+@@ -356,6 +356,70 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
      return ConversationRestore::restored;
  }
  
@@ -988,32 +994,32 @@ index 0000000..1bf6acc
 +    std::printf("prefix_store_test: %d checks passed\n",checks);
 +}
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 600609f..27a54ee 100644
+index c59f7aa..07d1d2c 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
-@@ -18,6 +18,7 @@
- #include "strata/core/remote_expert_opt.hpp"
+@@ -21,6 +21,7 @@
  #include "strata/core/expert_cache.hpp"
  #include "strata/core/conversation_snapshot.hpp"
+ #include "strata/core/conversation_file.hpp"
 +#include "strata/core/prefix_store.hpp"
  #include "strata/core/conversation_memory.hpp"
  #include "strata/core/coupled_draft.hpp"
  #include "strata/core/expert_source.hpp"
-@@ -541,6 +542,10 @@ struct Options {
-     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
-     int conversation_cache_slots = 4;
+@@ -592,6 +593,10 @@ struct Options {
      int64_t conversation_cache_min_free_mib = 2560;
+     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
+     int64_t session_min_free_mib = 4096;
 +    /// --serve: persistent prefix snapshots (docs/DETAILS.md): the state at the end of each system prompt, on disk
 +    /// in this directory (empty = off) and the most recently used ones also in RAM
 +    std::string prefix_cache_dir;
 +    int64_t prefix_cache_ram_mib = 2048, prefix_cache_disk_mib = 51200;
      /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
      int64_t prompt_cache_every = 16384;
-     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
-@@ -661,6 +666,10 @@ void usage() {
-                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
-                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
+     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
+@@ -731,6 +736,10 @@ void usage() {
+                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
+                  "                       session file (default 2560)\n"
+                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
 +                 "  --prefix-cache-dir DIR  --serve: keep the state at the end of each system prompt in DIR, so a new\n"
 +                 "                       chat with it reads only the rest (default off; one GPU, no --batch)\n"
 +                 "  --prefix-cache-ram-mib N  --serve: of those, keep the latest in N MiB of RAM (default 2048)\n"
@@ -1021,40 +1027,125 @@ index 600609f..27a54ee 100644
                   "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                   "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                   "                       give VRAM back to other programs between requests and take it back later\n"
-@@ -1575,8 +1584,10 @@ int main(int argc, char** argv) {
+@@ -1713,8 +1722,10 @@ int main(int argc, char** argv) {
          else if (a == "--serve") o.serve = true;
          else if (a == "--vision") o.vision = true;
          else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
 +        else if (a == "--prefix-cache-dir") o.prefix_cache_dir = next("--prefix-cache-dir");
          else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
--                 a == "--conversation-cache-min-free-mib") {
-+                 a == "--conversation-cache-min-free-mib" || a == "--prefix-cache-ram-mib" ||
-+                 a == "--prefix-cache-disk-mib") {
+-                 a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib") {
++                 a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib" ||
++                 a == "--prefix-cache-ram-mib" || a == "--prefix-cache-disk-mib") {
              const std::string value = next(a.c_str());
              int64_t number = 0;
              const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
-@@ -1587,6 +1598,8 @@ int main(int argc, char** argv) {
-             }
+@@ -1726,6 +1737,8 @@ int main(int argc, char** argv) {
              if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
              else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
+             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
 +            else if (a == "--prefix-cache-ram-mib") o.prefix_cache_ram_mib = number;
 +            else if (a == "--prefix-cache-disk-mib") o.prefix_cache_disk_mib = number;
              else o.conversation_cache_slots = (int) number;
          }
-         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
-@@ -5660,6 +5673,25 @@ int main(int argc, char** argv) {
+         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+@@ -6363,6 +6376,42 @@ int main(int argc, char** argv) {
+         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
+         // K/V format and the arithmetic switches.  Sampling, seeds, draft tuning and the expert tier are not in it.
+         std::optional<uint64_t> model_fp, config_fp;
++        // the config half, also in the prefix snapshots' identity (their K/V too is post-RoPE)
++        auto config_fingerprint = [&]() -> uint64_t {
++            if (!config_fp) {
++                strata::core::SessionConfig c;
++                c.engine_version = STRATA_VERSION;
++#if defined(STRATA_USE_HIP)
++                c.backend = "hip";
++#else
++                c.backend = "cuda";
++#endif
++                c.kv = o.kv;
++                c.max_context = o.max_context;
++                c.kv_resident = o.kv_resident;
++                c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
++                const char* rot = std::getenv("STRATA_KV_ROT");
++                c.kv_rot = rot != nullptr && rot[0] == '1';
++                c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
++                          rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
++                          rope_cfg.beta_slow};
++                c.cvec = cvec_digest;
++                c.switches = {
++                    {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
++                    {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
++                    {"native_gdn", o.native_gdn}, {"native_flash_attn_short", o.native_flash_attn_short},
++                    {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
++                    {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
++                    {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
++                    {"gr_fp32_activations", o.gr_fp32_activations}, {"gr_native_mmvf", o.gr_native_mmvf},
++                    {"native_preset", !o.native_preset.empty()}, {"shared_late", o.shared_late},
++                    {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
++                    {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
++                    {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
++                config_fp = strata::core::session_config_fingerprint(c);
++            }
++            return *config_fp;
++        };
+         auto session_identity = [&](strata::core::SessionFileIdentity& id, std::string& e,
+                                     const std::function<void()>& next_file) -> bool {
+             if (!model_fp) {
+@@ -6396,40 +6445,8 @@ int main(int argc, char** argv) {
+                     return false;
+                 model_fp = fp;
+             }
+-            if (!config_fp) {
+-                strata::core::SessionConfig c;
+-                c.engine_version = STRATA_VERSION;
+-#if defined(STRATA_USE_HIP)
+-                c.backend = "hip";
+-#else
+-                c.backend = "cuda";
+-#endif
+-                c.kv = o.kv;
+-                c.max_context = o.max_context;
+-                c.kv_resident = o.kv_resident;
+-                c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
+-                const char* rot = std::getenv("STRATA_KV_ROT");
+-                c.kv_rot = rot != nullptr && rot[0] == '1';
+-                c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
+-                          rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
+-                          rope_cfg.beta_slow};
+-                c.cvec = cvec_digest;
+-                c.switches = {
+-                    {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
+-                    {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
+-                    {"native_gdn", o.native_gdn}, {"native_flash_attn_short", o.native_flash_attn_short},
+-                    {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
+-                    {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
+-                    {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
+-                    {"gr_fp32_activations", o.gr_fp32_activations}, {"gr_native_mmvf", o.gr_native_mmvf},
+-                    {"native_preset", !o.native_preset.empty()}, {"shared_late", o.shared_late},
+-                    {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
+-                    {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
+-                    {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+-                config_fp = strata::core::session_config_fingerprint(c);
+-            }
+             id.model = *model_fp;
+-            id.config = *config_fp;
++            id.config = config_fingerprint();
+             return true;
+         };
+         // --prefill-main: CUDA0's session holds every layer and is the whole-model state at rest (checkpoints and
+@@ -6461,6 +6478,25 @@ int main(int argc, char** argv) {
          auto pm_main_whole = [&](std::string& e, int64_t cell_hi) -> bool {
              return !prefill_main || !pm_stage_ahead || pm_sync(false, e, cell_hi);
          };
 +        // docs/DETAILS.md: one GPU without --batch; a build or model change makes the files unusable
 +        strata::core::PrefixStore prefixes;
-+        // --prefill-main: CUDA0's session holds every layer at rest, so its state is the whole model's, as on one GPU
 +        if (!o.prefix_cache_dir.empty() && o.prompt_cache > 0 && (stages.empty() || prefill_main) && o.batch <= 0) {
 +            strata::core::PrefixStore::Options po;
 +            po.dir = o.prefix_cache_dir;
 +            po.identity = std::string(STRATA_VERSION " " __DATE__ " " __TIME__) + "|" + o.pack + "|" +
 +                          o.native_preset + "|" + o.mtp + "|" + o.kv + "|" +
-+                          (std::getenv("STRATA_BF16_TC") ? std::getenv("STRATA_BF16_TC") : "");
++                          (std::getenv("STRATA_BF16_TC") ? std::getenv("STRATA_BF16_TC") : "") + "|" +
++                          std::to_string(config_fingerprint());
 +            po.ram_budget = (size_t) o.prefix_cache_ram_mib << 20;
 +            po.disk_budget = (size_t) o.prefix_cache_disk_mib << 20;
 +            po.min_free = (size_t) o.conversation_cache_min_free_mib << 20;
@@ -1067,8 +1158,8 @@ index 600609f..27a54ee 100644
 +        }
          // Save only on a switch/rewind, not on each continuing request. No graph
          // addresses change: all parked images live in ordinary host vectors.
-         auto park_current = [&](size_t held) -> bool {
-@@ -7345,9 +7377,20 @@ int main(int argc, char** argv) {
+         auto park_current_body = [&](size_t held) -> bool {
+@@ -8513,9 +8549,20 @@ int main(int argc, char** argv) {
                          }
                  }
              const auto parked = conversations.best(ids, req_imgs, want_cvec);
@@ -1091,7 +1182,7 @@ index 600609f..27a54ee 100644
              // Reject the entire image before parking/overwriting the outgoing
              // state. Invalid entries can safely fall back to its existing prefix.
              const size_t n_park = prefill_main ? 0 : stages.size();   // local: images per parked conversation
-@@ -7374,7 +7417,8 @@ int main(int argc, char** argv) {
+@@ -8542,7 +8589,8 @@ int main(int argc, char** argv) {
              }
              // Preserve the outgoing branch before any checkpoint rewind, reset,
              // or incoming restore overwrites the positional state it requires.
@@ -1101,7 +1192,7 @@ index 600609f..27a54ee 100644
                  std::printf("ERR %s\n", err.c_str());
                  return 1;
              }
-@@ -7479,6 +7523,46 @@ int main(int argc, char** argv) {
+@@ -8652,6 +8700,41 @@ int main(int argc, char** argv) {
                      return 1;
                  }
              }
@@ -1121,11 +1212,6 @@ index 600609f..27a54ee 100644
 +                    cvec_cached = want_cvec;
 +                    resume = prefix.tokens;
 +                    from_live = true;
-+                    pm_synced = 0;   // --prefill-main: the stage's copy is replaced whole
-+                    if (prefill_main && !pm_sync(true, err, resume)) {
-+                        std::printf("ERR restoring a saved system prompt: %s\n", err.c_str());
-+                        return 1;
-+                    }
 +                    std::fprintf(stderr, "strata serve: prefix cache: restored %lld tokens (%s) in %.1f ms\n",
 +                                 (long long) resume, source.c_str(),
 +                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
@@ -1148,9 +1234,9 @@ index 600609f..27a54ee 100644
              if (want_cvec != cvec_cached) {
                  live_ok = false;
                  checks.clear();
-@@ -9205,6 +9289,24 @@ int main(int argc, char** argv) {
+@@ -10461,6 +10544,24 @@ int main(int argc, char** argv) {
                          (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
-                         (long long) req_offload);
+                         (long long) req_offload, chain_txt);
              std::fflush(stdout);
 +            // docs/DETAILS.md: the first time a system prompt is read whole, the state at its end (the chain's
 +            // root) goes to the prefix cache - after DONE, so the client does not wait for it

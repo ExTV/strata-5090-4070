@@ -17,7 +17,7 @@ the 4070 holds all 6,144. KV is int8 with 32,768 cells per attention layer resid
 VRAM and the rest in 3 GB of pinned RAM (`--kv int8 --kv-resident 32768`). The MTP drafter
 (`--spec 4`, the base model's head packed to Q2_0) runs on the last stage.
 
-## Why layer split 36
+## Why layer split 36 (37 since 2026-10-07, see the last section)
 
 With `--layer-split`, CUDA0 runs layers 0-35 and CUDA1 layers 36-47 plus the head and the drafter.
 Splits 35 to 39 were swept on stock 0.1.33 with the same 80K-prompt bench: 36 had the best decode
@@ -290,3 +290,48 @@ page faults. It suits a box that only serves; with a desktop in use, 14 is the s
 3 GB of parking covers a conversation up to about 160K tokens (a snapshot is ~19.5 KB per token). A
 longer one is not parked, so an interleaved second conversation (or a client's side request) makes the
 next turn of the long one re-read it: in real use a 200K agent chat lost 47 s per switch that way.
+
+## v0.1.40.1, split 37 and conversations on the SSD (2026-10-06 night to 2026-10-07)
+
+Upstream rewrote its history and released v0.1.40.1 with most of what this series carried: the RAM copy
+on a layer split, pipelined verify windows, the asynchronous tier, the CPU IQ kernels, #510, #525 (the
+stranded-call rescue is built in now, so the config no longer sets `format_fixes`), #934, #1043 and
+#1049. The series shrank to 19 patches. 0.1.40 turns `--adapt-async` off when pipelined windows are on;
+#1122 lets the two run together again. #904 is left out: it conflicts with upstream's rewrite of the
+decode kernels, and decode measured faster without it. On the same config the new base decodes about 10%
+faster, reads 16K-80K prompts 5-15% faster, and leaves about 2 GB less engine memory in zram.
+
+**Split 37 and the image encoder on the 4070.** The encoder took 1.7 GB of the 5090. Upstream's
+`"vision": {"cuda_device": 1}` runs it on the 4070 instead (1.28 GB there), and moving layer 36 to the
+5090 then still leaves the 4070 holding every expert of layers 37-47. The 5090's cache grows from 14,951
+to 16,014 experts, the page-locked RAM copy shrinks by 0.85 GiB, and 2K prompts got faster (631-646 vs
+448-584 tok/s). Split 38 holds fewer experts in total and slowed 2K prompts, so 37 it is.
+
+**Conversations on the SSD (patch 17).** Parking keeps whole conversations in RAM, about 19.5 KB per
+token, and this box has little RAM to spare: a 200K agent chat could not park, so every time another
+conversation ran in between, the next turn re-read all 200K tokens (47 s). `--conversation-spill-dir`
+writes a conversation the RAM cache refuses to a session file (the format of upstream's slot save/
+restore API, written with O_DIRECT, so it costs almost no RAM) and reads it back when a request continues
+it. The file is kept after it is read: while the conversation is at most 8,192 tokens past it, the next
+spill keeps the old file instead of writing 3 GB again, and a request can also match the file's deepest
+checkpoint. Parking went down from 3,072 to 1,024 MiB, which gives that RAM back to the engine. The
+Monitor page shows the files on disk and each restore from them. `--conversation-spill-mib` (default
+32,768) caps the directory; the oldest file goes first.
+
+**Streamed restore (PR #1269, patch 19).** Upstream's restore read the whole session file into RAM before
+copying it to the K/V pools: 3.1 GB for a 200K chat, with about 3 GB available. Free RAM fell to 225 MiB
+and the kernel pushed engine memory to zram, which the engine then faulted back in (18K swap-ins per three
+switches). #1269 restores in two passes: the first validates the file without keeping the K/V, the
+second copies it into the pools 16 MiB at a time. Patch 19 routes the spill through it. Free RAM now stays
+above 2.5 GB during a restore, the faults are gone (218 vs 18,331), and the short chat in the test stays
+parked in RAM because there is room for it. The second pass over the file costs about 0.3 s per restore.
+
+**The spill written while idle (patch 20).** The depth table showed the cost of writing on the switch:
+the new conversation waited for the old one's file, and on a nearly full SSD a burst of 3-4 GB writes
+fell to 170-360 MB/s (up to 24 s). The engine now writes the file when it has been idle for 2 s after an
+answer and the conversation is bigger than the parking budget. The write reads the K/V in 16 MiB blocks
+and checks before each one whether a request has come in; if so it stops, removes its temporary file and
+keeps every older spill (they are dropped only after a new file is complete), so a quick follow-up
+costs nothing. A switch that arrives before the idle write finishes still writes on the spot as before.
+The spill files are deleted when the engine ends on QUIT and, for an engine that was killed, by the
+server when it stops.

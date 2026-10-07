@@ -1,10 +1,10 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 0121bb0..a85fd9e 100644
+index cd60517..5ce0620 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -1034,6 +1034,13 @@ if(STRATA_NATIVE_EXPERTS)
-     add_test(NAME router_dot_parity COMMAND router_dot_parity)
-     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
+@@ -1178,6 +1178,13 @@ if(STRATA_NATIVE_EXPERTS)
+     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
+     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
    endif()
 +  # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
 +  add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
@@ -17,24 +17,23 @@ index 0121bb0..a85fd9e 100644
    # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
    if(STRATA_ORCA_Q4KS_MMQ)
 diff --git a/include/strata/kernels/cpu/iq_avx2.hpp b/include/strata/kernels/cpu/iq_avx2.hpp
-index a9628d3..c933980 100644
+index 0a8876b..a90c4aa 100644
 --- a/include/strata/kernels/cpu/iq_avx2.hpp
 +++ b/include/strata/kernels/cpu/iq_avx2.hpp
-@@ -18,6 +18,9 @@ void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
- void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
-                 float* const* out, int r0, int r1);
- 
+@@ -32,6 +32,8 @@ void iq256_gu_rows_v(int variant, int ggml_type, const uint8_t* blob, size_t gu_
+                      const void* const* act, int nt, float* const* ff, int r0, int r1);
+ void iq256_rows_v(int variant, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act,
+                   int nt, float* const* out, int r0, int r1);
 +/// ggml's quantize_row_q8_K (x86 runs the scalar reference), byte-identical, in AVX-2: n values -> n/256 block_q8_K.
 +void q8k_quant_avx2(const float* x, void* y, int64_t n);
-+
+ 
  /// out[t][r] = w_r . h[t] for IQ4_NL (type 20) rows against Q8_0 activations (ggml's block_q8_0).
  /// IQ4_NL is a 32-value-block format, so this does not go through iq256_rows (QK_K blocks, Q8_K acts).
- void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
 diff --git a/src/kernels/cpu/iq_avx2.cpp b/src/kernels/cpu/iq_avx2.cpp
-index bb8849b..d2607d7 100644
+index 333e0c4..da15e00 100644
 --- a/src/kernels/cpu/iq_avx2.cpp
 +++ b/src/kernels/cpu/iq_avx2.cpp
-@@ -407,6 +407,75 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void*
+@@ -324,6 +324,75 @@ bool vnni_on() { return STRATA_AVXVNNI && cpu_avxvnni_ok(); }
  
  }  // namespace
  
@@ -111,7 +110,7 @@ index bb8849b..d2607d7 100644
      return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
  }
 diff --git a/src/kernels/cpu/native_expert.cpp b/src/kernels/cpu/native_expert.cpp
-index 0dc5d3a..3e8f2b7 100644
+index c381ddc..066afe0 100644
 --- a/src/kernels/cpu/native_expert.cpp
 +++ b/src/kernels/cpu/native_expert.cpp
 @@ -68,11 +68,24 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt

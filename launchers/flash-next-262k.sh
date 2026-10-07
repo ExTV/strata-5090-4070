@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next (ISTA GSQ-RCO IQ3_XXS) at 262,144 tokens on an RTX 5090 + RTX 4070 Ti SUPER, served by the
 # patched Strata on :8888 (OpenAI and Anthropic compatible, model name qwen3.8-flash-next, images on).
-# Layers 0-35 on the 5090, 36-47 and the drafter on the 4070; prompts read on the 5090 only (--prefill-main);
-# the experts neither card holds sit in a page-locked RAM copy (--resident-experts, ~7 GB) and the two cards
-# overlap decode windows (--pipeline-windows 2 --adapt-async 1); switching between conversations restores a
-# parked one in under a second (--conversation-cache-mib 3072, 8 slots), and a system prompt seen before is
+# Layers 0-36 on the 5090, 37-47, the drafter and the image encoder on the 4070; prompts read on the 5090 only
+# (--prefill-main); the experts neither card holds sit in a page-locked RAM copy (--resident-experts) and the
+# two cards overlap decode windows (--pipeline-windows 2 --adapt-async 1); switching between conversations
+# restores a parked one in under a second (--conversation-cache-mib 1024, 8 slots), a conversation too big to
+# park goes to disk and comes back in ~3 s (--conversation-spill-dir), and a system prompt seen before is
 # restored from disk (--prefix-cache-dir).
 # Knobs: CONFIG= another config in strata/, PORT=, HOST= (default 127.0.0.1; the server has no authentication, so
 # HOST=0.0.0.0 exposes an unauthenticated 262K-context endpoint with image input to the whole LAN; put it behind

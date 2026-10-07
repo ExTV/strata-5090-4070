@@ -1,9 +1,9 @@
 # Benchmarks
 
-All on 2026-10-02 to 2026-10-06, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
-IQ3_XXS, 262,144 context, layer split 36, int8 KV with 32,768 resident cells, vision on. The Strata base
+All on 2026-10-02 to 2026-10-07, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
+IQ3_XXS, 262,144 context, layer split 36 (37 in the last section), int8 KV with 32,768 resident cells, vision on. The Strata base
 moves through the sections: 0.1.33, 0.1.37, 0.1.38 with six PRs, the Strata-DualGPU fork, then the fork's later commits with the
-lend region in RAM, then upstream 0.1.39 with the fork's work as PRs, then the 2026-10-06 PR updates with headroom 4 (the shipped config, last section).
+lend region in RAM, then upstream 0.1.39 with the fork's work as PRs, then the 2026-10-06 PR updates with headroom 4, then upstream 0.1.40.1 with the SSD spill (the shipped config, last section).
 `tools/bench.py`: five 600-token greedy answers with thinking off (decode median), fresh prompts of
 ~2K (twice), ~16K and ~80K tokens of random words (prefill tok/s), then a 2K follow-up on the 80K
 conversation; `tools/decode_after.py`: five more answers right after the 80K prompt. "faults" is
@@ -85,7 +85,7 @@ with spec-min-p 0.7-0.8 measured 128-134 tok/s median on the same prompts (`tool
 | sweep 1, median tok/s | 78 | 114 | 128 | | |
 | sweep 2, median tok/s | | | 97 | 134 | 121 |
 
-## Upstream 0.1.37 base and `STRATA_PF_FUSED=1` (2026-10-03, the shipped config)
+## Upstream 0.1.37 base and `STRATA_PF_FUSED=1` (2026-10-03)
 
 The v4 patch set (then three patches) on v0.1.37, pread on, chunk 32768, spec-min-p 0.8; MMQ and the fused kernels
 alternated, two rounds each, one boot per row. The MMQ rows reproduce the 0.1.33 v5 numbers above.
@@ -291,7 +291,7 @@ is what keeps the expert cache from taking it all). 4070 Ti SUPER: 15,754 MiB. P
 prompt and during vision requests stays inside those figures; the expert cache lends slots to the
 prompt path instead of allocating more.
 
-## PR updates, prefix cache and headroom 4 (2026-10-06, the shipped config)
+## PR updates, prefix cache and headroom 4 (2026-10-06)
 
 Patches 16-25 on the 0.1.39 series, ISTA GSQ-RCO IQ3_XXS with a runtime control vector (speed-neutral).
 New binary against the previous one, same config (headroom 14), interleaved boots: decode 177-180, 2K
@@ -347,3 +347,82 @@ under its normal load; run in two parts (2K-62K, then 92K-260K) because the firs
 The 260K prompt was read in 85.3 s (79.5 at headroom 14). Headroom 4 wins clearly up to 92K and
 not past it: chunks of the longest prompts borrow beyond what locked RAM covers in both configs, and
 with about 1 GB available the engine pays more page faults. Decode is unchanged.
+
+## Upstream 0.1.40.1, split 37, the SSD spill and PR #1269 (2026-10-06 night to 2026-10-07, the shipped config)
+
+Same corpus and tools as the section above. The new binary against the 0.1.39 build, same evening, split
+36, parking 1024 with the spill: decode median 198 vs 179, 2K 448-584, 16K 2,158 vs 2,020, 80K 3,133 vs
+2,743, follow-up 4.1 vs 4.6 s, 27K 2,820 tok/s, tool steps 3.2 / 3.4 / 3.9 s; engine memory in zram 3.5
+GB vs 5.6-6.8. Needle, merged tool turns and images all right.
+
+Layer split, with the image encoder moved to the 4070 (`"vision": {"cuda_device": 1}`):
+
+| split | GPU-cached experts | locked RAM | decode | 2K | 16K | 80K | follow-up |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 36, encoder on the 5090 | 14,951 | 15.13 GiB | 198 | 448-584 | 2,158 | 3,133 | 4.1 s |
+| **37, encoder on the 4070** | **16,014** | **14.28 GiB** | 195 | **631-646** | 2,117 | 3,192 | 3.9 s |
+| 38, encoder on the 4070 | 15,849 | 15.39 GiB | 191 | 480-493 | 2,179 | 3,290 | |
+
+At split 36 the encoder does not fit on the 4070 next to the drafter (the boot fails). Parking 8/8 right
+on split 37, image requests right.
+
+The SSD spill (`tools/spill_check.py`: a 199K conversation with a needle and a 5K one, alternating, four
+rounds): before it, every switch back to the long chat re-read it (~47 s). With the spill the 3.1 GB
+file is written in 1.6-2.5 s and read back in 2.7-3.9 s; every answer right.
+
+PR #1269 (streamed restore) plus our patch 19, same session, the old binary as control, page faults
+counted over rounds 1-3 only:
+
+| | switch back to 199K | switch back to 5K | lowest available RAM | major faults | swap-ins | engine faults |
+| --- | --- | --- | --- | --- | --- | --- |
+| whole file read into RAM (control) | 2.7-3.9 s | 0.4-0.5 s | 225 MiB | 18,331 | 18,055 | 6,464 |
+| **streamed in 16 MiB blocks** | 3.0-3.2 s | **0.2 s** | **2,531 MiB** | **218** | **31** | **4** |
+
+The streamed restore reads the file twice (validate, then apply), about 0.3 s more; in exchange nothing
+is pushed out to swap, and the 5K chat stays parked in RAM instead of going to the SSD too. Bench on the
+shipped build: decode 188, 2K 646-655, 16K 2,284, 80K 3,281 tok/s, follow-up 4.1 s.
+
+Tested and not adopted, same morning against a control boot of the same binary: PRs #1101 (stager
+threads sleep instead of spinning), #1237 (pinned stage buffers), #1181 (linear verify-window plan) and
+#1288 (a long read yields by what is left to read). Decode, prompts, tool steps and engine CPU time
+(361-384 s per `bench.py` run vs 382 s) all within noise on this box.
+
+### Depth table on the shipped config (2026-10-07)
+
+`tools/depth_bench.py`, corpus = the v0.1.40.1 source with the patches, run in three parts. Raw time to
+first token, and the spill write of the previous conversation that preceded it (from the server log):
+
+| depth | TTFT | spill write before it | prefill without the write | decode |
+| --- | --- | --- | --- | --- |
+| 2K | 3.5 s | | 553 tok/s | 170 tok/s |
+| 32K | 16.5 s (reruns 8.1 / 11.0 s) | | 1,933 (reruns 3,939 / 2,911) | 159-165 tok/s |
+| 62K | 15.3 s | (32K parked in RAM) | 4,040 tok/s | 150 tok/s |
+| 92K | 23.6 s | 62K, 1.1 GB, 0.7 s | 4,018 tok/s | 151 tok/s |
+| 122K | 32.0 s | 92K, 1.6 GB, 0.9 s | 3,924 tok/s | 149 tok/s |
+| 152K | 41.5 s | 122K, 2.0 GB, 1.2 s | 3,766 tok/s | 142 tok/s |
+| 182K | 55.4 s | 152K, 2.4 GB, 6.8 s | 3,741 tok/s | 140 tok/s |
+| 212K | 71.8 s | 182K, 2.9 GB, 9.3 s | 3,393 tok/s | 147 tok/s |
+| 242K | 81.3 s | 212K, 3.3 GB, 13.2 s | 3,552 tok/s | 139 tok/s |
+| 260K | 102.0 s | 242K, 3.8 GB, 18.9 s | 3,127 tok/s | 140 tok/s |
+
+In this run the spill write was synchronous: the next conversation waited for it. The SSD (WD SN740, 94% full) takes
+the first ~5 GB of a burst at about 1.7 GB/s and then drops to 170-360 MB/s, so eight long chats in a
+row (21 GB of spill files) is the worst case; a single switch writes in 1-2.5 s. A 32K rerun right after
+the 260K prompt waited 24 s for its 4 GB write and then read slowly too (54.3 s in total).
+
+### The spill written while idle (patch 20, 2026-10-07)
+
+Same morning, one boot, a scripted sequence (`thinking off`, greedy, needles in each conversation):
+
+| step | prompt | time | spill log |
+| --- | --- | --- | --- |
+| A, fresh | 152K | 43.1 s | 2 s later, idle: A written (2.4 GB) in 1.4 s |
+| B, fresh (A does not park) | 5K | 4.2 s | A's file kept, nothing written |
+| A, follow-up | 152K | 2.5 s | read back from the file |
+| C, fresh | 121K | 38.9 s | A's file kept (28 tokens behind) |
+| C, follow-up 3 s after the answer | 121K | 0.3 s | the idle write of C gave way after 436 ms |
+| B again, 15 s later | 5K | 0.2 s | C written while idle (2.0 GB, 2.9 s) and kept |
+
+Every answer right. Before patch 20, B's fresh prompt would have waited for A's 2.4 GB write. After the
+server stopped (SIGTERM, which sends QUIT to the engine) the spill directory was empty; a cancelled write
+left no temporary file.

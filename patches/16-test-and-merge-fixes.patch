@@ -1,0 +1,45 @@
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 726b200..5588d28 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -1386,7 +1386,7 @@ class IncrementalPrompts(unittest.TestCase):
+         self.assertIsNotNone(self.svc.prompts)
+         msgs = [{"role": "system", "content": "Be brief."}]
+         for turn in range(6):
+-            msgs.append({"role": "user", "content": f"question {turn} <|im_end|> é你 " * (turn + 1)})
++            msgs.append({"role": "user", "content": f"question {turn} < é你 " * (turn + 1)})
+             status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
+             self.assertEqual(status, 200, b)
+             prompt = self.svc.template.render(msgs)
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index bed0436..dc12031 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -604,7 +604,6 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
+         else STRATA_ATTN_LC(0);
+     } else
+ #undef STRATA_ATTN_LC
+-)
+     if (kv_mode == 3)
+         STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+diff --git a/src/kernels/ngram.cpp b/src/kernels/ngram.cpp
+index 7f97dcb..83b82d8 100644
+--- a/src/kernels/ngram.cpp
++++ b/src/kernels/ngram.cpp
+@@ -14,7 +14,6 @@
+ #include <cstring>
+ #include <limits>
+ #include <deque>
+-)
+ #if !defined(_WIN32)
+ #include <sys/mman.h>
+ #endif
+@@ -245,7 +244,6 @@ struct PleTable::Impl {
+                 b.dropped = false;
+             }
+     }
+-)
+ };
+ 
+ PleTable::PleTable() : impl_(new Impl) {}

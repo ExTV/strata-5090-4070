@@ -1,0 +1,505 @@
+diff --git a/serve/server.py b/serve/server.py
+index dbfec9e..0169374 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -450,6 +450,10 @@ class ConvCacheLog:
+     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
+                        r"(?: evictions=(\d+))?")
+     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
++    # --conversation-spill-dir: conversations too big for the RAM cache, in session files on disk
++    SPILL_TOTAL = re.compile(r"conversation spill: .*?spilled=(\d+) disk=(\d+) MiB")
++    SPILL_WROTE = re.compile(r"conversation spill: wrote \d+ tokens \(\d+ MiB\) in ([\d.]+) ms")
++    SPILL_READ = re.compile(r"conversation spill: read \d+ tokens \([a-z]+, \d+ MiB\) in ([\d.]+) ms")
+     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
+ 
+     def __init__(self):
+@@ -458,7 +462,8 @@ class ConvCacheLog:
+ 
+     def reset(self):
+         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
+-                      "last_tokens": None, "last_at": None}
++                      "last_tokens": None, "last_at": None, "spilled": 0, "spill_mib": 0, "spill_writes": 0,
++                      "spill_kept": 0, "spill_reads": 0, "spill_write_ms": None, "spill_read_ms": None}
+ 
+     def poll(self, path, start) -> dict:
+         """The state after the log's new lines; `start` is where the engine's current run began in it."""
+@@ -482,6 +487,23 @@ class ConvCacheLog:
+         self.pos += end
+         now = time.time()
+         for line in data[:end].decode("utf-8", "replace").splitlines():
++            if "conversation spill:" in line:
++                st = self.state
++                m = self.SPILL_TOTAL.search(line)
++                if m:
++                    st["spilled"], st["spill_mib"] = int(m.group(1)), int(m.group(2))
++                m = self.SPILL_WROTE.search(line)
++                if m:
++                    st["spill_writes"] += 1
++                    st["spill_write_ms"] = float(m.group(1))
++                elif "kept the spill" in line:
++                    st["spill_kept"] += 1
++                else:
++                    m = self.SPILL_READ.search(line)
++                    if m:
++                        st["spill_reads"] += 1
++                        st["spill_read_ms"] = float(m.group(1))
++                continue
+             if "conversation cache:" not in line:
+                 continue
+             m = self.EVENT.search(line)
+@@ -492,7 +514,8 @@ class ConvCacheLog:
+                     st["evictions"] = int(m.group(5))
+                 if m.group(1) != "skipped":
+                     st["parks" if m.group(1) == "parked" else "restores"] += 1
+-                    st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
++                    event = "restored-disk" if m.group(1) == "restored" and "(spill)" in line else m.group(1)
++                    st["last_event"], st["last_tokens"], st["last_at"] = event, int(m.group(2)), now
+                 continue
+             m = self.DROPPED.search(line)
+             if m:
+@@ -507,6 +530,7 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict)
+     last = hist[-1] if hist else None
+     return {"enabled": isinstance(mib, int) and mib > 0, "budget_mib": mib if isinstance(mib, int) else None,
+             "slots": info.get("conversation_cache_slots"), **parked,
++            "spill_budget_mib": info.get("conversation_spill_mib") or 0,
+             "requests": len(hist), "requests_reused": sum(1 for r in hist if (r.get("reused") or 0) > 0),
+             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
+             "last_reused": last.get("reused") if last else None,
+diff --git a/serve/test_monitor.py b/serve/test_monitor.py
+index 0c82cb0..f6670b5 100644
+--- a/serve/test_monitor.py
++++ b/serve/test_monitor.py
+@@ -222,6 +222,25 @@ class ConversationCacheCard(unittest.TestCase):
+             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
+             self.assertEqual(c.poll(None, None)["parked"], 0)
+ 
++    def test_the_spill_log(self):
++        """--conversation-spill-dir: the disk side of the card (files, MiB, writes, kept, reads) from the spill lines."""
++        from serve.server import ConvCacheLog
++        import tempfile
++        with tempfile.TemporaryDirectory() as d:
++            log = Path(d) / "strata.log"
++            log.write_text(
++                "strata serve: conversation cache: skip parking (snapshot 3690 MiB exceeds available budget)\n"
++                "strata serve: conversation spill: wrote 199102 tokens (3125 MiB) in 2045.5 ms; spilled=1 disk=3125 MiB\n"
++                "strata serve: conversation spill: read 199102 tokens (live, 3125 MiB) in 2157.7 ms; spilled=1 disk=3125 MiB\n"
++                "strata serve: conversation cache: restored 199102 tokens (spill) in 563.7 ms; parked=1 bytes=313468196\n"
++                "strata serve: conversation spill: kept the spill of this conversation (25 tokens behind); spilled=2 "
++                "disk=3424 MiB\n", encoding="utf-8")
++            st = ConvCacheLog().poll(str(log), 0)
++            self.assertEqual((st["spilled"], st["spill_mib"], st["spill_writes"], st["spill_kept"], st["spill_reads"]),
++                             (2, 3424, 1, 1, 1))
++            self.assertEqual((st["spill_write_ms"], st["spill_read_ms"]), (2045.5, 2157.7))
++            self.assertEqual((st["last_event"], st["last_tokens"], st["restores"]), ("restored-disk", 199102, 1))
++
+     def test_metrics(self):
+         tok = ByteTokenizer()
+         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
+diff --git a/serve/web/app.js b/serve/web/app.js
+index ade1901..45f5401 100644
+--- a/serve/web/app.js
++++ b/serve/web/app.js
+@@ -214,17 +214,33 @@ function renderConvCache(c) {
+     $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
+     $("cc-mem-bar").style.width = pct(c.bytes, budget);
+   }
++  // --conversation-spill-dir: conversations too big for the RAM budget, in session files on disk
++  const spill = c.enabled && c.spill_budget_mib > 0;
++  $("cc-disk").hidden = !spill;
++  if (spill) {
++    const used = (c.spill_mib || 0) * 1048576, cap = c.spill_budget_mib * 1048576;
++    $("cc-disk-text").textContent = `${fmt(c.spilled || 0)} · ${gb(used)} / ${gb(cap)} GB`;
++    $("cc-disk-bar").style.width = pct(used, cap);
++  }
+   $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
+   const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
+-  const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
++  const verb = {parked: "Parked", restored: "Restored", "restored-disk": "Restored from NVMe"}[c.last_event] || "Restored";
++  const event = c.last_event ? `${verb} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
++  const secs = (ms) => (ms != null ? `${fmt(ms / 1000, 1)} s` : "");
++  const disk = spill && (c.spill_writes || c.spill_reads || c.spill_kept)
++    ? `${fmt(c.spill_writes)} written${c.spill_write_ms != null ? ` (last ${secs(c.spill_write_ms)})` : ""} · ` +
++      `${fmt(c.spill_kept)} kept · ${fmt(c.spill_reads)} read back${c.spill_read_ms != null ? ` (last ${secs(c.spill_read_ms)})` : ""}`
++    : null;
+   facts($("cc-facts"), [
+     ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
+     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
+     ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
+     ["Last switch", c.enabled ? event : null],
++    ["NVMe spill", disk],
+   ]);
+   $("cc-note").textContent = c.enabled
+-    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
++    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full." +
++      (spill ? " A conversation too big for the memory goes to the NVMe instead and is read back from there." : "")
+     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+ }
+ 
+diff --git a/serve/web/index.html b/serve/web/index.html
+index 5c26ad8..c004666 100644
+--- a/serve/web/index.html
++++ b/serve/web/index.html
+@@ -132,6 +132,8 @@
+             <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
+           <div><div class="bar-row"><span>Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
+             <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
++          <div id="cc-disk" hidden><div class="bar-row"><span>On disk (NVMe)</span><span class="muted" id="cc-disk-text">&ndash;</span></div>
++            <div class="st-progress"><div class="st-progress__bar" id="cc-disk-bar" style="width:0%"></div></div></div>
+         </div>
+         <dl class="facts" id="cc-facts"></dl>
+         <p class="muted small cc-note" id="cc-note"></p>
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 711ad89..ba651a9 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -593,6 +593,10 @@ struct Options {
+     int64_t conversation_cache_min_free_mib = 2560;
+     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
+     int64_t session_min_free_mib = 4096;
++    /// --serve: a conversation the RAM cache cannot take (too big for its budget or for the free RAM) is written to
++    /// a session file in this directory instead and read back when a request continues it (empty = off)
++    std::string conversation_spill_dir;
++    int64_t conversation_spill_mib = 32768;   ///< the spill directory's budget; the oldest file goes first
+     /// --serve: persistent prefix snapshots (docs/DETAILS.md): the state at the end of each system prompt, on disk
+     /// in this directory (empty = off) and the most recently used ones also in RAM
+     std::string prefix_cache_dir;
+@@ -736,6 +740,9 @@ void usage() {
+                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
+                  "                       session file (default 2560)\n"
+                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
++                 "  --conversation-spill-dir DIR  --serve: a conversation the RAM cache cannot park goes to a session\n"
++                 "                       file in DIR and comes back when a request continues it (off by default)\n"
++                 "  --conversation-spill-mib N  --serve: the spill directory's budget (default 32768)\n"
+                  "  --prefix-cache-dir DIR  --serve: keep the state at the end of each system prompt in DIR, so a new\n"
+                  "                       chat with it reads only the rest (default off; one GPU, no --batch)\n"
+                  "  --prefix-cache-ram-mib N  --serve: of those, keep the latest in N MiB of RAM (default 2048)\n"
+@@ -1723,9 +1730,10 @@ int main(int argc, char** argv) {
+         else if (a == "--vision") o.vision = true;
+         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+         else if (a == "--prefix-cache-dir") o.prefix_cache_dir = next("--prefix-cache-dir");
++        else if (a == "--conversation-spill-dir") o.conversation_spill_dir = next("--conversation-spill-dir");
+         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
+                  a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib" ||
+-                 a == "--prefix-cache-ram-mib" || a == "--prefix-cache-disk-mib") {
++                 a == "--prefix-cache-ram-mib" || a == "--prefix-cache-disk-mib" || a == "--conversation-spill-mib") {
+             const std::string value = next(a.c_str());
+             int64_t number = 0;
+             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+@@ -1739,6 +1747,7 @@ int main(int argc, char** argv) {
+             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
+             else if (a == "--prefix-cache-ram-mib") o.prefix_cache_ram_mib = number;
+             else if (a == "--prefix-cache-disk-mib") o.prefix_cache_disk_mib = number;
++            else if (a == "--conversation-spill-mib") o.conversation_spill_mib = number;
+             else o.conversation_cache_slots = (int) number;
+         }
+         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+@@ -6497,6 +6506,164 @@ int main(int argc, char** argv) {
+         } else if (!o.prefix_cache_dir.empty()) {
+             std::fprintf(stderr, "strata serve: prefix cache off (it needs --prompt-cache, one GPU and no --batch)\n");
+         }
++        // --conversation-spill-dir: a conversation the RAM cache refuses (too big for its budget, or for the free
++        // RAM) is written as a session file instead - the K/V streams from its pools straight into the file, so the
++        // spill needs little RAM - and a later request that continues it reads the file back (spill_take).  The
++        // files belong to this engine run: the directory's spill-*.ses files are deleted at start.
++        struct ConvSpill {
++            std::vector<int32_t> ids;
++            std::vector<ImgKey> imgs;
++            std::vector<int32_t> ck_ids;   // the file's checkpoint (its last turn boundary): a client that renders
++            std::vector<ImgKey> ck_imgs;   // the last reply otherwise than it was sampled resumes from there
++            bool cvec = true;
++            std::string path;
++            size_t bytes = 0;
++            uint64_t used = 0;
++        };
++        std::vector<ConvSpill> spills;
++        uint64_t spill_clock = 0, spill_seq = 0;
++        const bool spill_on = !o.conversation_spill_dir.empty() && o.prompt_cache > 0 && o.batch <= 0 &&
++                              o.peer_device < 1 && (stages.empty() || prefill_main);
++        if (!o.conversation_spill_dir.empty() && !spill_on)
++            std::fprintf(stderr, "strata serve: conversation spill off (it needs --prompt-cache, no --batch or "
++                                 "--peer-device, and one GPU or --prefill-main)\n");
++        if (spill_on) {
++            std::error_code ec;
++            std::filesystem::create_directories(o.conversation_spill_dir, ec);
++            for (const auto& f : std::filesystem::directory_iterator(o.conversation_spill_dir, ec)) {
++                const std::string n = f.path().filename().string();
++                if (n.rfind("spill-", 0) == 0 && n.size() > 4 && n.compare(n.size() - 4, 4, ".ses") == 0)
++                    std::filesystem::remove(f.path(), ec);
++            }
++            std::fprintf(stderr, "strata serve: conversation spill: %s, up to %lld MiB\n",
++                         o.conversation_spill_dir.c_str(), (long long) o.conversation_spill_mib);
++        }
++        auto spill_disk = [&]() {
++            size_t t = 0;
++            for (const auto& sp_ : spills) t += sp_.bytes;
++            return t;
++        };
++        auto spill_drop = [&](size_t i) {
++            std::error_code ec;
++            std::filesystem::remove(spills[i].path, ec);
++            spills.erase(spills.begin() + (std::ptrdiff_t) i);
++        };
++        // the RAM floors are not applied here: the box this is for runs with ~1 GB available and zram behind it, and
++        // the alternative is reading the whole conversation again
++        auto spill_admit = [](uint64_t, std::string&) { return true; };
++        auto spill_current = [&]() {
++            if (!spill_on || !live_ok || live.empty()) return;
++            const auto t0 = Clock::now();
++            std::string e;
++            // An older spill of this conversation (its end or its checkpoint is the start of the live tokens): while
++            // the conversation has moved on by at most kSpillBehind tokens, that file stays its spill - coming back
++            // then reads those tokens again instead of this spill writing the whole conversation (a few GB at the
++            // drive's sustained write speed, several seconds, on the next request's clock).  Further behind, it is
++            // replaced.
++            constexpr size_t kSpillBehind = 8192;
++            auto covers = [&](const std::vector<int32_t>& pre) -> size_t {
++                return !pre.empty() && pre.size() <= live.size() && std::equal(pre.begin(), pre.end(), live.begin())
++                    ? pre.size() : 0;
++            };
++            size_t keep = spills.size(), keep_n = 0;
++            for (size_t i = 0; i < spills.size(); ++i) {
++                if (spills[i].cvec != cvec_cached) continue;
++                const size_t c = std::max(covers(spills[i].ids), covers(spills[i].ck_ids));
++                if (c > keep_n) { keep = i; keep_n = c; }
++            }
++            if (keep < spills.size() && live.size() - keep_n <= kSpillBehind) {
++                spills[keep].used = ++spill_clock;
++                for (size_t i = spills.size(); i-- > 0;)   // any other, older spill of it goes
++                    if (i != keep && spills[i].cvec == cvec_cached &&
++                        std::max(covers(spills[i].ids), covers(spills[i].ck_ids)) > 0)
++                        spill_drop(i);
++                std::fprintf(stderr, "strata serve: conversation spill: kept the spill of this conversation (%zu tokens "
++                                     "behind); spilled=%zu disk=%zu MiB\n", live.size() - keep_n, spills.size(),
++                             spill_disk() >> 20);
++                return;
++            }
++            for (size_t i = spills.size(); i-- > 0;)
++                if (spills[i].cvec == cvec_cached && std::max(covers(spills[i].ids), covers(spills[i].ck_ids)) > 0)
++                    spill_drop(i);
++            if (prefill_main) {   // CUDA0's session is what gets written: whole first, and the drafter's device idle
++                if (!pm_main_whole(e, (int64_t) live.size())) {
++                    std::fprintf(stderr, "strata serve: conversation spill skipped (%s)\n", e.c_str());
++                    return;
++                }
++                const strata::core::OnDevice on(stages.back()->dev);
++                if (cudaDeviceSynchronize() != cudaSuccess) {
++                    std::fprintf(stderr, "strata serve: conversation spill skipped (stage sync failed)\n");
++                    return;
++                }
++            }
++            const std::string path = o.conversation_spill_dir + "/spill-" + std::to_string(++spill_seq) + ".ses";
++            size_t bytes = 0;
++            std::vector<int32_t> ck_ids;
++            std::vector<ImgKey> ck_imgs;
++            try {
++                strata::core::SessionFileIdentity id;
++                if (!session_identity(id, e, {})) {
++                    std::fprintf(stderr, "strata serve: conversation spill skipped (%s)\n", e.c_str());
++                    return;
++                }
++                strata::core::SessionSaveLive sl;
++                {
++                    strata::core::ConversationStateSizes z;
++                    std::string why;
++                    uint64_t state = UINT64_MAX;
++                    if (strata::core::conversation_session_sizes(g, ss, z, why)) {
++                        const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
++                        const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
++                        if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
++                    }
++                    sl.state_bytes = state;
++                    sl.tokens = live.size();
++                    sl.images = live_imgs.size();
++                    sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
++                }
++                std::vector<ConvCheckpoint> disk_checks;
++                if (!strata::core::session_save_checkpoints(checks, sl, spill_admit, disk_checks, e)) {
++                    std::fprintf(stderr, "strata serve: conversation spill skipped (%s)\n", e.c_str());
++                    return;
++                }
++                for (const ConvCheckpoint& c : disk_checks)
++                    if (c.ids.size() > ck_ids.size() && c.ids.size() < live.size()) { ck_ids = c.ids; ck_imgs = c.imgs; }
++                const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
++                strata::core::SavedConversation meta;
++                std::vector<strata::core::SessionKvSource> sources;
++                if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(), e)) {
++                    std::fprintf(stderr, "strata serve: conversation spill skipped (%s)\n", e.c_str());
++                    return;
++                }
++                strata::core::SessionWriteOptions wo;
++                wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
++                strata::core::SessionStatus st;
++                if (!strata::core::session_file_write(path, meta, sources, id, bytes, e, wo, &st)) {
++                    std::fprintf(stderr, "strata serve: conversation spill failed (%s)\n", e.c_str());
++                    std::error_code ec;
++                    std::filesystem::remove(path, ec);
++                    return;
++                }
++            } catch (const std::bad_alloc&) {
++                std::fprintf(stderr, "strata serve: conversation spill skipped (out of memory)\n");
++                std::error_code ec;
++                std::filesystem::remove(path, ec);
++                return;
++            }
++            spills.push_back({live, live_imgs, std::move(ck_ids), std::move(ck_imgs), cvec_cached, path, bytes, ++spill_clock});
++            size_t total = 0;
++            for (const auto& sp_ : spills) total += sp_.bytes;
++            while (spills.size() > 1 && total > ((size_t) o.conversation_spill_mib << 20)) {
++                size_t oldest = 0;
++                for (size_t i = 1; i < spills.size(); ++i)
++                    if (spills[i].used < spills[oldest].used) oldest = i;
++                total -= spills[oldest].bytes;
++                spill_drop(oldest);
++            }
++            std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%zu MiB) in %.1f ms; spilled=%zu "
++                                 "disk=%zu MiB\n", live.size(), bytes >> 20,
++                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), spills.size(), total >> 20);
++        };
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+         auto park_current_body = [&](size_t held) -> bool {
+@@ -6576,6 +6743,7 @@ int main(int argc, char** argv) {
+             if (!conversations.make_room(estimate, held)) {
+                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
+                              estimate >> 20);
++                spill_current();
+                 return true;
+             }
+             const auto t0 = Clock::now();
+@@ -6587,6 +6755,7 @@ int main(int argc, char** argv) {
+                         additional, floor)) {
+                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
+                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
++                    spill_current();
+                     return true;
+                 }
+                 if (prefill_main) {   // CUDA0's session is what gets parked: whole first, and the drafter's device idle
+@@ -7479,7 +7648,8 @@ int main(int argc, char** argv) {
+                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
++                        "conversation_cache_min_free_mib=%lld conversation_spill_mib=%lld tail_role_token=%lld "
++                        "vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                         (long long) o.max_context, o.kv.c_str(),
+                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
+@@ -7490,7 +7660,9 @@ int main(int argc, char** argv) {
+                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                         pool.workers(), o.pcie_frac,
+                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+-                        (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
++                        (long long) o.conversation_cache_min_free_mib,
++                        (long long) (o.conversation_spill_dir.empty() ? 0 : o.conversation_spill_mib),
++                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
+         }
+@@ -8560,7 +8732,73 @@ int main(int argc, char** argv) {
+                     prefix = m;
+             }
+             std::optional<strata::core::SavedConversation> incoming;
+-            if (prefix.tokens == 0 && parked.tokens > std::max(resume, slot_tokens))
++            int64_t incoming_tokens = parked.tokens;
++            bool incoming_live = parked.live;
++            bool spill_restored = false;   // `incoming` was read from a spill file, not taken from the RAM cache
++            // --conversation-spill-dir: a spilled conversation this prompt continues, when it covers more than
++            // everything above
++            if (spill_on) {
++                size_t pick = spills.size();
++                bool pick_live = true;
++                int64_t best_n = std::max({resume, slot_tokens, parked.tokens, prefix.tokens});
++                for (size_t i = 0; i < spills.size(); ++i) {
++                    if (spills[i].cvec != want_cvec) continue;
++                    if ((int64_t) spills[i].ids.size() > best_n && starts_with(spills[i].ids, spills[i].imgs)) {
++                        pick = i;
++                        pick_live = true;
++                        best_n = (int64_t) spills[i].ids.size();
++                    } else if ((int64_t) spills[i].ck_ids.size() > best_n && starts_with(spills[i].ck_ids, spills[i].ck_imgs)) {
++                        pick = i;
++                        pick_live = false;
++                        best_n = (int64_t) spills[i].ck_ids.size();
++                    }
++                }
++                if (pick < spills.size()) {
++                    const auto t0 = Clock::now();
++                    strata::core::SavedConversation image;
++                    size_t bytes = 0;
++                    std::string e;
++                    bool ok = false;
++                    try {
++                        strata::core::SessionFileIdentity id;
++                        strata::core::SessionReadLimits limits;
++                        limits.admit = spill_admit;
++                        strata::core::SessionStatus st;
++                        ok = session_identity(id, e, {}) &&
++                             strata::core::conversation_session_read_limits(
++                                 limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
++                                 (uint64_t) std::max(o.prompt_cache, 1), e) &&
++                             strata::core::session_file_read(spills[pick].path, id, image, bytes, e, limits, &st);
++                    } catch (const std::bad_alloc&) {
++                        e = "out of memory";
++                    }
++                    if (ok && !pick_live) {   // the file's checkpoint must be there, with these tokens
++                        ok = false;
++                        for (const ConvCheckpoint& c : image.checkpoints) ok = ok || c.ids == spills[pick].ck_ids;
++                    }
++                    if (ok && (!pick_live || image.live.ids == spills[pick].ids)) {
++                        std::fprintf(stderr, "strata serve: conversation spill: read %lld tokens (%s, %zu MiB) in %.1f ms; "
++                                             "spilled=%zu disk=%zu MiB\n",
++                                     (long long) best_n, pick_live ? "live" : "checkpoint", bytes >> 20,
++                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
++                                     spills.size(), spill_disk() >> 20);
++                        incoming.emplace(std::move(image));
++                        incoming_tokens = best_n;
++                        incoming_live = pick_live;
++                        spill_restored = true;
++                        prefix = {};
++                        spills[pick].used = ++spill_clock;   // the file stays: the next spill of it may keep it
++                    } else {
++                        std::fprintf(stderr, "strata serve: conversation spill: reading %s failed (%s); the prompt is "
++                                             "read instead\n", spills[pick].path.c_str(),
++                                     ok ? "its tokens do not match" : e.c_str());
++                        spill_drop(pick);
++                        std::fprintf(stderr, "strata serve: conversation spill: dropped it; spilled=%zu disk=%zu MiB\n",
++                                     spills.size(), spill_disk() >> 20);
++                    }
++                }
++            }
++            if (!incoming && prefix.tokens == 0 && parked.tokens > std::max(resume, slot_tokens))
+                 incoming.emplace(conversations.take(parked.index));
+             if (incoming || prefix.tokens > 0) slot_source = -1;
+             // Reject the entire image before parking/overwriting the outgoing
+@@ -8590,7 +8828,7 @@ int main(int argc, char** argv) {
+             // Preserve the outgoing branch before any checkpoint rewind, reset,
+             // or incoming restore overwrites the positional state it requires.
+             if ((!from_live || incoming || slot_source >= 0 || prefix.tokens > 0) &&
+-                !park_current(incoming ? incoming->bytes() : 0)) {
++                !park_current(incoming && !spill_restored ? incoming->bytes() : 0)) {
+                 std::printf("ERR %s\n", err.c_str());
+                 return 1;
+             }
+@@ -8682,16 +8920,19 @@ int main(int argc, char** argv) {
+                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                 }
+                 cvec_cached = incoming->cvec;
+-                resume = parked.tokens;
+-                from_live = parked.live;
+-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
++                resume = incoming_tokens;
++                from_live = incoming_live;
++                if (spill_restored)   // the file's checkpoints carry their own LRU stamps
++                    for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
++                // a spilled image's K/V is not retained: it would hold the whole conversation in RAM again
++                if (!spill_restored && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
+                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
+                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                 }
+                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
+-                             (long long) resume, from_live ? "live" : "checkpoint",
++                             (long long) resume, spill_restored ? "spill" : from_live ? "live" : "checkpoint",
+                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                              conversations.size(), conversations.bytes());
+                 pm_synced = 0;   // the stage's copy is replaced whole

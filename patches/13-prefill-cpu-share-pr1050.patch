@@ -1,5 +1,5 @@
 diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
-index 3a1715e..e0620ea 100644
+index cc32ebe..33834fd 100644
 --- a/include/strata/prefill/prefill.hpp
 +++ b/include/strata/prefill/prefill.hpp
 @@ -23,6 +23,7 @@
@@ -19,7 +19,7 @@ index 3a1715e..e0620ea 100644
      double ms_ple = 0;
  };
  
-@@ -160,7 +163,16 @@ public:
+@@ -165,9 +168,18 @@ public:
      /// run `init`.
      bool set_stage_helper(Prefill* helper, std::string& err);
  
@@ -32,24 +32,26 @@ index 3a1715e..e0620ea 100644
 +    void set_cpu_pool(kernels::cpu::ExpertPool* pool);
 +
  private:
+     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                       bool owned_pages, bool src);
 +    kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
      // Stage-1 pipeline: intermediate stages return after handing their chunk to
      // the direct successor. The public run() drains the chain once at prompt end.
      bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
-index ad965c7..1ad7d66 100644
+index cc834d8..7548e14 100644
 --- a/src/prefill/prefill.cpp
 +++ b/src/prefill/prefill.cpp
-@@ -6,6 +6,8 @@
- 
+@@ -9,6 +9,8 @@
  #include "strata/core/layout.hpp"
  #include "strata/kernels/cpu/expert.hpp"
+ #include "strata/kernels/native_qsa.hpp"
 +#include "strata/kernels/cpu/native_expert.hpp"
 +#include "strata/kernels/cpu/pool.hpp"
  #include "strata/kernels/native_qsa_indexer.hpp"
  #include "strata/kernels/ngram.hpp"
  #include "strata/kernels/ple.hpp"
-@@ -105,6 +107,24 @@ inline int64_t stream_all_min() {
+@@ -114,6 +116,24 @@ inline int64_t stream_all_min() {
      static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1024; }();
      return v;
  }
@@ -74,7 +76,7 @@ index ad965c7..1ad7d66 100644
  double g_pinned_share = 1.0;
  // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
  // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
-@@ -522,6 +542,20 @@ struct Prefill::Impl {
+@@ -584,6 +604,20 @@ struct Prefill::Impl {
      std::vector<int32_t> bounds_host;
      std::unique_ptr<mmq::Context> mmq_ctx;
      std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
@@ -95,9 +97,9 @@ index ad965c7..1ad7d66 100644
      // The grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then the MMQ bounds: kernels
      // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
      // holds (up to `ring` of them, ~70 us each), and the GPU idles meanwhile - measured 4.2 s of a 128K prompt's
-@@ -628,6 +662,10 @@ void Prefill::release() {
-     }
-     if (impl_->copy) cudaStreamDestroy(impl_->copy);
+@@ -700,6 +734,10 @@ void Prefill::release() {
+     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
+     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
      if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
 +    for (float* p : {impl_->cpu_x, impl_->cpu_rows})
 +        if (p) cudaFreeHost(p);
@@ -106,7 +108,7 @@ index ad965c7..1ad7d66 100644
      for (void* p : impl_->owned) cudaFree(p);
  }
  
-@@ -1447,6 +1485,7 @@ int64_t Prefill::ring_max_slots() {
+@@ -1582,6 +1620,7 @@ int64_t Prefill::ring_max_slots() {
  }
  
  int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
@@ -114,7 +116,7 @@ index ad965c7..1ad7d66 100644
  
  bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
  
-@@ -2300,6 +2339,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+@@ -2550,6 +2589,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                      }
                      size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
                      bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
@@ -127,7 +129,7 @@ index ad965c7..1ad7d66 100644
                      if (fused_l) {
                          if (static bool said = false; !said) {
                              said = true;
-@@ -2369,12 +2414,39 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+@@ -2619,12 +2664,39 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
                          if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
                          else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
@@ -167,7 +169,7 @@ index ad965c7..1ad7d66 100644
                          pt.fold();
                          if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                              int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
-@@ -2385,6 +2457,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+@@ -2635,6 +2707,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                              ++m.cnt[(size_t) e];
                          }
@@ -197,7 +199,7 @@ index ad965c7..1ad7d66 100644
                          // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
                          const bool pre_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                          std::vector<char> on_peer;
-@@ -2410,12 +2505,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+@@ -2660,12 +2755,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          {
                              int32_t r = 0;
                              for (int32_t e = 0; e < m.g->n_expert; ++e)
@@ -217,7 +219,7 @@ index ad965c7..1ad7d66 100644
                          }
                          std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                          for (int64_t i = 0; i < T * K; ++i) {
-@@ -2434,11 +2535,71 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+@@ -2677,7 +2778,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          // the experts, in id order: resident ones from VRAM, the others through the staging ring
                          std::vector<int32_t> order, order_peer;
                          for (int32_t e = 0; e < m.g->n_expert; ++e)
@@ -227,6 +229,9 @@ index ad965c7..1ad7d66 100644
                                  (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                          for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
                              if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
+@@ -2697,6 +2799,65 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
+                         }
                          n_order = order.size();
 +                        // set_cpu_pool: the CPU's experts on a thread while this one streams and runs the GPU's; their
 +                        // unweighted rows land in Dm's row order, so the combine weights them as any other row
@@ -290,7 +295,7 @@ index ad965c7..1ad7d66 100644
                          const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                          const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                          pt.mark(kPfGather, cs);
-@@ -2901,6 +3062,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+@@ -3159,6 +3320,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          }
                      }
                      pt.mark(kPfCombine, cs);
@@ -313,10 +318,10 @@ index ad965c7..1ad7d66 100644
                          cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
                          if (!m.pp->p2p)
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index 9894c01..600609f 100644
+index 6cedeea..c59f7aa 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
-@@ -5183,6 +5183,9 @@ int main(int argc, char** argv) {
+@@ -5885,6 +5885,9 @@ int main(int argc, char** argv) {
                  if (prefill_main) sp.set_stage(0, -1, nullptr);   // all layers on the main device
                  else sp.set_stage(0, split_at[0], &stages[0]->sp);
              }
@@ -326,7 +331,7 @@ index 9894c01..600609f 100644
              if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                  return err.find("do not fit") != std::string::npos ? 2 : 1;
              return 0;
-@@ -9385,6 +9388,7 @@ int main(int argc, char** argv) {
+@@ -10668,6 +10671,7 @@ int main(int argc, char** argv) {
          }
          if (borrow == nullptr)
              std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
@@ -334,7 +339,7 @@ index 9894c01..600609f 100644
          if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                            host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                            borrow_bytes)) {
-@@ -9439,10 +9443,11 @@ int main(int argc, char** argv) {
+@@ -10731,10 +10735,11 @@ int main(int argc, char** argv) {
          ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
          const strata::prefill::PrefillStats& ps = prefill.stats();
          std::fprintf(stderr, "strata generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
@@ -347,4 +352,4 @@ index 9894c01..600609f 100644
 +                     (long long) ps.experts_cpu, ps.cpu_share, ps.ms_ple);
      }
  
-     for (int64_t pos = pos_start;; ++pos) {
+     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches

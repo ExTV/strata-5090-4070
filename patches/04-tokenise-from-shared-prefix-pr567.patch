@@ -1,12 +1,16 @@
 diff --git a/serve/server.py b/serve/server.py
-index 9e66982..a3e7879 100644
+index d6b1fc3..dbfec9e 100644
 --- a/serve/server.py
 +++ b/serve/server.py
-@@ -1596,20 +1596,26 @@ class ByteTokenizer:
+@@ -1985,24 +1985,30 @@ class ByteTokenizer:
      SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
  
      ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
 +    max_special_len = max(len(s) for s in SPECIALS)
+ 
+     @property
+     def control_tokens(self):
+         return [s for s in self.SPECIALS if s not in self.ALWAYS]
  
      def encode(self, text, parse_special=False, plain=()):
 -        out, i = [], 0
@@ -31,7 +35,7 @@ index 9e66982..a3e7879 100644
  
      def decode(self, ids, errors="replace"):
          raw = bytearray()
-@@ -1708,6 +1714,18 @@ class Service:
+@@ -2205,6 +2211,18 @@ class Service:
          self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
          self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                              tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -50,20 +54,20 @@ index 9e66982..a3e7879 100644
  
      def loaded(self) -> bool:
          return not hasattr(self.engine, "alive") or self.engine.alive()
-@@ -2138,7 +2156,7 @@ class Service:
-         marked, marked_tools, changed = mark_think_literals(messages, tools)
+@@ -2701,7 +2719,7 @@ class Service:
+         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
          prompt = self.render_prompt(marked, marked_tools, kwargs)
          if not changed:
 -            return self.tok.encode(prompt, parse_special=True)
 +            return self.encode_text(prompt)
-         prompt, plain = unmark_think_literals(prompt)
+         prompt, plain = unmark_think_literals(prompt, self.literals)
          return self.tok.encode(prompt, parse_special=True, plain=plain)
  
 diff --git a/serve/test_server.py b/serve/test_server.py
-index 0ffe2f6..c5ed53f 100644
+index 590cf05..85c8256 100644
 --- a/serve/test_server.py
 +++ b/serve/test_server.py
-@@ -838,6 +838,59 @@ class RecordingPrompt(MockEngine):
+@@ -1310,6 +1310,59 @@ class RecordingPrompt(MockEngine):
          yield from super().generate(ids, max_new, sampling, cancel, embeddings)
  
  
@@ -124,7 +128,7 @@ index 0ffe2f6..c5ed53f 100644
      """Issue #27: an engine that dies after a few tokens of its first answer, and comes back when restarted."""
  
 diff --git a/tools/strata_tokenizer.py b/tools/strata_tokenizer.py
-index 8b79419..80c41e4 100644
+index 11fcd45..ee47f1f 100644
 --- a/tools/strata_tokenizer.py
 +++ b/tools/strata_tokenizer.py
 @@ -15,9 +15,11 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
@@ -139,7 +143,7 @@ index 8b79419..80c41e4 100644
  
  import regex
  
-@@ -110,6 +112,8 @@ class Tokenizer:
+@@ -111,6 +113,8 @@ class Tokenizer:
          # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
          self._always_re = self._alt(always)
          self._special_re = self._alt(list(self.special_tokens))
@@ -148,7 +152,7 @@ index 8b79419..80c41e4 100644
  
      @staticmethod
      def _alt(literals: list[str]):
-@@ -213,13 +217,16 @@ class Tokenizer:
+@@ -214,13 +218,16 @@ class Tokenizer:
                  out.append(i)
          return out
  
@@ -166,7 +170,7 @@ index 8b79419..80c41e4 100644
          """
          if pat is None:
              return self._encode_plain(text)
-@@ -232,6 +239,8 @@ class Tokenizer:
+@@ -233,6 +240,8 @@ class Tokenizer:
                  out.extend(self._encode_plain(text[pos:m.start()]))
              out.append(self.special_tokens[m.group(0)])
              pos = m.end()
@@ -175,7 +179,7 @@ index 8b79419..80c41e4 100644
          if pos < len(text):
              out.extend(self._encode_plain(text[pos:]))
          return out
-@@ -246,6 +255,12 @@ class Tokenizer:
+@@ -247,6 +256,12 @@ class Tokenizer:
          """
          return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
  
@@ -188,7 +192,7 @@ index 8b79419..80c41e4 100644
      def token_bytes(self, i: int) -> bytes:
          """The raw bytes of one token (a multi-byte character can be split across tokens)."""
          cache = self.__dict__.setdefault("_bytes_cache", {})
-@@ -266,6 +281,79 @@ class Tokenizer:
+@@ -267,6 +282,79 @@ class Tokenizer:
          return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
  
  

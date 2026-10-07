@@ -1,0 +1,265 @@
+diff --git a/serve/server.py b/serve/server.py
+index 0169374..7715940 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -28,6 +28,7 @@ import hashlib
+ import hmac
+ import codecs
+ import ctypes
++import glob
+ import json
+ import math
+ import os
+@@ -1954,6 +1955,25 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
+     return args
+ 
+ 
++
++def remove_spill_files(cfg: dict) -> int:
++    """--conversation-spill-dir: the engine deletes its spill files when it ends on QUIT; this removes what an engine
++    that was killed or crashed left behind (the server's own stop calls it after the engine is gone).  A relative
++    directory is the engine's (the config's "cwd").  Returns how many files went."""
++    args = [str(x) for x in cfg.get("args") or []]
++    if "--conversation-spill-dir" not in args[:-1]:
++        return 0
++    d = args[args.index("--conversation-spill-dir") + 1]
++    d = d if os.path.isabs(d) else os.path.join(cfg.get("cwd") or ".", d)
++    n = 0
++    for f in glob.glob(os.path.join(glob.escape(d), "spill-*.ses")):
++        try:
++            os.remove(f)
++            n += 1
++        except OSError:
++            pass
++    return n
++
+ def hip_visible(cfg: dict) -> list[int]:
+     """AMD: the devices the engine should see, as the HIP runtime numbers them (HIP_VISIBLE_DEVICES).
+ 
+@@ -5041,8 +5061,8 @@ def main() -> int:
+             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
+     except KeyboardInterrupt:
+         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+-                   hub.close if hub is not None else None]
++        closers = [httpd.shutdown, getattr(engine, "close", None), lambda: remove_spill_files(cfg),
++                   vision.shutdown if vision else None, hub.close if hub is not None else None]
+         for close in filter(None, closers):
+             try:
+                 close()
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 5588d28..34e6882 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -4074,5 +4074,27 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
+         self.assertEqual(ids[1][:len(first) - 8], first[:len(first) - 8])   # all but the generation header
+ 
+ 
++
++class SpillCleanup(unittest.TestCase):
++    """--conversation-spill-dir: what a killed engine left behind goes when the server stops; other files stay."""
++
++    def setUp(self):
++        from serve import server
++        self.server = server
++
++    def test_removes_only_the_spill_files(self):
++        with tempfile.TemporaryDirectory() as d:
++            spill = os.path.join(d, "spill")
++            os.mkdir(spill)
++            for n in ("spill-1.ses", "spill-12.ses", "keep.ses", "spill-1.txt"):
++                open(os.path.join(spill, n), "wb").close()
++            cfg = {"cwd": d, "args": ["--pack", "p", "--conversation-spill-dir", "spill"]}
++            self.assertEqual(self.server.remove_spill_files(cfg), 2)
++            self.assertEqual(sorted(os.listdir(spill)), ["keep.ses", "spill-1.txt"])
++
++    def test_no_spill_dir(self):
++        self.assertEqual(self.server.remove_spill_files({"args": ["--conversation-spill-dir"]}), 0)
++        self.assertEqual(self.server.remove_spill_files({}), 0)
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 36fb081..c6f5653 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -6551,8 +6551,11 @@ int main(int argc, char** argv) {
+         // the RAM floors are not applied here: the box this is for runs with ~1 GB available and zram behind it, and
+         // the alternative is reading the whole conversation again
+         auto spill_admit = [](uint64_t, std::string&) { return true; };
+-        auto spill_current = [&]() {
+-            if (!spill_on || !live_ok || live.empty()) return;
++        // `cancel` (the idle write): polled before every block the file reads from the pools; true abandons the
++        // write (its temporary file goes) and keeps every older file.  Returns true when the conversation has a
++        // spill on disk afterwards (written now, or kept).
++        auto spill_current = [&](const std::function<bool()>& cancel = {}) -> bool {
++            if (!spill_on || !live_ok || live.empty()) return false;
+             const auto t0 = Clock::now();
+             std::string e;
+             // An older spill of this conversation (its end or its checkpoint is the start of the live tokens): while
+@@ -6577,25 +6580,24 @@ int main(int argc, char** argv) {
+                     if (i != keep && spills[i].cvec == cvec_cached &&
+                         std::max(covers(spills[i].ids), covers(spills[i].ck_ids)) > 0)
+                         spill_drop(i);
+-                std::fprintf(stderr, "strata serve: conversation spill: kept the spill of this conversation (%zu tokens "
+-                                     "behind); spilled=%zu disk=%zu MiB\n", live.size() - keep_n, spills.size(),
+-                             spill_disk() >> 20);
+-                return;
++                if (!cancel)
++                    std::fprintf(stderr, "strata serve: conversation spill: kept the spill of this conversation (%zu "
++                                         "tokens behind); spilled=%zu disk=%zu MiB\n", live.size() - keep_n,
++                                 spills.size(), spill_disk() >> 20);
++                return true;
+             }
+-            for (size_t i = spills.size(); i-- > 0;)
+-                if (spills[i].cvec == cvec_cached && std::max(covers(spills[i].ids), covers(spills[i].ck_ids)) > 0)
+-                    spill_drop(i);
+             if (prefill_main) {   // CUDA0's session is what gets written: whole first, and the drafter's device idle
+                 if (!pm_main_whole(e, (int64_t) live.size())) {
+                     std::fprintf(stderr, "strata serve: conversation spill skipped (%s)\n", e.c_str());
+-                    return;
++                    return false;
+                 }
+                 const strata::core::OnDevice on(stages.back()->dev);
+                 if (cudaDeviceSynchronize() != cudaSuccess) {
+                     std::fprintf(stderr, "strata serve: conversation spill skipped (stage sync failed)\n");
+-                    return;
++                    return false;
+                 }
+             }
++            bool cancelled = false;
+             const std::string path = o.conversation_spill_dir + "/spill-" + std::to_string(++spill_seq) + ".ses";
+             size_t bytes = 0;
+             std::vector<int32_t> ck_ids;
+@@ -6604,7 +6606,7 @@ int main(int argc, char** argv) {
+                 strata::core::SessionFileIdentity id;
+                 if (!session_identity(id, e, {})) {
+                     std::fprintf(stderr, "strata serve: conversation spill skipped (%s)\n", e.c_str());
+-                    return;
++                    return false;
+                 }
+                 strata::core::SessionSaveLive sl;
+                 {
+@@ -6624,7 +6626,7 @@ int main(int argc, char** argv) {
+                 std::vector<ConvCheckpoint> disk_checks;
+                 if (!strata::core::session_save_checkpoints(checks, sl, spill_admit, disk_checks, e)) {
+                     std::fprintf(stderr, "strata serve: conversation spill skipped (%s)\n", e.c_str());
+-                    return;
++                    return false;
+                 }
+                 for (const ConvCheckpoint& c : disk_checks)
+                     if (c.ids.size() > ck_ids.size() && c.ids.size() < live.size()) { ck_ids = c.ids; ck_imgs = c.imgs; }
+@@ -6633,23 +6635,40 @@ int main(int argc, char** argv) {
+                 std::vector<strata::core::SessionKvSource> sources;
+                 if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(), e)) {
+                     std::fprintf(stderr, "strata serve: conversation spill skipped (%s)\n", e.c_str());
+-                    return;
++                    return false;
+                 }
++                if (cancel)   // the idle write: each block first asks whether a request has come in
++                    for (auto& src : sources) {
++                        auto read = std::move(src.read);
++                        src.read = [read = std::move(read), &cancel, &cancelled](size_t part, size_t off, void* dst,
++                                                                                  size_t n) {
++                            if (cancel()) { cancelled = true; return false; }
++                            return read(part, off, dst, n);
++                        };
++                    }
+                 strata::core::SessionWriteOptions wo;
+                 wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                 strata::core::SessionStatus st;
+                 if (!strata::core::session_file_write(path, meta, sources, id, bytes, e, wo, &st)) {
+-                    std::fprintf(stderr, "strata serve: conversation spill failed (%s)\n", e.c_str());
++                    if (cancelled)
++                        std::fprintf(stderr, "strata serve: conversation spill: the idle write gave way to a request "
++                                             "after %.1f ms\n",
++                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
++                    else
++                        std::fprintf(stderr, "strata serve: conversation spill failed (%s)\n", e.c_str());
+                     std::error_code ec;
+                     std::filesystem::remove(path, ec);
+-                    return;
++                    return false;
+                 }
+             } catch (const std::bad_alloc&) {
+                 std::fprintf(stderr, "strata serve: conversation spill skipped (out of memory)\n");
+                 std::error_code ec;
+                 std::filesystem::remove(path, ec);
+-                return;
++                return false;
+             }
++            for (size_t i = spills.size(); i-- > 0;)   // the older spills of this conversation: this one replaces them
++                if (spills[i].cvec == cvec_cached && std::max(covers(spills[i].ids), covers(spills[i].ck_ids)) > 0)
++                    spill_drop(i);
+             spills.push_back({live, live_imgs, std::move(ck_ids), std::move(ck_imgs), cvec_cached, path, bytes, ++spill_clock});
+             size_t total = 0;
+             for (const auto& sp_ : spills) total += sp_.bytes;
+@@ -6660,9 +6679,11 @@ int main(int argc, char** argv) {
+                 total -= spills[oldest].bytes;
+                 spill_drop(oldest);
+             }
+-            std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%zu MiB) in %.1f ms; spilled=%zu "
++            std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%zu MiB) in %.1f ms%s; spilled=%zu "
+                                  "disk=%zu MiB\n", live.size(), bytes >> 20,
+-                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), spills.size(), total >> 20);
++                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
++                         cancel ? " while idle" : "", spills.size(), total >> 20);
++            return true;
+         };
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+@@ -8205,6 +8226,29 @@ int main(int argc, char** argv) {
+                 if (!pump(false)) return false;
+             return true;
+         };
++        // --conversation-spill-dir: once the engine has been idle for 2 s after a request, a conversation too big for
++        // the parking budget is written to its spill file now, instead of on the next request's clock when another
++        // conversation comes in.  A line arriving meanwhile abandons the write at its next 16 MiB block; the next
++        // switch then writes it as before (or keeps an earlier file of it).
++        uint64_t served = 0, idle_tried = 0;
++        auto spill_idle = [&]() {
++            auto line_waiting = [&] {
++                std::lock_guard<std::mutex> lk(in_mu);
++                return !in_lines.empty() || in_eof;
++            };
++            {
++                std::unique_lock<std::mutex> lk(in_mu);
++                if (in_cv.wait_for(lk, std::chrono::seconds(2), [&] { return !in_lines.empty() || in_eof; })) return;
++            }
++            if (!live_ok || live.empty() || !conversations.enabled()) return;
++            size_t estimate = 0;
++            std::string e;
++            const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
++            if (!strata::core::conversation_snapshot_bytes(view, ss, g, use_mtp ? &mtp.kv_state() : nullptr, estimate, e) ||
++                estimate <= ((size_t) o.conversation_cache_mib << 20))
++                return;   // it parks (or cannot be sized): the switch handles it
++            spill_current(line_waiting);
++        };
+         for (;;) {
+             if (batch_on() || (piped && pipe_inflight())) {
+                 if (!try_next_line(line)) {
+@@ -8213,9 +8257,14 @@ int main(int argc, char** argv) {
+                 }
+                 // a request reads its prompt through every stage: the groups in flight finish first
+                 if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
+-            } else if (!next_line(line)) {
+-                break;
++            } else {
++                if (spill_on && idle_tried != served) {
++                    idle_tried = served;
++                    spill_idle();
++                }
++                if (!next_line(line)) break;
+             }
++            ++served;
+             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
+             // request's prompt and first token as a GEN 1, then continues it in that slot
+             if (line.rfind("BSTOP ", 0) == 0) {
+@@ -11052,6 +11101,7 @@ int main(int argc, char** argv) {
+                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
+         }
+         save_profile("exit");   // #477: QUIT, or the server closed stdin
++        while (!spills.empty()) spill_drop(spills.size() - 1);   // the spill files belong to this run
+         return 0;
+     }
+ 

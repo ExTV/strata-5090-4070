@@ -1,8 +1,8 @@
 diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
-index 1a7ca8d..b8e5dab 100644
+index 78e3c6d..d53457e 100644
 --- a/src/core/expert_source.cpp
 +++ b/src/core/expert_source.cpp
-@@ -1462,7 +1462,10 @@ bool FileExpertSource::pin_cache_complement(
+@@ -1773,7 +1773,10 @@ bool FileExpertSource::pin_cache_complement(
          lend_from_slot = -1;
      }
  

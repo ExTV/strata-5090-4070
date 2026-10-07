@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Clones upstream Strata at the v0.1.39 tag into ./strata, applies the patch series in patches/ (Hardin22's two-GPU
-# PRs, twelve other open PRs and our own patches, in the order they were merged and tested), builds the engine and the vision helper
+# Clones upstream Strata at the v0.1.40.1 tag into ./strata, applies the patch series in patches/ (ten open
+# upstream PRs and our own patches, in the order they were merged and tested), builds the engine and the vision helper
 # for an RTX 5090 (sm_120) + RTX 4070 Ti SUPER (sm_89), makes the Python venv, and writes the server config
 # from configs/flash-next-262k.json.in with $MODELS filled in.  Safe to re-run: patches already applied are
 # skipped and cmake only rebuilds what changed.  The expert pack and the MTP drafter are built by prepare.sh.
@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 STRATA_REPO=${STRATA_REPO:-https://github.com/Niko1221/Strata.git}
-STRATA_COMMIT=${STRATA_COMMIT:-a1641e9f77aacad4d201b53c8a7ae8fa21059ebb}   # tag v0.1.39 (2026-10-04)
+STRATA_COMMIT=${STRATA_COMMIT:-82f46a8c8f475f001ad76d92f58f4a4f8ffb0253}   # tag v0.1.40.1 (2026-10-06)
 MODELS=${MODELS:-$PWD/models}
 CUDA_ARCHS=${CUDA_ARCHS:-"89;120"}
 JOBS=${JOBS:-3}          # a cicc/nvcc job takes ~3 GB of RAM; 3 jobs fit a 32 GB box next to a desktop
@@ -33,7 +33,7 @@ for p in ../patches/[0-9][0-9]-*.patch; do
     if grep -qxF "$name" .patches-applied; then
         echo "already applied  $name"
     elif patch -p1 --dry-run --forward --quiet < "$p" >/dev/null 2>&1; then
-        patch -p1 --forward --quiet -b -z .orig-v0139 < "$p"
+        patch -p1 --forward --quiet -b -z .orig-v0140 < "$p"
         echo "$name" >> .patches-applied
         echo "applied          $name"
     else

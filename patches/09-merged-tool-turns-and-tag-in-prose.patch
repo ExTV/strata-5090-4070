@@ -1,9 +1,9 @@
 diff --git a/serve/frontend.py b/serve/frontend.py
-index f198ed6..bd61d62 100644
+index 068da78..b8b26b2 100644
 --- a/serve/frontend.py
 +++ b/serve/frontend.py
-@@ -257,10 +257,61 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
-     return tools
+@@ -302,10 +302,61 @@ def tool_arguments(raw) -> dict:
+     return {"arguments": json.dumps(raw, ensure_ascii=False)}
  
  
 +# A tool call id names the response that issued it (OutputParser.new_id): "call_<16 hex>_<n>".
@@ -65,14 +65,27 @@ index f198ed6..bd61d62 100644
          role = m.get("role")
          if role == "developer":
              role = "system"
-@@ -504,8 +555,15 @@ class OutputParser:
-         # the reply's "adaptations"), and the name of a detected shape no enabled fix covers
-         self.adaptations: list[str] = []
-         self.format_hint: str | None = None
+@@ -607,6 +658,9 @@ class OutputParser:
+         self.rescued = 0             # calls delivered from the reasoning
+         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
+         self.fence, self.line, self.ticks = "", "", 0
 +        # this response's mark in its tool call ids: a client that later sends the calls of several responses in
 +        # one assistant message can be read back in the order they were written (_split_tool_steps)
 +        self.step, self.ncalls = uuid.uuid4().hex[:16], 0
          self._reset_scan()
+ 
+     def _track(self, text: str) -> str:
+@@ -644,6 +698,7 @@ class OutputParser:
+         out = []
+         for raw, call in self.pending:
+             if call is not None and deliver:
++                call.id = self.new_id()
+                 out.append(Event("tool_call", call=call))
+                 self.rescued += 1
+             elif call is None or not deliver:
+@@ -654,6 +709,10 @@ class OutputParser:
+         self.pending = []
+         return out
  
 +    def new_id(self) -> str:
 +        self.ncalls += 1
@@ -81,7 +94,7 @@ index f198ed6..bd61d62 100644
      def _reset_scan(self):
          self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
          self.ss = "name"             # name -> between -> str|raw -> ... -> done
-@@ -529,7 +587,7 @@ class OutputParser:
+@@ -677,7 +736,7 @@ class OutputParser:
                  if b < 0:
                      return out
                  name = rest[a + 10:b]
@@ -90,32 +103,7 @@ index f198ed6..bd61d62 100644
                  props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                  self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
                  out.append(Event("tool_start", call=self.scall))
-@@ -685,6 +743,8 @@ class OutputParser:
-             self.format_hint = "stranded-call"   # detected but not enabled: the serve says so, changes nothing
-             return []
-         self.adaptations.append("stranded-call")
-+        for call in calls:
-+            call.id = self.new_id()
-         return [Event("tool_call", call=call) for call in calls]
- 
-     def feed(self, delta: str) -> list[Event]:
-@@ -725,6 +785,15 @@ class OutputParser:
-                         out.append(Event("content", self.buf[:j]))
-                         self.buf = self.buf[j:]
-                     return out
-+                # A call is the tag followed by <function= (as the template writes it).  The tag named in a
-+                # sentence is text: taken as a call, everything after it failed to parse and ended the request.
-+                after = self.buf[i + len(CALL_START):].lstrip()
-+                if not "<function=".startswith(after[:len("<function=")]):
-+                    out.append(Event("content", self.buf[:i + len(CALL_START)]))
-+                    self.buf = self.buf[i + len(CALL_START):]
-+                    continue
-+                if len(after) < len("<function="):              # not decided yet: wait for what follows
-+                    return out
-                 if i and self.buf[:i].strip():
-                     out.append(Event("content", self.buf[:i].rstrip("\n")))
-                 self.buf = self.buf[i + len(CALL_START):]
-@@ -745,8 +814,7 @@ class OutputParser:
+@@ -916,8 +975,7 @@ class OutputParser:
                  self.buf = self.buf[i + len(CALL_END):]
                  name = body.strip()[len("<function="):].split(">", 1)[0]
                  call = parse_tool_call(body, self.schemas.get(name))

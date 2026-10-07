@@ -1,0 +1,87 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 0d8154e..36fb081 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -8786,6 +8786,11 @@ int main(int argc, char** argv) {
+             int64_t incoming_tokens = parked.tokens;
+             bool incoming_live = parked.live;
+             bool spill_restored = false;   // `incoming` was read from a spill file, not taken from the RAM cache
++            // a spill of a single session (no later-stage images) is read in two passes: `incoming` gets the running
++            // state and the K/V headers, the K/V stays on disk until the restore streams it into the pools
++            const bool spill_stream = prefill_main || stages.empty();
++            std::string spill_path;
++            std::vector<std::array<uint64_t, 5>> spill_kv;   // the K/V part sizes the read pass validated
+             // --conversation-spill-dir: a spilled conversation this prompt continues, when it covers more than
+             // everything above
+             if (spill_on) {
+@@ -8819,7 +8824,10 @@ int main(int argc, char** argv) {
+                              strata::core::conversation_session_read_limits(
+                                  limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                  (uint64_t) std::max(o.prompt_cache, 1), e) &&
+-                             strata::core::session_file_read(spills[pick].path, id, image, bytes, e, limits, &st);
++                             (spill_stream
++                                  ? strata::core::session_file_read_streamed(spills[pick].path, id, image, bytes, e,
++                                                                             limits, &spill_kv, &st)
++                                  : strata::core::session_file_read(spills[pick].path, id, image, bytes, e, limits, &st));
+                     } catch (const std::bad_alloc&) {
+                         e = "out of memory";
+                     }
+@@ -8837,6 +8845,7 @@ int main(int argc, char** argv) {
+                         incoming_tokens = best_n;
+                         incoming_live = pick_live;
+                         spill_restored = true;
++                        if (spill_stream) spill_path = spills[pick].path;
+                         prefix = {};
+                         spills[pick].used = ++spill_clock;   // the file stays: the next spill of it may keep it
+                     } else {
+@@ -8870,8 +8879,10 @@ int main(int argc, char** argv) {
+                     break;
+                 }
+             }
+-            if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
+-                    use_mtp && n_park == 0 ? &mtp.kv_state() : nullptr, err)) {
++            const strata::core::QsaState* draft_kv = use_mtp && n_park == 0 ? &mtp.kv_state() : nullptr;
++            if (incoming && !(spill_path.empty()
++                                  ? strata::core::conversation_snapshot_validate(*incoming, ss, g, draft_kv, err)
++                                  : strata::core::conversation_snapshot_validate_meta(*incoming, ss, g, draft_kv, err))) {
+                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
+                 incoming.reset();
+                 err.clear();
+@@ -8925,9 +8936,36 @@ int main(int argc, char** argv) {
+                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
+                 return 1;
+             }
++            if (incoming && !spill_path.empty()) {
++                // the streamed spill: disk -> the authoritative pools in blocks of at most 16 MiB, bound to the part
++                // sizes the read pass validated; once a block is written a failure is fatal, as below
++                std::vector<strata::core::ConversationKvTarget> targets;
++                bool touched = false;
++                auto sink = [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t n) {
++                    if (layer >= targets.size()) { err = "session file: K/V layer outside the validated set"; return false; }
++                    touched = true;
++                    return targets[layer].apply(part, offset, data, n, err);
++                };
++                strata::core::SessionFileIdentity id;
++                strata::core::SessionStatus st;
++                const auto t0 = Clock::now();
++                bool ok = strata::core::conversation_kv_targets(*incoming, ss, g,
++                              use_mtp ? &mtp.kv_state() : nullptr, targets, err) &&
++                          cudaDeviceSynchronize() == cudaSuccess && session_identity(id, err, {}) &&
++                          strata::core::session_file_apply_streamed(spill_path, id, sink, spill_kv, err, &st);
++                for (size_t i = 0; ok && i < targets.size(); ++i) ok = targets[i].finish(err);
++                ok = ok && strata::core::conversation_checkpoint_restore(incoming->live, ss, g, err);
++                if (!ok) {
++                    std::printf("ERR restoring spilled conversation%s: %s\n", touched ? "" : " (nothing written)",
++                                err.c_str());
++                    return 1;
++                }
++                std::fprintf(stderr, "strata serve: conversation spill: streamed %s into the K/V in %.1f ms\n",
++                             spill_path.c_str(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
++            }
+             if (incoming) {
+                 const auto t0 = Clock::now();
+-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
++                if (spill_path.empty() && strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                         use_mtp && n_park == 0 ? &mtp.kv_state() : nullptr, err) !=
+                     strata::core::ConversationRestore::restored) {
+                     // Already prevalidated above: a failure here is fatal, never
