@@ -1,0 +1,185 @@
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index d5a0c1fd..a7431549 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -946,7 +946,7 @@ moving spare row are preserved, including checkpoint rewinds.
+ The engine log reports parking, restoration, bytes, evictions, individual snapshot
+ sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
+ retention for diagnostic comparisons. Parked snapshots are not
+-persisted across restarts; the session files below are.
++persisted across restarts; the session files and the prefix snapshots below are.
+ 
+ **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
+ restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
+@@ -1029,12 +1029,21 @@ only its own temporary file. Once the rename is done the old file is gone: if th
+ fails with `published` set - the new file's bytes are complete and flushed, but its name may not survive a power loss.
+ A filesystem that cannot flush a folder (`EINVAL`) is not a failure; the engine logs it. A restore opens `path` without following a symbolic link (or a Windows reparse point) and refuses
+ anything but a regular file with one name; it checks the size, the header, both fingerprints (before the payload is
+-parsed; the first 16 MiB block, header included, is already read), that the parse's peak (the image, the read buffer, the per-segment overhead) fits in RAM above the parking
++parsed; the first 16 MiB block, header included, is already read), that the read's peak (the running state metadata,
++two 16 MiB block buffers and the small vectors) fits in RAM above the parking
+ floor (`--conversation-cache-min-free-mib`), the file's size against the largest this session can restore, the
+ geometry and layer range before any state array, and every count against the bytes left and this session's exact
+-limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, the payload hash
+-and then the usual snapshot validation - all before any device write, and a refusal leaves the current session as it
+-was. A transfer failure after the device writes began ends the engine (`FATAL`) rather than decode from a partial
++limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, and the payload hash
++- all before any device write, and a refusal leaves the current session as it was. The K/V itself is not held in RAM:
++after the running state and the K/V headers were validated against this engine, the engine reads the file again and
++copies the K/V into its pools a 16 MiB block at a time; this is what restores a session larger than RAM. The apply
++pass is bound to the read pass: a file whose K/V layer count or any part size differs from what the read pass saw is
++refused before that layer or part is applied, and the payload hash is recomputed and compared to the file's trailer
++at the end. The first applied block is the gate - everything before it can still be refused cleanly; a divergence
++found after it (a same-size edit, or a torn re-read) ends the engine, since the remaining bytes cannot be told apart.
++A complete atomic replacement that is itself self-consistent and keeps the same sizes is not detected: the file must
++have no writer but this engine. A transfer failure after the device
++writes began ends the engine (`FATAL`) rather than decode from a partial
+ state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
+ `--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
+ `--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
+@@ -1060,6 +1069,24 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one
+ `--rope-freq-base` refused the file and then answered; a save with a RAM floor above the machine's RAM was refused as
+ `memory` before any copy, the file it would have replaced untouched. The times are single runs.
+ 
++**Prefix snapshots on disk (opt-in).** The system-prompt checkpoint above lives in the one K/V arena, so it is gone
++once a request with another start comes in (a title request, a subagent, another client), and after every restart;
++a parked conversation that holds it is taken out whole to lend it. `--prefix-cache-dir DIR` keeps it in a file
++instead: when a request that read its system prompt has answered (after `DONE`), the state at that checkpoint - its
++running state and the K/V of every layer and of the draft layer up to it - is streamed from the session into
++`DIR`, once per distinct system prompt. A later request whose prompt starts with a saved one, and which the live
++session or a batch slot cannot serve further, restores it and reads only the rest. It is preferred over a parked
++conversation of the same length, which then stays parked. Restoring leaves the file in place.
++`--prefix-cache-disk-mib N` (default 51200) caps the directory, least recently used first;
++`--prefix-cache-ram-mib N` (default 2048, 0 = disk only) also keeps the most recently used in RAM when
++`--conversation-cache-min-free-mib` allows it - otherwise the file is streamed into the session through a 64 MB
++buffer, so a full RAM never blocks it. Each file records the engine build, the pack, `--native`, `--mtp`, `--kv`,
++`STRATA_BF16_TC` and the settings a session file is bound to (the rope scaling, `STRATA_KV_ROT`, the control vector,
++the arithmetic switches); a file that differs in any of them (a rebuilt engine included) is deleted at start-up, and every
++restore is validated like a parked snapshot before anything is written. A restore that fails before writing keeps
++what the session held; one that fails after reads the whole prompt instead. One GPU without `--batch` only. A file
++is about 118 MB plus 12.4 KB per token with K8V4 (a 30,028-token system prompt: 490 MB).
++
+ **Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
+ decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
+ re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 4e03dc8b..79a44362 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -947,6 +947,20 @@ const MmqPlan& mmq_plan() {
+     }();
+     return plan;
+ }
++// EVERY layer's experts go through MMQ (none keeps the FP16 path), which is what the fused layout's smaller buffers
++// need: `mmq_plan().any` only says ONE layer does, and a layer that does not runs the FP16 path at the FULL chunk -
++// `m.gemm.f16(..., m.GU + o0 * 1280, ne, ...)` over the layer's routed rows - while the fused layout sizes GU for
++// stream_all_min() - 1 tokens of them (#583: on an IQ3_XXS pack with a layer the FUSED kernels do not cover either,
++// that overflow is a 16384/1023 = 16x write past the buffer: garbage, an illegal access, or a kernel that never
++// returns - the first `ck()` to see it is `prefill mmq: iota`, one prompt later).  The shrink is therefore all-or-
++// nothing: a pack with one such layer keeps MMQ's buffers, as `fused_ring()` already does for the native kernels.
++inline bool mmq_all() {
++    const MmqPlan& mp = mmq_plan();
++    if (!mp.any) return false;
++    for (const char v : mp.layer)
++        if (!v) return false;
++    return true;
++}
+ // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
+ // stream_all_min() tokens or more).  Its GU, H and Xq hold only the fused path's grouping tables, int8 H and per-token
+ // int8 activations, and Hq nothing: ~100 KB a token less than MMQ's FP32 GU / H and per-slot q8_1 rows, which is what
+@@ -954,7 +968,7 @@ const MmqPlan& mmq_plan() {
+ // MMQ in the same buffers, so each keeps MMQ's size for stream_all_min() - 1 tokens.  `src`: the layout streams experts
+ // (Prefill::init got an ExpertSource; without one no chunk takes the streamed walk, so no chunk is fused).
+ bool fused_layout(size_t T, bool src) {
+-    return src && fused_ring() && mmq_plan().any && ring_slots(T) > STAGE && (int64_t) T >= stream_all_min();
++    return src && fused_ring() && mmq_all() && ring_slots(T) > STAGE && (int64_t) T >= stream_all_min();
+ }
+ // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
+ // default): MMQ's, for T tokens.
+@@ -1743,19 +1757,19 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
+ double Prefill::pinned_share() { return g_pinned_share; }
+ int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
+ 
+-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+-    return bytes_needed_impl(g, ss, chunk, false);
++uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
++    return bytes_needed_impl(g, ss, chunk, false, src);
+ }
+ 
+ // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
+ // page, and the ring is one allocation (carve).  `bytes_needed` stays the borrowed region's sum.
+ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+-    return bytes_needed_impl(g, ss, chunk, true);
++    return bytes_needed_impl(g, ss, chunk, true, true);
+ }
+ 
+ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+-                                    bool owned_pages) {
+-    // the same allocation sequence as `init`, counted
++                                    bool owned_pages, bool src) {
++    // the same allocation sequence as `init` (`carve`), counted - with the MoE layout `carve` picks for the same source
+     const size_t T = (size_t) chunk;
+     bool ok = true;
+     Alloc o;
+@@ -1789,7 +1803,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
+     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+-                                       moe_set_bytes(T, g.n_expert, fused_layout(T, true))}), ok);
++                                       moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
+     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+     if (mmq_plan().any) {
+         const MmqPlan& mp = mmq_plan();
+@@ -1810,8 +1824,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
+     return o.used + (8u << 20);   // alignment slack
+ }
+ 
+-uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+-    return bytes_needed(g, ss, chunk) - (uint64_t) ring_slots((size_t) chunk) * (uint64_t) MAXBLOB();
++uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
++                                        bool src) {
++    return bytes_needed(g, ss, chunk, src) - (uint64_t) ring_slots((size_t) chunk) * (uint64_t) MAXBLOB();
+ }
+ 
+ int64_t Prefill::ring_default_slots() {
+@@ -3595,6 +3610,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         }();
+                         const bool group_gather = group_env && stream_all && use_mmq && lay.native &&
+                                                   MMQ_GROUP <= mmq::kGatherGroupMax;
++                        // The staged walk (a short prompt) groups only the experts already in the GPU cache: a staged
++                        // one sits in the 8-slot staging ring, smaller than a group, so it closes the open group and is
++                        // gathered alone.  Resident experts need no wait and no release, so a group of them is the same
++                        // bytes into the same group slots in one launch instead of up to 16.
++                        const bool group_resident = group_env && !stream_all && use_mmq && lay.native &&
++                                                    MMQ_GROUP <= mmq::kGatherGroupMax;
++                        bool gg_now = group_gather;
+                         mmq::GatherGroup gg;
+                         int gg_slots[MMQ_GROUP];
+                         int gg_nslots = 0;   // ring slots gathered by the next flush
+@@ -3630,7 +3652,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                             if (use_mmq) {
+                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
+                                 const size_t q = j % MMQ_GROUP;
+-                                if (group_gather) {
++                                if (group_resident) {
++                                    gg_now = slot < 0;
++                                    if (!gg_now) {   // a staged expert: what the group holds so far first, then it alone
++                                        flush();
++                                        gg.first = gg.n = (int) q + 1;   // the next flush starts after it
++                                    }
++                                }
++                                if (gg_now) {
+                                     gg.blob[q] = blob_dev;
+                                     gg.n = (int) q + 1;
+                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
+@@ -3644,8 +3673,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                 } else {
+                                     mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                 }
+-                                if (slot >= 0 && !group_gather) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
++                                if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
++                                if (group_resident) gg = mmq::GatherGroup{};   // the next group starts empty
+                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
+                                 const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                                 const int ngx = (int) (q + 1);

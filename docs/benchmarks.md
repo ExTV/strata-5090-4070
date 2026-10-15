@@ -1,9 +1,9 @@
 # Benchmarks
 
-All on 2026-10-02 to 2026-10-07, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
-IQ3_XXS, 262,144 context, layer split 36 (37 in the last section), int8 KV with 32,768 resident cells, vision on. The Strata base
+All on 2026-10-02 to 2026-10-15, RTX 5090 + RTX 4070 Ti SUPER (x1), 31 GB RAM, Arch Linux, ISTA GSQ-RCO
+IQ3_XXS until 2026-10-10 and IQ3_S since (the shipped quant), 262,144 context, layer split 36 (37 since 2026-10-07), int8 KV with 32,768 resident cells, vision on. The Strata base
 moves through the sections: 0.1.33, 0.1.37, 0.1.38 with six PRs, the Strata-DualGPU fork, then the fork's later commits with the
-lend region in RAM, then upstream 0.1.39 with the fork's work as PRs, then the 2026-10-06 PR updates with headroom 4, then upstream 0.1.40.1 with the SSD spill (the shipped config, last section).
+lend region in RAM, then upstream 0.1.39 with the fork's work as PRs, then the 2026-10-06 PR updates with headroom 4, then upstream 0.1.40.1 with the SSD spill, then upstream 0.1.41 with the draft K/V on the main device, the quant comparison, IQ3_S, and the template and parser work (the last five sections, the shipped config).
 `tools/bench.py`: five 600-token greedy answers with thinking off (decode median), fresh prompts of
 ~2K (twice), ~16K and ~80K tokens of random words (prefill tok/s), then a 2K follow-up on the 80K
 conversation; `tools/decode_after.py`: five more answers right after the 80K prompt. "faults" is
@@ -426,3 +426,138 @@ Same morning, one boot, a scripted sequence (`thinking off`, greedy, needles in 
 Every answer right. Before patch 20, B's fresh prompt would have waited for A's 2.4 GB write. After the
 server stopped (SIGTERM, which sends QUIT to the engine) the spill directory was empty; a cancelled write
 left no temporary file.
+
+## Upstream v0.1.41 and the draft layer's K/V on the main device (2026-10-08)
+
+The whole series merged onto v0.1.41 (now patch 01), IQ3_XXS, the same config, against the v0.1.40.1 build
+in the same session (`tools/bench.py` run 2; run 1 is the cold one):
+
+| | v0.1.40.1 build | v0.1.41 build |
+| --- | --- | --- |
+| decode median | 199 | 203 |
+| 2K | 606 / 454 | 643 / 644 |
+| 16K | 2,080 | 2,315 |
+| 80K | 2,793 | 3,359 |
+| 80K follow-up | 3.7 s | 3.8 s |
+| depth 32K / 122K / 260K prefill | 3,091 / 3,307 / 3,870 tok/s | 3,128 / 3,774 / 2,907 tok/s |
+| lowest available RAM over the depth run | 1.0 GB | 3.2 GB |
+
+The 260K gap is disk state: the new tree's spill directory already held 11-15 GB on the 92%-full SSD, so its
+122K spill write took 13 s instead of 1.9. Needle 40K + 4 follow-ups + 60K extension, parking 8/8 (0.9-1.1 s),
+spill 200K / 5K x4 (2.9-3.0 s / 0.2 s), the merged tool turn, the 14:05 train, vision on the 4070 (1.9 s) and
+tool steps 3.0 / 3.2 / 3.9 s all passed on the new build.
+
+**The draft layer's prompt K/V computed on the 5090 (patch 04)** against the residual-rows path it replaces,
+same session, fresh prompts, prefix cache cleared between arms:
+
+| | 40 KB/token of rows over the x1 link | K/V computed on the 5090, K/V rows shipped |
+| --- | --- | --- |
+| `after each chunk` on an 82K prompt (link traffic) | 4.0-4.3 s | 0.27-0.30 s |
+| the same on a 32K prompt | 1.7 s | 0.08 s |
+| TTFT 32K / 40K / 48K / 56K / 82K | 9.9 / 14.0 / 12.6 / 15.0 / 21.3 s | 9.0 / 9.4-12.5 / 10.4 / 11.3 / 16.8 s |
+| bench 16K / 80K prompt | 7.5 / 25.9 s | 6.5 / 21.0 s |
+| decode median (session band 174-195) | 195 | 187-190 |
+| 1024-token answers after 40-56K prompts | 145-152 tok/s | 157-160 tok/s |
+| draft acceptance over 1024-token answers | 78.5% | 78.9% |
+
+Two traps on the way, both visible only as lower acceptance, never as an error: a synchronous peer copy does
+not wait for a non-blocking compute stream (acceptance 64-67% from partly stale K/V), and the next batch's
+kernels overwrote the staging source while the previous copy over the x1 link (16 MiB, ~20 ms) was still
+reading it (4.7 points low). An explicit stream sync before the copy and an event the compute stream waits on
+fixed them. Upstream's PR #1599 (patch 03) is inert under `--prefill-main`: the drafter sits on the other
+device and its block declines. The PR's parity tool reports FAIL even between two single-GPU arms here (the
+target's tokens shift with the verify window's row grouping), so acceptance over 1024-token answers and the
+`after each chunk` line are the gates.
+
+## Quants on the same config (2026-10-10)
+
+The production config with only the model paths changed, same bench, same session:
+
+| arm | GPU-resident experts | decode median | 2K | 16K | 80K | 80K follow-up | decode at 82K | acceptance |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ISTA IQ3_XXS (the build's quant until then) | 21,752 of 24,576 | 181 | 3.4-3.6 s | 6.6 s | 21.1 s | 3.9 s | 146 | 81.3% |
+| ISTA Q2_0 | 24,576 (all) | 211 | 2.5-2.6 s | 5.9 s | 19.6 s | 3.1 s | 158 | 82.7% |
+| unsloth UD-IQ4_XS | 15,340 | 58 | 5.1-5.4 s | 13.1 s | 43.1 s | 6.5 s | 82 | 80.4% |
+| **ISTA IQ3_S** | 18,620 | 171.7 aggregate / 181 median | 3.9-7.8 s | 7.0 s | 26.9 s | 4.8 s | | 84.5% |
+| **IQ3_S, `--prefill auto:16384` (shipped)** | 18,620 | 168.9 / 198 | 3.7 s | 7.2 s | 25.9 s | 6.6 s | | |
+
+unsloth's file is 93.7 GB: RAM is fully used, decode reads about 5,000 expert blobs per answer from the SSD, and
+no knob fixes a 3x gap on 31 GB (headroom 2 and `--prefill auto` reached 70-73 tok/s). Q2_0 holds every expert
+in VRAM and is the speed pick at a quality cost (ISTA task average 89.07 vs 92.57 for IQ3_XXS). IQ3_S has about
+3,000 fewer GPU-resident experts than IQ3_XXS, yet decode still reads 0 experts from the file (the RAM copy is
+17.0 GiB at headroom 4); with 32K chunks 41% of a chunk's lent slots re-read from the pack, with 16K chunks all
+2,813 lendable slots stay in RAM, a wash on speed and cleaner on RAM. Quality evidence is external only:
+sirfyyn's KL divergence from BF16 over three corpora puts UD-IQ4_XS at 0.049 / 0.046 / 0.122, IQ3_S at
+0.069 / 0.061 / 0.183 and IQ3_XXS at 0.118 / 0.112 / 0.264; ISTA's own task average is 93.26 (IQ3_S) and 92.57
+(IQ3_XXS) against 93.12 for BF16. IQ3_S is the shipped quant since 2026-10-10.
+
+**IQ3_S full suite on the shipped config (2026-10-10):** needle 40K with four follow-ups and a 61K extension
+all correct (15.0 s read, follow-ups 0.2-0.5 s, the extension 10.8 s); parking 8/8 (30K / 15K, switches
+0.7-1.4 s); spill 200K x4 (61.4 s read, restores 2.8-2.9 s, the short chat 0.2 s); the merged tool turn's four
+steps; an image read through the 4070's encoder in 3.7 s; tool probe 16/30 (stock template); depth 32K 10.2 s
+(3,124 tok/s) then 134.7 tok/s, 122K 35.1 s (3,479) then 131.0, 260K 76.4 s (3,405) then 124.2; tool-result
+steps of 1.5K / 2.3K / 5.4K tokens 3.2-3.6 / 3.4-3.6 / 3.8-4.2 s after a 12.9K first message (5.1 s).
+Basalt's self-distilled draft layer as a drop-in drafter: acceptance 86.1% vs 85.7%, not adopted.
+
+## Tail skip and RAM adapt (2026-10-10)
+
+Upstream's 0.1.42 `STRATA_ROUTE_TAIL_SKIP` (patch 05) cherry-picked: a missed expert that every token of a verify
+window routes at rank 7 or lower is neither copied nor computed. Same session, same binary, milliseconds per
+verify window paired over 13 requests (the measure that survives acceptance noise; tok/s swings 0.73-0.88
+acceptance between identical runs here):
+
+| | off | rank 7 (now the default) | rank 7 + `STRATA_RAM_ADAPT=256` |
+| --- | --- | --- | --- |
+| IQ3_S ms/window, aggregate tok/s, bench median | 13.22, 170, 167 | 12.78 (12 of 13 wins), 174, 180 | |
+| unsloth UD-IQ4_XS ms/window, aggregate, bench median | 31.1, 72.3, 79 | 24.1 (13 of 13), 93.1, 103 | 21.7, 101.4, 109 |
+
+Prompts unchanged; the probes (planets, the 14:05 train, two needles in 98K, a haiku follow-up) pass; answers
+differ slightly (upstream measured KL 0.003-0.006). `STRATA_RAM_ADAPT` (PR #1838, opt-in) lets the RAM copy
+follow the conversation between requests: on the SSD-bound unsloth quant fresh prompt sets went 73.9 / 76.2 ->
+88.5 / 89.2 tok/s and file reads per eight answers 53 / 47 -> 34 / 31 GB; on IQ3_S decode reads nothing from
+the file, so it does nothing and the shipped config leaves it unset.
+
+## The park gain (PR #2265, 2026-10-13)
+
+Upstream issue #2264: the conversation cache parked every turn and the next turn dropped the snapshot, so a
+long single conversation wrote a whole snapshot per turn for nothing. One day of the production log: 1,131
+parks for 93 restores, 294 GB written, 112 s spent on the request path. `--conversation-cache-park-gain 4096`
+(patch 05) parks again only once the conversation grew by 4,096 tokens. Judged by parks versus restores in the
+log, not by an A/B. `--mtp-hnorm stream` (upstream's opt-in drafter norm) went on the same day; first probes at
+temperature 0 with thinking off: code 237, prose 146, reasoning 194 tok/s at 91 / 78 / 83% acceptance.
+Tested the same day and rejected: `STRATA_EXPDEC=1 STRATA_QSA_ROWS=1` (PRs #2058 / #2059), interleaved
+off/on/off/on, ms per window code 14.00 -> 14.39, reasoning 12.92 -> 13.37, 110K context +1.1%.
+
+## The chat template and the tool-call parser (2026-10-15, IQ3_S)
+
+`tools/tool_probe.py` (the two-turn agent probe: parallel `read_file` calls with integer arguments, then an
+`edit_file` whose strings hold a literal `<parameter=limit>..</parameter>` line, plus a `bash` call), 15
+sequences per run, the same seeds.
+
+Templates, same server, stock parser:
+
+| template | pass | note |
+| --- | --- | --- |
+| stock Qwen (Unsloth's, xhigh default) | 21/60 | |
+| Sharp v22.5.0 at its medium default | 8/60 | empty `new_string` 2 -> 15 |
+| Sharp with `reasoning_effort: xhigh` per request | 33/60 | |
+
+Effort level drives the calls; the terseness block does not hurt them. Ten short questions: Sharp used a third
+of the tokens with equal accuracy. A "pelican on a bicycle" SVG: Sharp at medium 2.4K / 4.7K tokens, stock
+8.4K / 18.4K. The shipped tokenizer directory is Sharp with its default raised to xhigh.
+
+The parser (patch 08), Sharp at xhigh, same engine, 4 x 15 sequences each:
+
+| | pass | edit cut at the nested `</parameter>` | `bash` never written | `new_string` never written | turn ended inside the thinking |
+| --- | --- | --- | --- | --- | --- |
+| stock parser | 30/60 | 17 | 14 | 6 | 1 |
+| patch 08 | **44/60** | **0** | 9 | 5 | 2 |
+
+The raw engine output (`STRATA_DEBUG=1`) shows the cause: in 7 of 15 edits the model writes
+`<parameter=new_string>\n<parameter=limit>25</parameter>\n</function>`, the inner closer standing in for the
+value's own, which the old rule (the first `</parameter>` followed by `<parameter=` or `</function>`) read as
+`new_string = "<parameter=limit>25"`. Every remaining miss is a call the model never wrote. All 45 raw outputs
+captured that day parse correctly with the patch at chunk sizes 1 / 3 / 7 / 50 / whole, streamed and not.
+PRs #2589 and #2572 (patches 06, 07) were measured the same day with `tool_call_recovery` on: 32/60, noise; the
+recovery rewrote 0 parameter tags (this model never writes `<parameter name=`) and invented a call named
+`new_string` once, so it stays off.

@@ -1,0 +1,523 @@
+diff --git a/serve/frontend.py b/serve/frontend.py
+index 6a0434c9..289f9a56 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -566,25 +566,102 @@ FUNC_START = "<function="
+ FUNC_END = "</function>"
+ 
+ 
+-def param_end(text: str, final: bool = False) -> int:
+-    """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
+-    `<parameter=` or `</function>` - the same text inside a value (a file that documents the call format, #210) is
+-    part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
+-    at = text.find(PARAM_END)
+-    while at >= 0:
+-        after = text[at + len(PARAM_END):].lstrip()
+-        if after.startswith(("<parameter=", FUNC_END)):
+-            return at
+-        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after):
+-            return at if final else -2
+-        at = text.find(PARAM_END, at + 1)
+-    return -1
+-
+-
+-def call_end(text: str) -> int:
++def _next_param(after: str, names, seen, final: bool):
++    """Does `after` (what follows a `</parameter>`, whitespace stripped) open the next parameter or close the call?
++    True / False / None (not decided yet: streaming; `final` decides).  With `names` (the tool's declared
++    parameters) a `<parameter=NAME>` counts only for a declared NAME not yet given, so a documented parameter of
++    another tool inside a value stays text; without them any name counts."""
++    if after.startswith(PARAM_START):
++        gt = after.find(">")
++        if gt < 0:
++            return True if final else None
++        name = after[len(PARAM_START):gt]
++        return names is None or (name in names and name not in seen)
++    if after.startswith(FUNC_END):
++        return True
++    if not after or PARAM_START.startswith(after) or FUNC_END.startswith(after):
++        return True if final else None
++    return False
++
++
++def _closes_call(after: str, final: bool):
++    """Does `after` (what follows a `</function>`) end the call: `</tool_call>` then the end of the turn or the next
++    `<tool_call>`?  True / False / None (not decided yet).  Anything else (`</parameter>`, more text) means the
++    `</function>` was a value's text."""
++    s = after.lstrip()
++    if not s.startswith(CALL_END):
++        return (True if final else None) if CALL_END.startswith(s) else False
++    s = s[len(CALL_END):].lstrip()
++    if not s:
++        return True if final else None
++    if s.startswith(CALL_START):
++        return True
++    return (True if final else None) if CALL_START.startswith(s) else False
++
++
++def param_end(text: str, final: bool = False, names=None, seen=()) -> tuple[int, int]:
++    """Where a parameter value in `text` ends -> (end, skip): the value is text[:end], and skip characters of tag
++    follow it before the next parameter or `</function>`.  A `<parameter=` inside the value (a file that documents
++    the call format, #210) opens a nested pair whose `</parameter>` is the value's text; the value ends at the first
++    unmatched `</parameter>` followed (after whitespace) by the next parameter or `</function>` (skip 12).  A model
++    that has just written a nested pair often skips the value's own closer and goes straight on (Flash-Next, 7 of 15
++    edits of such a file: `<parameter=limit>25</parameter>\\n</function>`): then, with every pair matched, the next
++    declared parameter (`names`: the tool's parameters, `seen`: those already given) or a `</function>` that closes
++    the call ends the value with skip 0.  end -1: none yet; -2: a candidate whose follower has not arrived (streaming;
++    skip is then where it starts, and `final` accepts it)."""
++    depth, pos = 0, 0
++    while True:
++        at = min((i for i in (text.find(t, pos) for t in (PARAM_START, PARAM_END, FUNC_END)) if i >= 0), default=-1)
++        if at < 0:
++            return -1, 0
++        if text.startswith(PARAM_START, at):
++            gt = text.find(">", at)
++            if depth == 0 and names is not None:        # the next parameter, when the closer was skipped
++                if gt < 0:
++                    if not final:
++                        return -2, at
++                elif _next_param(text[at:], names, seen, final):
++                    return at, 0
++            depth += 1
++            pos = gt + 1 if gt >= 0 else at + len(PARAM_START)
++        elif text.startswith(PARAM_END, at):
++            if depth > 0:
++                depth -= 1
++                pos = at + len(PARAM_END)
++                continue
++            opens = _next_param(text[at + len(PARAM_END):].lstrip(), names, seen, final)
++            if opens:
++                return at, len(PARAM_END)
++            if opens is None:
++                return -2, at
++            pos = at + 1
++        else:                                            # </function>
++            if depth == 0:
++                closes = _closes_call(text[at + len(FUNC_END):], final)
++                if closes:
++                    return at, 0
++                if closes is None:
++                    return -2, at
++            pos = at + len(FUNC_END)
++
++
++def _declared(text: str, pos: int, schemas) -> list | None:
++    """The declared parameter names of the tool a `<function=NAME>` at `pos` in `text` names, or None without
++    schemas (or for a tool they do not know)."""
++    if not schemas:
++        return None
++    gt = text.find(">", pos)
++    schema = schemas.get(text[pos + len(FUNC_START):gt].strip()) if gt >= 0 else None
++    if schema is None:
++        return None
++    return list(((schema.get("parameters") or {}).get("properties") or {}).keys())
++
++
++def call_end(text: str, schemas=None, final: bool = False) -> int:
+     """Where a tool call's body ends (#210): the `</tool_call>` after the call's own `</function>`, found by walking
+-    its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
+-    the call format ends at the first `</tool_call>`, as before."""
++    its parameters with param_end, so a value may contain either tag.  -1: not complete yet (`final`: the turn is
++    over, so what is undecided is decided).  A body that is not in the call format ends at the first `</tool_call>`,
++    as before."""
+     s = text.lstrip()
+     pos = len(text) - len(s)
+     if not s.startswith("<function="):
+@@ -592,6 +669,7 @@ def call_end(text: str) -> int:
+     gt = text.find(">", pos)
+     if gt < 0:
+         return -1
++    names, seen = _declared(text, pos, schemas), []
+     pos = gt + 1
+     while True:
+         rest = text[pos:]
+@@ -601,10 +679,11 @@ def call_end(text: str) -> int:
+             gt = text.find(">", pos)
+             if gt < 0:
+                 return -1
+-            end = param_end(text[gt + 1:])
++            seen.append(text[pos + len(PARAM_START):gt])
++            end, skip = param_end(text[gt + 1:], final, names, seen)
+             if end < 0:
+                 return -1
+-            pos = gt + 1 + end + len(PARAM_END)
++            pos = gt + 1 + end + skip
+         elif s.startswith(FUNC_END):
+             rest = text[pos + len(FUNC_END):]
+             s = rest.lstrip()
+@@ -664,7 +743,7 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+ PARAM_START = "<parameter="
+ 
+ 
+-def function_end(text: str) -> int:
++def function_end(text: str, schemas=None, final: bool = False) -> int:
+     """Where a `<function=NAME>...</function>` at the start of `text` ends (just past `</function>`), walking its
+     parameters with param_end like call_end does; -1: not complete (or not in the call format)."""
+     s = text.lstrip()
+@@ -674,6 +753,7 @@ def function_end(text: str) -> int:
+     gt = text.find(">", pos)
+     if gt < 0:
+         return -1
++    names, seen = _declared(text, pos, schemas), []
+     pos = gt + 1
+     while True:
+         rest = text[pos:]
+@@ -683,10 +763,11 @@ def function_end(text: str) -> int:
+             gt = text.find(">", pos)
+             if gt < 0:
+                 return -1
+-            end = param_end(text[gt + 1:])
++            seen.append(text[pos + len(PARAM_START):gt])
++            end, skip = param_end(text[gt + 1:], final, names, seen)
+             if end < 0:
+                 return -1
+-            pos = gt + 1 + end + len(PARAM_END)
++            pos = gt + 1 + end + skip
+         elif s.startswith(FUNC_END):
+             return pos + len(FUNC_END)
+         else:
+@@ -723,14 +804,15 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+     name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
+     rest = body[body.index(">") + 1:]
+     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
++    names = list(props.keys()) if schema is not None else None
+     args = {}
+     while "<parameter=" in rest:
+         rest = rest[rest.index("<parameter=") + len("<parameter="):]
+         pname = rest[:rest.index(">")]
+         rest = rest[rest.index(">") + 1:]
+-        end = param_end(rest, final=True)
++        end, skip = param_end(rest, True, names, list(args) + [pname])
+         value = rest[:end] if end >= 0 else rest
+-        rest = rest[end + len(PARAM_END):] if end >= 0 else ""
++        rest = rest[end + skip:] if end >= 0 else ""
+         if value.startswith("\n"):
+             value = value[1:]
+         if value.endswith("\n"):
+@@ -898,6 +980,7 @@ class OutputParser:
+         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
+         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
+         self.recover = recover
++        self.eot = False             # finish() ran: a call end that waited for text after </tool_call> is decided
+         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
+         self.batch = False           # the call being finished is followed by another in the same wrapper
+         self.param_forms = ParamForms() if recover and self.schemas else None   # #2451
+@@ -1002,10 +1085,14 @@ class OutputParser:
+         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
+         self.sfirst = True
+         self.sval_started = False
++        self.svstart = 0             # where the string value being streamed starts in self.buf
+         self.sdeclared = {}
++        self.snames = None          # the tool's declared parameter names (None: a tool the schemas do not know)
++        self.sseen = []              # the parameters given so far (param_end: a repeat opens no parameter)
+ 
+-    def _scan(self) -> list[Event]:
+-        """Advance the streaming view of the call body in self.buf (see stream_tools)."""
++    def _scan(self, final: bool = False) -> list[Event]:
++        """Advance the streaming view of the call body in self.buf (see stream_tools).  `final`: the body is whole
++        (its `</tool_call>` arrived, or the turn ended), so a value end that waited for its follower is decided."""
+         out = []
+ 
+         def args(s):
+@@ -1022,6 +1109,7 @@ class OutputParser:
+                 self.scall = ToolCall(name=name, arguments={}, id=self.new_id())
+                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
++                self.snames = list(props) if name in self.schemas else None
+                 out.append(Event("tool_start", call=self.scall))
+                 args("{")
+                 self.sp += b + 1
+@@ -1036,6 +1124,7 @@ class OutputParser:
+                     pname = stripped[11:b]
+                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
+                     self.sfirst = False
++                    self.sseen.append(pname)
+                     self.sp += b + 1
+                     if self.sdeclared.get(pname) == "string":
+                         args('"')
+@@ -1055,26 +1144,29 @@ class OutputParser:
+                     if rest[0] == "\n":          # the value's leading newline is not part of it
+                         self.sp += 1
+                         rest = rest[1:]
+-                    self.sval_started = True
+-                end = param_end(rest)
++                    self.sval_started, self.svstart = True, self.sp
++                # the whole value so far is scanned each time (a nested pair's depth is not kept across scans)
++                # and only what was not sent yet goes out
++                val, done = self.buf[self.svstart:], self.sp - self.svstart
++                end, skip = param_end(val, final, self.snames, self.sseen)
+                 if end >= 0:
+-                    value = rest[:end]
++                    value = val[:end]
+                     if value.endswith("\n"):
+                         value = value[:-1]
+-                    args(json.dumps(value)[1:-1] + '"')
+-                    self.sp += end + len(PARAM_END)
++                    args(json.dumps(value[done:])[1:-1] + '"')
++                    self.sp = self.svstart + end + skip
+                     self.ss = "between"
+                     continue
+-                # an undecided </parameter> (-2) is held from its start, like a tag still arriving
+-                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END,))
+-                if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
++                # an undecided tag (-2, at skip) is held from its start, like a tag still arriving
++                safe = skip if end == -2 else len(val) - self._hold(val, (PARAM_END, PARAM_START, FUNC_END))
++                if safe > 0 and val[safe - 1] == "\n":   # may be the trailing newline before </parameter>
+                     safe -= 1
+-                if safe > 0:
+-                    args(json.dumps(rest[:safe])[1:-1])
+-                    self.sp += safe
++                if safe > done:
++                    args(json.dumps(val[done:safe])[1:-1])
++                    self.sp = self.svstart + safe
+                 return out
+             elif self.ss == "raw":
+-                end = param_end(rest)
++                end, skip = param_end(rest, final, self.snames, self.sseen)
+                 if end < 0:
+                     return out
+                 value = rest[:end]
+@@ -1087,7 +1179,7 @@ class OutputParser:
+                 except ValueError:
+                     v = value
+                 args(json.dumps(v, ensure_ascii=False))
+-                self.sp += end + len(PARAM_END)
++                self.sp += end + skip
+                 self.ss = "between"
+             else:
+                 return out
+@@ -1128,7 +1220,7 @@ class OutputParser:
+                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
+                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
+                 body = self.buf[len(CALL_START):]
+-                end, think = call_end(body), body.find(THINK_END)
++                end, think = call_end(body, self.schemas, self.eot), body.find(THINK_END)
+                 if end >= 0 and (think < 0 or think >= end):
+                     call = None
+                     try:
+@@ -1295,7 +1387,7 @@ class OutputParser:
+             else:
+                 drop = None
+                 if self.bare:                       # no wrapper: the call ends at its </function>; a stray
+-                    i = function_end(self.buf)      # </tool_call> after it is the wrapper's closer, dropped
++                    i = function_end(self.buf, self.schemas, self.eot)   # </tool_call> after it is the wrapper's closer, dropped
+                     if i >= 0:
+                         after = self.buf[i:].lstrip()
+                         if after.startswith(CALL_END):
+@@ -1303,11 +1395,11 @@ class OutputParser:
+                         elif after and not CALL_END.startswith(after):
+                             drop = 0
+                 else:
+-                    i = call_end(self.buf)
++                    i = call_end(self.buf, self.schemas, self.eot)
+                     if i >= 0:
+                         drop = len(CALL_END)
+                     if self.recover:                # a batch in one wrapper: the next call follows this one's
+-                        f = function_end(self.buf)  # </function> (or opens as <parameter=NAME>)
++                        f = function_end(self.buf, self.schemas, self.eot)   # </function> (or opens as <parameter=NAME>)
+                         nxt = self.buf[f:].lstrip() if f >= 0 else ""
+                         if nxt.startswith(PARAM_START) and self._follower(nxt) == "param":
+                             at = len(self.buf) - len(nxt)
+@@ -1318,11 +1410,11 @@ class OutputParser:
+                 if self.stream_tools:
+                     if i >= 0:
+                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
+-                        out += self._scan()
++                        out += self._scan(final=True)
+                         out += self._close_scan()
+                         self.buf = whole
+                     else:
+-                        out += self._scan()
++                        out += self._scan(final=self.eot)
+                 if i < 0 or drop is None:
+                     return out
+                 body = self.buf[:i]
+@@ -1344,10 +1436,12 @@ class OutputParser:
+             self.params_rewritten = forms.rewritten
+             if tail:
+                 out += self.feed(tail)
++        self.eot = True                                 # a call whose end waited for what follows it is whole now
++        out += self.feed("")
+         if self.pending:
+             out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
+-        if self.state == "call" and self.bare and function_end(self.buf) >= 0:
+-            i = function_end(self.buf)          # recover: a bare call is whole at its </function>
++        if self.state == "call" and self.bare and function_end(self.buf, self.schemas, True) >= 0:
++            i = function_end(self.buf, self.schemas, True)   # recover: a bare call is whole at its </function>
+             body, rest = self.buf[:i], self.buf[i:].strip()
+             self.buf = ""
+             out += self._finish_call(body)
+@@ -1355,7 +1449,7 @@ class OutputParser:
+                 out.append(Event("content", self._track(rest)))
+             return out
+         if self.state == "call" and self.stream_tools and self.scall is not None:
+-            out += self._scan()                 # the output ended inside a call that was already announced
++            out += self._scan(final=True)       # the output ended inside a call that was already announced
+             if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
+                 out.append(Event("tool_call", call=self.scall))
+             else:
+diff --git a/serve/test_skipped_closer.py b/serve/test_skipped_closer.py
+new file mode 100644
+index 00000000..3a2c2278
+--- /dev/null
++++ b/serve/test_skipped_closer.py
+@@ -0,0 +1,159 @@
++"""A value that holds a nested `<parameter=X>...</parameter>` pair, after which the model skips the value's own
++`</parameter>` and goes straight to `</function>` or the next parameter.  Qwen3.8-Flash-Next did this in 7 of 15
++edits of a file that documents the call format (2026-10-15, raw engine output):
++
++    <parameter=new_string>
++    <parameter=limit>25</parameter>
++    </function>
++    </tool_call>
++
++The parser read new_string as `<parameter=limit>25`.  A `</parameter>` that matches a `<parameter=` opened inside
++the value is the value's text; the value ends at the first unmatched one, or, when the model skipped it, right before
++the `</function>` (followed by `</tool_call>`) or the next declared parameter.
++
++Run: .venv/bin/python -m unittest serve.test_skipped_closer
++"""
++import json
++import sys
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++from serve.frontend import OutputParser, parse_tool_call  # noqa: E402
++
++TOOLS = [
++    {"name": "read_file", "parameters": {"properties": {"path": {"type": "string"}, "offset": {"type": "integer"},
++                                                        "limit": {"type": "integer"}}}},
++    {"name": "edit_file", "parameters": {"properties": {"path": {"type": "string"}, "old_string": {"type": "string"},
++                                                        "new_string": {"type": "string"}}}},
++    {"name": "bash", "parameters": {"properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}}},
++]
++EDIT_SKIPPED = ("<tool_call>\n<function=edit_file>\n<parameter=path>\ntemplates/chat.jinja\n</parameter>\n"
++                "<parameter=old_string>\n<parameter=limit>40</parameter>\n</parameter>\n"
++                "<parameter=new_string>\n<parameter=limit>25</parameter>\n</function>\n</tool_call>")
++BASH = ("<tool_call>\n<function=bash>\n<parameter=command>\npytest -q tests/test_template.py\n</parameter>\n"
++        "<parameter=timeout>\n120\n</parameter>\n</function>\n</tool_call>")
++EDIT_ARGS = {"path": "templates/chat.jinja", "old_string": "<parameter=limit>40</parameter>",
++             "new_string": "<parameter=limit>25</parameter>"}
++BASH_ARGS = {"command": "pytest -q tests/test_template.py", "timeout": 120}
++
++
++def run(text, *, stream_tools=True, step=3, recover=False):
++    p = OutputParser(thinking=True, tools=TOOLS, stream_tools=stream_tools, recover=recover)
++    evs = []
++    for i in range(0, len(text), step):
++        evs += p.feed(text[i:i + step])
++    evs += p.finish("stop")
++    return evs
++
++
++def calls(evs):
++    return [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
++
++
++def streamed(evs):
++    """The streamed arguments of each announced call, decoded."""
++    by_call = {}
++    for e in evs:
++        if e.kind == "tool_args":
++            by_call.setdefault(id(e.call), []).append(e.text)
++    return [json.loads("".join(parts)) for parts in by_call.values()]
++
++
++class SkippedCloserBeforeFunctionEnd(unittest.TestCase):
++    def test_parse_tool_call_keeps_the_nested_pair(self):
++        body = EDIT_SKIPPED[len("<tool_call>\n"):-len("\n</tool_call>")]
++        self.assertEqual(parse_tool_call(body, TOOLS[1]).arguments, EDIT_ARGS)
++        self.assertEqual(parse_tool_call(body).arguments, EDIT_ARGS)       # no schema: </function></tool_call> decides
++
++    def test_streamed_edit_then_bash(self):
++        text = "Go.</think>\n\n" + EDIT_SKIPPED + "\n" + BASH
++        for stream_tools in (False, True):
++            for step in (1, 2, 3, 7, 13, 10_000):
++                with self.subTest(stream_tools=stream_tools, step=step):
++                    evs = run(text, stream_tools=stream_tools, step=step)
++                    self.assertEqual(calls(evs), [("edit_file", EDIT_ARGS), ("bash", BASH_ARGS)])
++                    self.assertFalse([e for e in evs if e.kind == "content" and e.text.strip()])
++                    if stream_tools:
++                        self.assertEqual(streamed(evs), [EDIT_ARGS, BASH_ARGS])
++
++    def test_streamed_edit_alone_at_the_end_of_the_turn(self):
++        text = "Go.</think>\n\n" + EDIT_SKIPPED
++        for stream_tools in (False, True):
++            for step in (1, 3, 10_000):
++                with self.subTest(stream_tools=stream_tools, step=step):
++                    evs = run(text, stream_tools=stream_tools, step=step)
++                    self.assertEqual(calls(evs), [("edit_file", EDIT_ARGS)])
++                    if stream_tools:
++                        self.assertEqual(streamed(evs), [EDIT_ARGS])
++
++    def test_with_recovery_on(self):
++        evs = run("Go.</think>\n\n" + EDIT_SKIPPED + "\n" + BASH, recover=True, step=5)
++        self.assertEqual(calls(evs), [("edit_file", EDIT_ARGS), ("bash", BASH_ARGS)])
++
++
++class SkippedCloserBeforeNextParameter(unittest.TestCase):
++    TEXT = ("<tool_call>\n<function=edit_file>\n<parameter=path>\ntemplates/chat.jinja\n</parameter>\n"
++            "<parameter=old_string>\n<parameter=limit>40</parameter>\n"           # its </parameter> skipped
++            "<parameter=new_string>\n<parameter=limit>25</parameter>\n</parameter>\n</function>\n</tool_call>")
++
++    def test_the_next_declared_parameter_ends_the_value(self):
++        for stream_tools in (False, True):
++            for step in (1, 3, 10_000):
++                with self.subTest(stream_tools=stream_tools, step=step):
++                    evs = run("Go.</think>\n\n" + self.TEXT, stream_tools=stream_tools, step=step)
++                    self.assertEqual(calls(evs), [("edit_file", EDIT_ARGS)])
++                    if stream_tools:
++                        self.assertEqual(streamed(evs), [EDIT_ARGS])
++
++
++class NestedPairsThatAreText(unittest.TestCase):
++    """What must stay the same: matched pairs inside a value, whatever follows them."""
++
++    def test_two_nested_lines_with_a_seen_parameter_name(self):
++        # the first nested closer is followed by `<parameter=limit>` (not a parameter of edit_file) and the value's
++        # own closer by `<parameter=new_string>`: only the latter ends it
++        old = "<parameter=path>README.md</parameter>\n<parameter=limit>40</parameter>"
++        new = "<parameter=path>README.md</parameter>\n<parameter=limit>25</parameter>"
++        text = ("<tool_call>\n<function=edit_file>\n<parameter=path>\nt.jinja\n</parameter>\n"
++                f"<parameter=old_string>\n{old}\n</parameter>\n<parameter=new_string>\n{new}\n</parameter>\n"
++                "</function>\n</tool_call>")
++        want = {"path": "t.jinja", "old_string": old, "new_string": new}
++        for stream_tools in (False, True):
++            for step in (1, 4, 10_000):
++                with self.subTest(stream_tools=stream_tools, step=step):
++                    evs = run("Go.</think>\n\n" + text, stream_tools=stream_tools, step=step)
++                    self.assertEqual(calls(evs), [("edit_file", want)])
++                    if stream_tools:
++                        self.assertEqual(streamed(evs), [want])
++
++    def test_a_whole_documented_call_inside_a_value(self):
++        # the value holds `</function>\n</tool_call>` of its own; its real closer follows them
++        doc = ("<tool_call>\n<function=read_file>\n<parameter=path>README.md</parameter>\n"
++               "<parameter=limit>40</parameter>\n</function>\n</tool_call>")
++        text = ("<tool_call>\n<function=edit_file>\n<parameter=path>\nt.jinja\n</parameter>\n"
++                f"<parameter=old_string>\n{doc}\n</parameter>\n<parameter=new_string>\nnew\n</parameter>\n"
++                "</function>\n</tool_call>")
++        want = {"path": "t.jinja", "old_string": doc, "new_string": "new"}
++        for stream_tools in (False, True):
++            for step in (1, 5, 10_000):
++                with self.subTest(stream_tools=stream_tools, step=step):
++                    evs = run("Go.</think>\n\n" + text, stream_tools=stream_tools, step=step)
++                    self.assertEqual(calls(evs), [("edit_file", want)])
++                    if stream_tools:
++                        self.assertEqual(streamed(evs), [want])
++
++    def test_a_lone_closer_line_then_a_nested_pair(self):
++        # an unmatched `</parameter>` followed by `<parameter=limit>` (not a parameter of edit_file) is text
++        old = "</parameter>\n<parameter=limit>40</parameter>"
++        text = ("<tool_call>\n<function=edit_file>\n<parameter=path>\nt.jinja\n</parameter>\n"
++                f"<parameter=old_string>\n{old}\n</parameter>\n<parameter=new_string>\nnew\n</parameter>\n"
++                "</function>\n</tool_call>")
++        want = {"path": "t.jinja", "old_string": old, "new_string": "new"}
++        for step in (1, 5, 10_000):
++            with self.subTest(step=step):
++                self.assertEqual(calls(run("Go.</think>\n\n" + text, step=step)), [("edit_file", want)])
++
++
++if __name__ == "__main__":
++    unittest.main()

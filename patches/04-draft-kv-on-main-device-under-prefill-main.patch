@@ -1,0 +1,311 @@
+diff --git a/docs/MULTI_GPU.md b/docs/MULTI_GPU.md
+index 8135a88b..a1d1abd2 100644
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -110,10 +110,17 @@ draft K/V (`STRATA_MTP_BATCH_RING=0` sends a ring back to the old pass); otherwi
+ `strata serve: draft layer prompt K/V batched on CUDA<d> ...` or `strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the
+ drafter's own pass runs: <reason>`. The draft layer's K/V come out of Q8_1 x Q8_0 MMQ instead of its own mmvq, so the
+ drafts, and how many are accepted, can move; the target's tokens are decided by the verify window.
+-`tools/split_mtp_batch_parity.py` compares the greedy texts of the two arms. Preliminary, one machine (2x RTX 3080 20 GB,
+-UD-Q4_K_XL, `--layer-split 23`, `--batch-mtp`, two slots), few runs per arm, TODO-EVIDENCE (n, the A/A control and the
+-parity result): a 24K-token prompt read at 1,751 tok/s without and 1,857 with; 25K-token prompts +5 to 7%, 104K +2%;
+-drafts accepted 0.633 without, 0.635 with.
++`tools/split_mtp_batch_parity.py` compares the greedy texts of the two arms. Measured on one machine (2x RTX 3080 20 GB
++at 220 W, Xeon E5-2696 v4, UD-Q4_K_XL, `--layer-split 23`, `--batch-mtp`, two slots, `--prefill auto:16384`), two full
++restarts per arm in the order off, on, off, on, the same binary in every arm: pooled medians of the prompt read were 1,996
++tok/s without and 2,129 with at 25K tokens (+6.7%), 2,448 and 2,553 at 51K (+4.3%), 2,846 and 2,940 at 104K (+3.3%); all 8
++on/off ratios of medians are above 1 (1.03 to 1.08), and the two off restarts differ by at most 2% at 25K and 0.3% at the
++other sizes. The host's "after each chunk" time per request fell from 0.9-1.3 s to 0.1-0.25 s (one restart per arm). Greedy
++output (`--adapt-every 0 --suffix-draft 0`, five prompts of 256 tokens and one 25.5K-token prompt) was identical in 6 of 6
++prompts in all five comparisons, the two runs inside one process (A/A) included, and the drafts accepted were 826 of 1,210
++in every run, so no difference in acceptance was visible. Decode is not shown to be unchanged: the medians with the variable
++set were about 3% lower (pooled solo 82.6 -> 80.2 tok/s, two streams 93.2 -> 90.8), and the same configuration restarted
++twice moved up to 4.7%, so two restarts per arm can neither confirm nor exclude it; the change touches only the prompt path.
+ 
+ **Each card loads only its own layers' dense weights** (0.1.39, PR #639) with explicit split points (`--layer-split
+ 27`, not `auto`): every card used to keep a full copy (~3.4 GB for the Coder) though its stage reads only its own
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index d2266e55..b6f620d1 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -152,6 +152,16 @@ public:
+         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
+         return true;
+     }
++    /// E-9 from another device (--prefill-main: the prompt path runs on the main device, the drafter on the last
++    /// stage): the ten tensors draft_kv reads.  On `device_` the drafter's own pointers; on another device a copy
++    /// made once (about 25 MB, read from dense.bin).  A null member: that tensor is missing from the pack.
++    struct KvWeights {
++        const float *ne = nullptr, *nh = nullptr, *hn = nullptr, *kn = nullptr;
++        const void *fe = nullptr, *fh = nullptr, *k = nullptr, *v = nullptr;
++        const uint16_t *dn = nullptr, *up = nullptr;
++        bool complete() const { return ne && nh && hn && kn && fe && fh && k && v && dn && up; }
++    };
++    bool kv_weights_on(int device, KvWeights& w, std::string& err);
+ 
+ private:
+     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+@@ -230,6 +240,8 @@ private:
+     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
+     std::vector<Tensor> tensors_;
+     uint8_t* dense_ = nullptr;
++    struct KvCopy { int device = -1; uint8_t* blob = nullptr; uint64_t off[10] = {}; };   // kv_weights_on, per device
++    std::vector<KvCopy> kv_copies_;
+     uint8_t* experts_ = nullptr;
+     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
+     bool owns_weights_ = true;
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index f9f77918..298cffc7 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -158,12 +158,76 @@ MtpDrafter::~MtpDrafter() {
+     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
+     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
+     for (void* h : hosts) if (h) cudaFreeHost(h);
++    for (const KvCopy& c : kv_copies_) {
++        const OnDevice on(c.device);
++        if (c.blob) cudaFree(c.blob);
++    }
+ }
+ 
+ const float* MtpDrafter::f32(const char* name) const {
+     for (const auto& t : tensors_) if (t.name == name && t.kind == "f32") return (const float*) (dense_ + t.off);
+     return nullptr;
+ }
++
++bool MtpDrafter::kv_weights_on(int device, KvWeights& w, std::string& err) {
++    // the ten tensors Prefill::draft_kv reads, in the order of KvCopy::off
++    static const char* const kNames[10] = {
++        "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight", "attn_hyper_connection.hc_norm.weight",
++        "self_attn.k_norm.weight", "fc_embedding.weight", "fc_hidden.weight", "self_attn.k_proj.weight",
++        "self_attn.v_proj.weight", "attn_hyper_connection.input_mix_weight_down.weight",
++        "attn_hyper_connection.input_mix_weight_up.weight"};
++    static const char* const kKinds[10] = {"f32", "f32", "f32", "f32", "q8_0", "q8_0", "q8_0", "q8_0", "bf16", "bf16"};
++    auto assign = [&](const uint8_t* base, const uint64_t* off, const bool* have) {
++        auto p = [&](int i) -> const void* { return have[i] ? base + off[i] : nullptr; };
++        w.ne = (const float*) p(0); w.nh = (const float*) p(1); w.hn = (const float*) p(2); w.kn = (const float*) p(3);
++        w.fe = p(4); w.fh = p(5); w.k = p(6); w.v = p(7);
++        w.dn = (const uint16_t*) p(8); w.up = (const uint16_t*) p(9);
++    };
++    const Tensor* found[10] = {};
++    bool have[10] = {};
++    for (int i = 0; i < 10; ++i)
++        for (const auto& t : tensors_)
++            if (t.name == kNames[i] && t.kind == kKinds[i]) { found[i] = &t; have[i] = true; break; }
++    if (device < 0 || device == device_) {
++        uint64_t off[10] = {};
++        for (int i = 0; i < 10; ++i) if (have[i]) off[i] = found[i]->off;
++        assign(dense_, off, have);
++        return true;
++    }
++    for (const KvCopy& c : kv_copies_)
++        if (c.device == device) { assign(c.blob, c.off, have); return true; }
++    // a copy for this device: the tensors' bytes from dense.bin, contiguous
++    KvCopy c;
++    c.device = device;
++    uint64_t total = 0;
++    for (int i = 0; i < 10; ++i) if (have[i]) { c.off[i] = total; total += (found[i]->bytes + 255) & ~(uint64_t) 255; }
++    std::vector<uint8_t> blob((size_t) total);
++    FILE* f = std::fopen((rt_dir_ + "/dense.bin").c_str(), "rb");
++    if (f == nullptr) { err = "mtp: cannot open dense.bin for the main device's copy"; return false; }
++    for (int i = 0; i < 10; ++i) {
++        if (!have[i]) continue;
++        if (STRATA_FILE_SEEK64(f, (long long) found[i]->off, SEEK_SET) != 0 ||
++            std::fread(blob.data() + c.off[i], 1, (size_t) found[i]->bytes, f) != (size_t) found[i]->bytes) {
++            std::fclose(f);
++            err = "mtp: dense.bin is short of " + std::string(kNames[i]);
++            return false;
++        }
++    }
++    std::fclose(f);
++    const OnDevice on(device);
++    if (cudaMalloc((void**) &c.blob, (size_t) total) != cudaSuccess) {
++        err = "mtp: the main device has no room for the draft layer's K/V projections (" + std::to_string(total >> 20) + " MiB)";
++        return false;
++    }
++    if (cudaMemcpy(c.blob, blob.data(), (size_t) total, cudaMemcpyHostToDevice) != cudaSuccess) {
++        cudaFree(c.blob);
++        err = "mtp: the K/V projections' upload to the main device failed";
++        return false;
++    }
++    kv_copies_.push_back(c);
++    assign(c.blob, c.off, have);
++    return true;
++}
+ const uint16_t* MtpDrafter::bf16(const char* name) const {
+     for (const auto& t : tensors_) if (t.name == name && t.kind == "bf16") return (const uint16_t*) (dense_ + t.off);
+     return nullptr;
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 1ec60c7b..085674eb 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -781,6 +781,11 @@ struct Prefill::Impl {
+     float* ple_norm = nullptr;
+     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
+     uint64_t region_bytes = 0;
++    // draft_kv from another device (--prefill-main): the K and V rows of one batch on the drafter's device
++    float* dkv_remote = nullptr;
++    int64_t dkv_remote_rows = 0;
++    int dkv_remote_dev = -1;
++    cudaEvent_t dkv_remote_ev = nullptr;     // the copies of a batch are done reading Kc/Vc (the next batch waits on it)
+     PrefillStats* stats = nullptr;
+     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
+     strata::kernels::KvHostPools stage;
+@@ -867,6 +872,13 @@ void Prefill::release() {
+     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
+     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
+     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
++    if (impl_->dkv_remote) {
++        const core::OnDevice on(impl_->dkv_remote_dev);
++        if (impl_->dkv_remote_ev) cudaEventDestroy(impl_->dkv_remote_ev);
++        cudaFree(impl_->dkv_remote);
++        impl_->dkv_remote = nullptr;
++        impl_->dkv_remote_ev = nullptr;
++    }
+     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
+     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
+         if (p) cudaFreeHost(p);
+@@ -1302,23 +1314,27 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     if (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok))
+         return decline(st.kv_mode == 2 ? "the drafter's K/V is a ring and STRATA_MTP_BATCH_RING=0" : "the drafter's K/V mode is not paged/ring");
+     if (st.kv_hybrid) return decline("the drafter's K/V is hybrid (kv_hybrid)");
+-    if (mtp.device() != m.device) return decline("the drafter is on another device than this prefill path");
++    // --prefill-main (local): the drafter lives on the last stage while this path runs on the main device.  The
++    // batch is computed here from a copy of the drafter's ten tensors (kv_weights_on) and only its K and V rows
++    // cross to the drafter's device (4 KB per cell instead of the 40 KB residual rows the drafter's own pass needs)
++    const bool remote = mtp.device() != m.device;
+     const auto t0 = Clock::now();
+     const core::ModelGeometry& g = *m.g;
+     const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim;
+     constexpr int kQ8_0 = 8;   // GGML_TYPE_Q8_0
+-    const float* w_ne = mtp.tensor_f32("pre_fc_norm_embedding.weight");
+-    const void* w_fe = mtp.tensor_q8("fc_embedding.weight");
+-    const float* w_nh = mtp.tensor_f32("pre_fc_norm_hidden.weight");
+-    const void* w_fh = mtp.tensor_q8("fc_hidden.weight");
+-    const float* w_hn = mtp.tensor_f32("attn_hyper_connection.hc_norm.weight");
+-    const uint16_t* w_dn = mtp.tensor_bf16("attn_hyper_connection.input_mix_weight_down.weight");
+-    const uint16_t* w_up = mtp.tensor_bf16("attn_hyper_connection.input_mix_weight_up.weight");
+-    const void* w_k = mtp.tensor_q8("self_attn.k_proj.weight");
+-    const void* w_v = mtp.tensor_q8("self_attn.v_proj.weight");
+-    const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
+-    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn)
+-        return decline("a drafter tensor is missing (Q8_0 projections / norms)");
++    core::MtpDrafter::KvWeights w;
++    if (!mtp.kv_weights_on(m.device, w, err)) return false;
++    const float* w_ne = w.ne;
++    const void* w_fe = w.fe;
++    const float* w_nh = w.nh;
++    const void* w_fh = w.fh;
++    const float* w_hn = w.hn;
++    const uint16_t* w_dn = w.dn;
++    const uint16_t* w_up = w.up;
++    const void* w_k = w.k;
++    const void* w_v = w.v;
++    const float* w_kn = w.kn;
++    if (!w.complete()) return decline("a drafter tensor is missing (Q8_0 projections / norms)");
+     const core::NativeEmbed* nemb = core::native_embed();
+     const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+     if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
+@@ -1338,7 +1354,22 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
+     if (st.kv_mode == 2)   // a ring: one batch's cells must not share a slot (a batch can straddle one page more)
+         B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
++    if (remote) B = std::min<int64_t>(B, 4096);   // the K/V staging on the drafter's device: 16 MiB at most
+     if (B < 64) return decline("too little scratch for a 64-row batch");
++    if (remote && m.dkv_remote_rows < B) {
++        const core::OnDevice on(mtp.device());
++        if (m.dkv_remote) { cudaFree(m.dkv_remote); m.dkv_remote = nullptr; m.dkv_remote_rows = 0; }
++        if (cudaMalloc((void**) &m.dkv_remote, (size_t) B * KV * 4 * 2) != cudaSuccess) {
++            m.dkv_remote = nullptr;
++            return decline("the drafter's device has no room for the K/V staging buffer");
++        }
++        m.dkv_remote_rows = B;
++        m.dkv_remote_dev = mtp.device();
++        if (m.dkv_remote_ev == nullptr && cudaEventCreateWithFlags(&m.dkv_remote_ev, cudaEventDisableTiming) != cudaSuccess) {
++            m.dkv_remote_ev = nullptr;
++            return decline("the drafter's device gave no event for the K/V hand-off");
++        }
++    }
+     uint8_t* q = m.region;
+     auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
+     float* emb = (float*) carve((size_t) B * Nn * 4);
+@@ -1438,17 +1469,46 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+             strata::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
+             strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
+         }
++        const float* Kd = Kc;
++        const float* Vd = Vc;
++        void* append_stream = m.cs;
++        if (remote) {
++            // this batch's K/V must be complete here before they cross (the compute stream is non-blocking, so the
++            // synchronous cudaMemcpyPeer would not wait for it); the copies run on the drafter's stream, after
++            // the previous batch's append has read the staging rows
++            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
++                err = std::string("prefill: the draft layer's K/V batch: ") + cudaGetErrorString(cudaGetLastError());
++                return false;
++            }
++            float* Kr = m.dkv_remote;
++            float* Vr = m.dkv_remote + (size_t) B * KV;
++            if (cudaMemcpyPeerAsync(Kr, mtp.device(), Kc, m.device, (size_t) nb * KV * 4, mtp.stream()) != cudaSuccess ||
++                cudaMemcpyPeerAsync(Vr, mtp.device(), Vc, m.device, (size_t) nb * KV * 4, mtp.stream()) != cudaSuccess) {
++                err = std::string("prefill: the draft layer's K/V to the drafter's device: ") + cudaGetErrorString(cudaGetLastError());
++                return false;
++            }
++            // the next batch's kernels on m.cs overwrite Kc/Vc: they wait until these copies have read them (the
++            // event is the drafter's device's; a stream may wait on another device's event)
++            if (cudaEventRecord(m.dkv_remote_ev, mtp.stream()) != cudaSuccess ||
++                cudaStreamWaitEvent(m.cs, m.dkv_remote_ev, 0) != cudaSuccess) {
++                err = std::string("prefill: the draft layer's K/V hand-off event: ") + cudaGetErrorString(cudaGetLastError());
++                return false;
++            }
++            Kd = Kr; Vd = Vr; append_stream = mtp.stream();
++        }
++        const core::OnDevice on_append(remote ? mtp.device() : m.device);
+         if (st.kv_q4) {
+-            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
++            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kd, Vd, s, append_stream, &st.host);
+         } else {
+-            kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+-                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
++            kv_append(Kd, Vd, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
++                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, append_stream, &st.host);
+         }
+     }
+     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+         err = std::string("prefill: the draft layer's K/V: ") + cudaGetErrorString(cudaGetLastError());
+         return false;
+     }
++    if (remote && !mtp.idle(err)) return false;   // the appends on the drafter's stream
+     mtp.ms_prefill += ms_since(t0);
+     if (timing)
+         std::fprintf(stderr, "strata draft kv: %lld cells from %lld (first needed %lld), batch %lld: drafter idle %.1f ms, "
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index c0df8e60..7f68f614 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -7611,6 +7611,25 @@ int main(int argc, char** argv) {
+             // local port: with --prefill-main the rows are on CUDA0 but the drafter lives on the last stage, and
+             // GeForce cards have no peer access, so its kernels cannot read them there: copy them over in pieces of
+             // kPmRows rows (a small buffer: the last stage's VRAM is already spoken for by its cache)
++            // local: STRATA_PM_MTP_BATCH=1 computes the draft layer's K/V here on CUDA0 (E-9 with a copy of the
++            // drafter's projections) and ships only K and V to the drafter's device: 4 KB a cell over the stage's
++            // link instead of the 40 KB residual rows below
++            static const bool pm_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_PM_MTP_BATCH"));
++            if (use_mtp && prefill_main && pm_mtp_batch && e.empty()) {
++                const char* why = nullptr;
++                batched = sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e, &why);
++                static bool said = false;
++                if (!said && (batched || (e.empty() && why != nullptr))) {
++                    said = true;
++                    if (batched)
++                        std::fprintf(stderr, "strata serve: draft layer prompt K/V batched on CUDA0, appended on CUDA%d "
++                                             "(STRATA_PM_MTP_BATCH=1, K/V mode %d)\n", stages.back()->dev,
++                                     mtp.kv_state().kv_mode);
++                    else
++                        std::fprintf(stderr, "strata serve: STRATA_PM_MTP_BATCH=1 declined, the drafter's own pass runs: "
++                                             "%s\n", why);
++                }
++            }
+             if (use_mtp && prefill_main && !batched && e.empty()) {   // (the PR's plan is not consulted here)
+                 constexpr int64_t kPmRows = 256;
+                 const uint64_t row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);

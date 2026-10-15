@@ -1,0 +1,453 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6321515e..2e1de84f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1079,6 +1079,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
+   target_include_directories(conv_cache_test PRIVATE include)
+   add_test(NAME conv_cache_test COMMAND conv_cache_test)
++  # which path computes the draft layer's prompt K/V, and STRATA_SPLIT_MTP_BATCH's parsing (header-only, CPU)
++  add_executable(draft_kv_plan_test src/program/draft_kv_plan_test.cpp)
++  target_include_directories(draft_kv_plan_test PRIVATE include)
++  add_test(NAME draft_kv_plan_test COMMAND draft_kv_plan_test)
+   # coupled draft sampling's counter and penalty-ring arithmetic (header-only, CPU)
+   add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
+   target_include_directories(coupled_draft_test PRIVATE include)
+diff --git a/docs/MULTI_GPU.md b/docs/MULTI_GPU.md
+index 5659f97e..8135a88b 100644
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -100,6 +100,21 @@ The engine flags behind it: `--layer-split K1[,K2..]|auto` and `--split-device D
+ devices; default the next visible ones). `--layer-split K --split-device 0` runs both stages on one card sharing
+ everything - the bit-exact check of the hand-off, not a speed mode.
+ 
++**The draft layer's prompt K/V in batches on a split (opt-in, `STRATA_SPLIT_MTP_BATCH=1`).** With `--mtp` the draft
++layer sits on the last card, and each prompt chunk ends by filling that layer's K/V for the chunk's rows. On one card the
++prompt path does it in batches (`Prefill::draft_kv`, a few large matrix products per chunk); on a split the drafter's own
++pass always did it, one graph launch and four device copies per group of 8 rows (1,024 groups per 8,192-token chunk).
++With the variable set, the last card's prompt path batches it as it does on one card. Restart-only; default off, so the
++default start is unchanged. It needs a `--native` pack (the GGUF-form token table) and a paged or ring (`--kv-resident`)
++draft K/V (`STRATA_MTP_BATCH_RING=0` sends a ring back to the old pass); otherwise it says why once and keeps the old pass:
++`strata serve: draft layer prompt K/V batched on CUDA<d> ...` or `strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the
++drafter's own pass runs: <reason>`. The draft layer's K/V come out of Q8_1 x Q8_0 MMQ instead of its own mmvq, so the
++drafts, and how many are accepted, can move; the target's tokens are decided by the verify window.
++`tools/split_mtp_batch_parity.py` compares the greedy texts of the two arms. Preliminary, one machine (2x RTX 3080 20 GB,
++UD-Q4_K_XL, `--layer-split 23`, `--batch-mtp`, two slots), few runs per arm, TODO-EVIDENCE (n, the A/A control and the
++parity result): a 24K-token prompt read at 1,751 tok/s without and 1,857 with; 25K-token prompts +5 to 7%, 104K +2%;
++drafts accepted 0.633 without, 0.635 with.
++
+ **Each card loads only its own layers' dense weights** (0.1.39, PR #639) with explicit split points (`--layer-split
+ 27`, not `auto`): every card used to keep a full copy (~3.4 GB for the Coder) though its stage reads only its own
+ layers, and the VRAM it frees goes to that card's expert cache (2x MI50 16 GB, Coder: 8,819 -> 10,626 experts in
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 85cda57b..28c179f0 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -51,8 +51,9 @@ public:
+     /// scratch - call it from on_chunk.  false with `err` empty: not applicable here (a ring or hybrid K/V, another
+     /// device, too little scratch; STRATA_MTP_BATCH=0), the caller runs the drafter's own pass.  Not bit-identical to
+     /// that pass (FP16 GEMMs instead of Q8_1 activations): the drafts may differ, never the target's tokens' logits.
++    /// `why` (optional): on a decline (false, `err` empty) the reason, a static string.
+     bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+-                  std::string& err);
++                  std::string& err, const char** why = nullptr);
+     Prefill();
+     ~Prefill();
+     Prefill(const Prefill&) = delete;
+diff --git a/include/strata/program/draft_kv_plan.hpp b/include/strata/program/draft_kv_plan.hpp
+new file mode 100644
+index 00000000..0bff531d
+--- /dev/null
++++ b/include/strata/program/draft_kv_plan.hpp
+@@ -0,0 +1,44 @@
++// include/strata/program/draft_kv_plan.hpp - which code computes the draft layer's prompt K/V for a chunk.
++//
++// One GPU: the prompt path's batched pass (E-9, `Prefill::draft_kv`) tries first and the drafter's own
++// per-8-row pass (`MtpDrafter::prefill`) takes what it declines.  A layer split: only the drafter's own pass
++// ran, until `STRATA_SPLIT_MTP_BATCH=1` (opt-in) lets the last stage's prompt path try E-9 as well.  The
++// drafter's K/V then come from Q8_1 x Q8_0 MMQ instead of its own mmvq, so its drafts can differ a little; the
++// target's tokens are decided by the verify window and do not.
++//
++// Pure (no GPU, no environment read): generate.cpp passes in what it knows.
++#pragma once
++
++#include <cstdlib>
++
++namespace strata::program::draft_kv {
++
++/// `STRATA_SPLIT_MTP_BATCH`'s value: any whole number other than 0 turns it on; unset, empty, `0` and text
++/// that is not a number leave it off.
++inline bool split_env_on(const char* value) { return value != nullptr && std::atoi(value) != 0; }
++
++struct Plan {
++    bool try_batched = false;      ///< call Prefill::draft_kv for this chunk
++    const char* why = nullptr;     ///< when `try_batched` is false only because of a missing prerequisite: what is missing
++};
++
++/// `use_mtp`: the engine runs a draft layer. `multi_gpu`: a layer split. `split_env`: split_env_on(...) of the
++/// variable. `has_native_embed`: the GGUF-form token embedding table exists (a --native pack): the split's
++/// last stage reads it, a single GPU's path can also gather from its own weights.
++inline Plan plan(bool use_mtp, bool multi_gpu, bool split_env, bool has_native_embed) {
++    Plan p;
++    if (!use_mtp) return p;
++    if (!multi_gpu) {
++        p.try_batched = true;
++        return p;
++    }
++    if (!split_env) return p;   // the default on a split: the drafter's own pass, nothing to say
++    if (!has_native_embed) {
++        p.why = "the split's last stage has no GGUF-form token embedding table (not --native)";
++        return p;
++    }
++    p.try_batched = true;
++    return p;
++}
++
++}  // namespace strata::program::draft_kv
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 79a44362..1ec60c7b 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1286,8 +1286,10 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
+ int64_t Prefill::chunk() const { return impl_->T; }
+ 
+ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+-                       std::string& err) {
++                       std::string& err, const char** why) {
+     Impl& m = *impl_;
++    const core::OnDevice on_device(m.device);   // the stage's own GPU current (a layer split's drafter: the last stage)
++    auto decline = [&](const char* reason) { if (why != nullptr) *why = reason; return false; };
+     static const bool off = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
+     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
+     // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
+@@ -1295,9 +1297,12 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     // drafter's own pass for a ring (the A/B).
+     static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v == nullptr || v[0] != '0'; }();
+     core::QsaState& st = mtp.kv_state_rw();
+-    if (off || n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok)) ||
+-        st.kv_hybrid || mtp.device() != m.device)
+-        return false;
++    if (off) return decline("STRATA_MTP_BATCH=0");
++    if (n <= 0 || m.g == nullptr || m.region == nullptr) return decline("no prompt scratch region on this path");
++    if (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok))
++        return decline(st.kv_mode == 2 ? "the drafter's K/V is a ring and STRATA_MTP_BATCH_RING=0" : "the drafter's K/V mode is not paged/ring");
++    if (st.kv_hybrid) return decline("the drafter's K/V is hybrid (kv_hybrid)");
++    if (mtp.device() != m.device) return decline("the drafter is on another device than this prefill path");
+     const auto t0 = Clock::now();
+     const core::ModelGeometry& g = *m.g;
+     const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim;
+@@ -1312,12 +1317,13 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     const void* w_k = mtp.tensor_q8("self_attn.k_proj.weight");
+     const void* w_v = mtp.tensor_q8("self_attn.v_proj.weight");
+     const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
+-    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn) return false;
++    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn)
++        return decline("a drafter tensor is missing (Q8_0 projections / norms)");
+     const core::NativeEmbed* nemb = core::native_embed();
+     const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+     if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
+                   (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+-        return false;
++        return decline("the token embedding is not gatherable on this path");
+     // the cells the drafter's window can still reach
+     const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
+     if (r0 >= n) return true;
+@@ -1332,7 +1338,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
+     if (st.kv_mode == 2)   // a ring: one batch's cells must not share a slot (a batch can straddle one page more)
+         B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
+-    if (B < 64) return false;
++    if (B < 64) return decline("too little scratch for a 64-row batch");
+     uint8_t* q = m.region;
+     auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
+     float* emb = (float*) carve((size_t) B * Nn * 4);
+@@ -1355,7 +1361,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     void* xq = q8 ? carve(mmq::q8_bytes(B * g.hc, Nn)) : nullptr;
+     int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
+     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
+-    if ((uint64_t) (q - m.region) > m.region_bytes) return false;
++    if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
+     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
+     if (timing) cudaStreamSynchronize(m.cs);
+     const auto ti0 = Clock::now();
+diff --git a/src/program/draft_kv_plan_test.cpp b/src/program/draft_kv_plan_test.cpp
+new file mode 100644
+index 00000000..d48fdb75
+--- /dev/null
++++ b/src/program/draft_kv_plan_test.cpp
+@@ -0,0 +1,62 @@
++// src/program/draft_kv_plan_test.cpp - which path computes the draft layer's prompt K/V (header-only, CPU).
++//
++//   1. STRATA_SPLIT_MTP_BATCH: unset, empty, 0 and text that is not a number are off; any other whole number is on;
++//   2. one GPU: the batched pass is tried whatever the variable says (the default before this change);
++//   3. a layer split: the default stays the drafter's own pass, silently; with the variable on the batched pass is
++//      tried, unless the pack has no GGUF-form token table, which is reported instead;
++//   4. no draft layer: nothing is tried and nothing is said.
++#include "strata/program/draft_kv_plan.hpp"
++
++#include <cstdio>
++#include <initializer_list>
++
++namespace dkv = strata::program::draft_kv;
++
++namespace {
++int g_fail = 0;
++void check(bool ok, const char* what) {
++    std::printf("  %-72s %s\n", what, ok ? "ok" : "FAIL");
++    if (!ok) ++g_fail;
++}
++}  // namespace
++
++int main() {
++    std::printf("draft_kv_plan_test\n");
++    check(!dkv::split_env_on(nullptr), "unset is off");
++    check(!dkv::split_env_on(""), "empty is off");
++    check(!dkv::split_env_on("0"), "0 is off");
++    check(!dkv::split_env_on("off"), "text that is not a number is off");
++    check(dkv::split_env_on("1"), "1 is on");
++    check(dkv::split_env_on("2"), "any other whole number is on");
++
++    for (const bool env : {false, true})
++        for (const bool native : {false, true}) {
++            const dkv::Plan p = dkv::plan(true, false, env, native);
++            check(p.try_batched && p.why == nullptr, "one GPU: the batched pass is tried, nothing is reported");
++        }
++
++    {
++        const dkv::Plan p = dkv::plan(true, true, false, true);
++        check(!p.try_batched && p.why == nullptr, "split, variable off: the drafter's own pass, silently");
++    }
++    {
++        const dkv::Plan p = dkv::plan(true, true, false, false);
++        check(!p.try_batched && p.why == nullptr, "split, variable off, no token table: still silent");
++    }
++    {
++        const dkv::Plan p = dkv::plan(true, true, true, true);
++        check(p.try_batched && p.why == nullptr, "split, variable on: the batched pass is tried on the last stage");
++    }
++    {
++        const dkv::Plan p = dkv::plan(true, true, true, false);
++        check(!p.try_batched && p.why != nullptr, "split, variable on, no token table: declined with a reason");
++    }
++    for (const bool multi : {false, true})
++        for (const bool env : {false, true}) {
++            const dkv::Plan p = dkv::plan(false, multi, env, true);
++            check(!p.try_batched && p.why == nullptr, "no draft layer: nothing tried, nothing said");
++        }
++
++    std::printf(g_fail == 0 ? "draft_kv_plan_test: all ok\n" : "draft_kv_plan_test: %d FAILED\n", g_fail);
++    return g_fail == 0 ? 0 : 1;
++}
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index ffdb6e6c..c0df8e60 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -61,6 +61,7 @@
+ #include "strata/core/native_dense.hpp"
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
++#include "strata/program/draft_kv_plan.hpp"
+ #include "strata/program/message_boundary.hpp"
+ #include "strata/spec/draft_policy.hpp"
+ #include "strata/spec/draft_source.hpp"
+@@ -7578,17 +7579,39 @@ int main(int argc, char** argv) {
+             }
+             return true;
+         };
++        // STRATA_SPLIT_MTP_BATCH=1 (default off): the layer split's drafter is on the last stage, so E-9 (Prefill::draft_kv)
++        // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
++        // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
++        static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
+         void* pm_rows = nullptr;      // --prefill-main: the drafter's copy of a chunk's rows (last stage's device)
+         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+             std::vector<int32_t> nxt((size_t) T);
+             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
+-            // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last
+-            // stage; STRATA_PREFILL_MAIN: the main device's rows cover all layers, so it qualifies too)
+-            const bool batched = use_mtp && !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
++            // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
++            bool batched = false;
++            const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
++                use_mtp, multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
++            if (!prefill_main && (dkv.try_batched || dkv.why != nullptr)) {
++                strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;   // the drafter's stage
++                const char* why = dkv.why;
++                if (dkv.try_batched) batched = dsp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e, &why);
++                if (multi_gpu) {   // once per process: what this env did
++                    static bool said = false;
++                    if (!said && (batched || (e.empty() && why != nullptr))) {
++                        said = true;
++                        if (batched)
++                            std::fprintf(stderr, "strata serve: draft layer prompt K/V batched on CUDA%d (E-9 on the layer "
++                                                 "split, K/V mode %d)\n", stages.back()->dev, mtp.kv_state().kv_mode);
++                        else
++                            std::fprintf(stderr, "strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the drafter's own pass "
++                                                 "runs: %s\n", why);
++                    }
++                }
++            }
+             // local port: with --prefill-main the rows are on CUDA0 but the drafter lives on the last stage, and
+             // GeForce cards have no peer access, so its kernels cannot read them there: copy them over in pieces of
+             // kPmRows rows (a small buffer: the last stage's VRAM is already spoken for by its cache)
+-            if (use_mtp && prefill_main && !batched && e.empty()) {
++            if (use_mtp && prefill_main && !batched && e.empty()) {   // (the PR's plan is not consulted here)
+                 constexpr int64_t kPmRows = 256;
+                 const uint64_t row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);
+                 const int ddev = stages.back()->dev;
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 08fe3fc2..1aef34d4 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -1275,8 +1275,9 @@ catch (sycl::exception const &exc) {
+ int64_t Prefill::chunk() const { return impl_->T; }
+ 
+ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+-                       std::string& err) {
++                       std::string& err, const char** why) {
+     Impl& m = *impl_;
++    auto decline = [&](const char* reason) { if (why != nullptr) *why = reason; return false; };
+     static const bool off = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
+     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
+     // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
+@@ -1284,9 +1285,12 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     // drafter's own pass for a ring (the A/B).
+     static const bool ring_ok = [] { const char* v = std::getenv("STRATA_MTP_BATCH_RING"); return v == nullptr || v[0] != '0'; }();
+     core::QsaState& st = mtp.kv_state_rw();
+-    if (off || n <= 0 || m.g == nullptr || m.region == nullptr || (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok)) ||
+-        st.kv_hybrid || mtp.device() != m.device)
+-        return false;
++    if (off) return decline("STRATA_MTP_BATCH=0");
++    if (n <= 0 || m.g == nullptr || m.region == nullptr) return decline("no prompt scratch region on this path");
++    if (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok))
++        return decline(st.kv_mode == 2 ? "the drafter's K/V is a ring and STRATA_MTP_BATCH_RING=0" : "the drafter's K/V mode is not paged/ring");
++    if (st.kv_hybrid) return decline("the drafter's K/V is hybrid (kv_hybrid)");
++    if (mtp.device() != m.device) return decline("the drafter is on another device than this prefill path");
+     const auto t0 = Clock::now();
+     const core::ModelGeometry& g = *m.g;
+     const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim;
+@@ -1301,12 +1305,13 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     const void* w_k = mtp.tensor_q8("self_attn.k_proj.weight");
+     const void* w_v = mtp.tensor_q8("self_attn.v_proj.weight");
+     const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
+-    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn) return false;
++    if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn)
++        return decline("a drafter tensor is missing (Q8_0 projections / norms)");
+     const core::NativeEmbed* nemb = core::native_embed();
+     const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+     if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
+                   (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+-        return false;
++        return decline("the token embedding is not gatherable on this path");
+     // the cells the drafter's window can still reach
+     const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
+     if (r0 >= n) return true;
+@@ -1321,11 +1326,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     // SYCL port: B is the batch buffers' capacity, not the row count (each batch uses nb <= B rows), so a short
+     // prompt gets 64-row buffers instead of the per-6-token fallback (19 tokens: 106 ms there, a few ms here)
+     const int64_t cap = (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63;
+-    if (cap < 64) return false;
++    if (cap < 64) return decline("too little scratch for a 64-row batch");
+     int64_t B = std::min<int64_t>(std::max<int64_t>(n - r0, 64), cap);
+     if (st.kv_mode == 2)   // #453: a ring: one batch's cells must not share a slot (a batch can straddle one page more)
+         B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
+-    if (B < 64) return false;
++    if (B < 64) return decline("too little scratch for a 64-row batch");
+     uint8_t* q = m.region;
+     auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
+     float* emb = (float*) carve((size_t) B * Nn * 4);
+@@ -1348,7 +1353,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     void* xq = q8 ? carve(mmq::q8_bytes(B * g.hc, Nn)) : nullptr;
+     int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
+     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
+-    if ((uint64_t) (q - m.region) > m.region_bytes) return false;
++    if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
+     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
+     if (timing) m.cs->wait();
+     const auto ti0 = Clock::now();
+diff --git a/tools/split_mtp_batch_parity.py b/tools/split_mtp_batch_parity.py
+new file mode 100755
+index 00000000..e976fbb8
+--- /dev/null
++++ b/tools/split_mtp_batch_parity.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""Live parity check for STRATA_SPLIT_MTP_BATCH (needs a running engine; no model on the build box).
++
++  split_mtp_batch_parity.py dump OUT.json [--url URL] [--key-file FILE] [--long-words N]
++  split_mtp_batch_parity.py compare A.json B.json
++
++`dump` sends 5 fixed greedy prompts x 256 tokens and one long prompt (default ~25k tokens) x 256 tokens to a
++server started WITHOUT the env (A) or WITH STRATA_SPLIT_MTP_BATCH=1 (B), and stores the texts.  `compare` exits 0
++when every text is identical, 1 otherwise, printing PASS/FAIL lines.  The drafter's K/V is not bit-identical
++(Q8_1 x Q8_0 MMQ instead of mmvq), so only the target's tokens are compared here; read `drafts accepted X of Y`
++from the engine log for each arm (expect within +-3 points).
++"""
++import json
++import sys
++import urllib.request
++
++PROMPTS = [
++    "Write a 200 word story about a lighthouse keeper who finds a message in a bottle.",
++    "Explain how a binary search tree stays balanced, with a short Python example.",
++    "List the planets of the solar system with one fact each.",
++    "Translate to French and then explain the grammar: 'The quick brown fox jumps over the lazy dog.'",
++    "Write a C function that reverses a singly linked list and explain its complexity.",
++]
++
++
++def haystack(n_entries):
++    w = ["amber", "birch", "cedar", "delta", "ember", "fjord", "grove", "harbor", "iris", "juniper"]
++    return "\n".join(
++        f"Entry {i}: the {w[(i * 3) % 10]} station {(i * 7) % 997} logged a reading of {(i * 31) % 1009}."
++        for i in range(n_entries)
++    )
++
++
++def ask(url, key, content, n):
++    body = json.dumps({"model": "qwen3.8-flash-next-ud-q4_k_xl", "messages": [{"role": "user", "content": content}],
++                       "max_tokens": n, "temperature": 0.0, "chat_template_kwargs": {"enable_thinking": False}}).encode()
++    hdr = {"Content-Type": "application/json"}
++    if key:
++        hdr["Authorization"] = "Bearer " + key
++    d = json.load(urllib.request.urlopen(urllib.request.Request(url, body, hdr), timeout=3600))
++    return d["choices"][0]["message"]["content"], d["usage"]
++
++
++def main(argv):
++    if len(argv) >= 3 and argv[0] == "compare":
++        a, b = (json.load(open(p)) for p in argv[1:3])
++        bad = 0
++        for k in a:
++            same = a[k]["text"] == b.get(k, {}).get("text")
++            print(("PASS" if same else "FAIL"), k, f"({a[k]['completion_tokens']} vs {b.get(k, {}).get('completion_tokens')} tokens)")
++            bad += not same
++        print("PARITY", "OK" if not bad else f"BROKEN ({bad} differ)")
++        return 1 if bad else 0
++    if len(argv) >= 2 and argv[0] == "dump":
++        url = "http://127.0.0.1:8000/v1/chat/completions"
++        key = None
++        words = 1100
++        i = 2
++        while i < len(argv):
++            if argv[i] == "--url":
++                url = argv[i + 1]
++            elif argv[i] == "--key-file":
++                key = open(argv[i + 1]).read().strip()
++            elif argv[i] == "--long-words":
++                words = int(argv[i + 1])
++            i += 2
++        out = {}
++        for n, p in enumerate(PROMPTS):
++            t, u = ask(url, key, p, 256)
++            out[f"short{n}"] = {"text": t, "completion_tokens": u["completion_tokens"], "prompt_tokens": u["prompt_tokens"]}
++        t, u = ask(url, key, "Summarise the log below in three sentences.\n" + haystack(words), 256)
++        out["long"] = {"text": t, "completion_tokens": u["completion_tokens"], "prompt_tokens": u["prompt_tokens"]}
++        json.dump(out, open(argv[1], "w"), indent=1)
++        print({k: v["prompt_tokens"] for k, v in out.items()})
++        return 0
++    print(__doc__)
++    return 2
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))

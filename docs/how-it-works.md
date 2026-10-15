@@ -335,3 +335,117 @@ keeps every older spill (they are dropped only after a new file is complete), so
 costs nothing. A switch that arrives before the idle write finishes still writes on the spot as before.
 The spill files are deleted when the engine ends on QUIT and, for an engine that was killed, by the
 server when it stops.
+
+## Upstream v0.1.41 as the base (2026-10-08)
+
+Upstream v0.1.41 took in most of the open PRs the series carried (#905 is our #1122, #954 / #958, the
+pipelined adaptive tier, the CPU prefill share). The series was merged onto it as one step (patch 01): twelve
+files conflicted, upstream's versions won where the same change had landed, and three places kept ours: the
+NVMe spill instead of upstream's parked-conversation eviction in `generate.cpp`, the `--prefill-main`
+residency mask next to upstream's `pin=N` prefix, and the response marker in tool-call ids inside upstream's
+new `_finish_call`. Upstream renamed `all_resident_` to a per-window loan flag (`ar_on()`); our PLE ticket
+branch sits inside it. Patch 02 is the one hunk a merge tool had thrown away (#547's `bytes_needed` source
+flag). On the same config the new base decodes the same and reads long prompts 5-20% faster, with 2 GB more
+RAM left available (the page-locked complement is accounted differently).
+
+## The draft layer's prompt K/V computed on the main device
+
+The MTP drafter lives on the 4070 (the last stage). Under `--prefill-main` the whole prompt is read on the
+5090, so the drafter's layer needs its K/V for the prompt too, and the series used to ship the residual rows
+it needs across the x1 link: 40 KB per token, 1.7 s per 32K chunk, 4.0-4.3 s per 82K prompt in the
+`after each chunk` timing line. Upstream's PR #1599 (patch 03) batches the draft layer's prompt K/V on the
+drafter's own stage, which under `--prefill-main` is the wrong device, so its block declines and nothing
+changes. Patch 04 computes that K/V on the 5090 instead: the ten draft-layer weight tensors are copied there
+once (about 25 MB), `Prefill::draft_kv` runs on the main device, synchronises its compute stream, copies the
+K/V rows (not the residual) into a staging buffer on the 4070 with `cudaMemcpyPeerAsync` on the drafter's
+stream (at most 4,096 rows = 16 MiB at a time), records an event that the main stream waits on before it
+touches the source again, and appends the rows into the drafter's KV on its own stream. The link now carries
+0.27-0.30 s per 82K prompt; TTFT fell 10-25% on 32K-82K prompts, decode and acceptance are unchanged. Any
+future cross-device hand-off in the prompt path needs both the explicit sync and the event: without them the
+only symptom is a few points of acceptance, never an error.
+
+## IQ3_S and the runtime refusal projection
+
+ISTA's GSQ-RCO family shares one PLE shard (28.8 GB, byte-identical across quants) and differs in shard 1:
+IQ3_XXS 47 GB, IQ3_S 54.8 GB, Q2_0 37.6 GB. On this box the question is which quant still keeps every decode
+expert off the SSD: Q2_0 fits entirely in VRAM, IQ3_XXS leaves 2,800 experts for the RAM copy, IQ3_S 6,000,
+unsloth's UD-IQ4_XS 9,200 (which no longer fit in RAM: decode read 5,000 blobs per answer from the SSD and ran
+at 58 tok/s). IQ3_S keeps the file reads at zero with 17.0 GiB locked, and is the best quality tier that does
+(KL from BF16 about 40% below IQ3_XXS on sirfyyn's corpora). Its prompt chunk is 16K rather than 32K because
+the lend region is smaller: with 32K chunks 41% of a chunk's lent slots re-read from the pack, with 16K every
+lendable slot stays in RAM; speed is a wash.
+
+The refusal direction is not baked into the weights. alesha-pro's release ships the direction huihui-ai's
+abliterated checkpoint removes (a 480 KB GGUF control vector, one 2560-float vector per layer), and Strata
+projects it out of the residual stream at runtime on layers 4-44 (`--control-vector-scaled FILE:1.0
+--control-vector-layer-range 4 44 --cvec-mode project --cvec-dir per-layer`; the tables are uploaded to both
+cards of the split). The weights stay ISTA's, the drafter is the stock head, speed and the probes are at
+parity with the vector off, and a request can turn it off with `"experimental_speed_projection": false`. The
+earlier route, a re-quantised abliterated checkpoint (SC117's IQ3_XXS), measured XSTest unsafe refusals
+167/200 -> 3/200 at unchanged acceptance; the vector was adopted because it leaves the quant untouched and
+works on any ISTA size.
+
+## The tail skip, RAM adapt and the park gain (patch 05)
+
+Three independent pieces in one patch, as they were tested together:
+
+- **`STRATA_ROUTE_TAIL_SKIP`** is upstream's 0.1.42 default, cherry-picked: an expert a verify window would
+  have to fetch, and that every token of the window routes at rank 7 or lower, is neither copied nor computed.
+  12.78 instead of 13.22 ms per window on IQ3_S (12 of 13 paired requests), 24.1 instead of 31.1 on the
+  SSD-bound unsloth quant. Answers change slightly (upstream: KL 0.003-0.006); `"STRATA_ROUTE_TAIL_SKIP": "0"`
+  restores 0.1.41's bytes. It arms itself only when no helper or peer GPU is in use and not every expert is
+  resident; a layer split is fine, each stage skips by itself.
+- **`STRATA_RAM_ADAPT=N`** (PR #1838, opt-in) lets the page-locked RAM copy follow the conversation. The PR
+  moves experts between verify windows; with a layer split and `--pipeline-windows 2` a window is in flight
+  on both cards at every tick and might still read the evicted blob, so ours moves between requests only,
+  after the adaptive round drained and the lent slots refilled, scores by the routing summed over rounds
+  (halved each idle pass) and gives way to a request line arriving. +15-20% decode on unsloth's quant; a no-op
+  on IQ3_S, whose decode never reads the file.
+- **`--conversation-cache-park-gain N`** (PR #2265): the cache parked a conversation at every turn and the next
+  turn dropped that snapshot (upstream issue #2264), so a long single conversation wrote a full snapshot per
+  turn for nothing: 294 GB in a day here. Now a conversation is parked again only once it grew N tokens past
+  the copy it would supersede (4,096 in the config).
+
+## The Sharp template at xhigh
+
+Strata has no template flag: it renders `<tokenizer dir>/chat_template.jinja`, and the config's `"tokenizer"`
+key picks the directory. `prepare.sh` copies the pack's tokenizer to `tokenizer-sharp` and swaps in the
+[Sharp template](https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates) v22.5.0 with one line
+changed: its default reasoning effort goes from medium to xhigh. The template cuts filler (short answers in a
+third of the tokens, same accuracy) and fixes a few tool-call details, but on this model its effort default is
+what moves tool calls: 8/60 at medium, 33/60 at xhigh, 21/60 for the stock template. ISTA says the same of
+the quant itself (it is tuned for xhigh; medium "degrades significantly"). The server forwards
+`reasoning_effort` and `enable_thinking` from a request; the template's other switches are not reachable
+through Strata.
+
+## Nested parameter pairs and the closer the model skips (patch 08)
+
+A tool call is `<function=NAME>` then `<parameter=P>` ... `</parameter>` per argument, then `</function>`. A value
+can contain those tags (a file that documents the call format, upstream #210), so the parser ended a value at
+the first `</parameter>` followed by `<parameter=` or `</function>`. The raw engine output (`STRATA_DEBUG=1`) of an
+agent editing such a file showed what breaks that: in about half of the edits the model writes the nested line
+`<parameter=limit>25</parameter>` and then goes straight to `</function>`, the inner closer standing in for the
+value's own, and the rule read `new_string` as `<parameter=limit>25`. The same rule also cut a two-line value
+whose first nested closer is followed by `<parameter=` and a value holding a whole documented call.
+
+`param_end` now counts `<parameter=` openers inside the value: a `</parameter>` that matches one is text. The
+value ends at the first unmatched closer followed by the next parameter or `</function>`; if every pair is
+matched and the model moves on anyway (a parameter the tool declares and the call has not given yet, or a
+`</function>` followed by `</tool_call>` and then the end of the turn or the next `<tool_call>`), the value ends
+there and the skipped closer is forgiven. The tool's schema is threaded through all four readers (the call
+and function end finders, the final parse and the streaming scanner, which rescans a value from its start on
+each delta so the depth is never lost mid-stream), and `finish()` makes one last pass so a decision that needs
+text after `</tool_call>` is made at the end of the turn. One ambiguity is accepted: a value whose last line
+is an unmatched `<parameter=X>` opener looks identical to the skipped-closer case, and the parser favours the
+latter, which is what the model does. Tests: `serve/test_skipped_closer.py` (8 cases, each at chunk sizes from
+one character to whole, streamed and not); the 45 raw outputs of that day all parse. On the probe the cut
+edits went 17 -> 0 of 60; the misses left are calls the model never wrote.
+
+## Two upstream PRs carried but inert in the shipped config (patches 06, 07)
+
+#2589 (`STRATA_SLOT_EXPIRE_S`) keeps a long conversation's batch slot from a short side request when the server
+runs with `"parallel"` slots; the shipped config runs one request at a time, so it does nothing here. #2572
+reads parameters a model writes as `<parameter name="X">` or as one JSON `<parameter>` block, under
+`"tool_call_recovery": true`; this model never writes those forms (0 rewrites in 60 probe sequences) and the
+recovery mode invented a call once, so recovery stays off. Both are kept because they apply cleanly, pass their
+tests, and are where the series would go next.

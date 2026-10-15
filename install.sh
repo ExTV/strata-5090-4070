@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Clones upstream Strata at the v0.1.40.1 tag into ./strata, applies the patch series in patches/ (ten open
-# upstream PRs and our own patches, in the order they were merged and tested), builds the engine and the vision helper
-# for an RTX 5090 (sm_120) + RTX 4070 Ti SUPER (sm_89), makes the Python venv, and writes the server config
-# from configs/flash-next-262k.json.in with $MODELS filled in.  Safe to re-run: patches already applied are
-# skipped and cmake only rebuilds what changed.  The expert pack and the MTP drafter are built by prepare.sh.
+# Clones upstream Strata at the v0.1.41 tag into ./strata, applies the patch series in patches/ (the dual-GPU
+# series, four open upstream PRs and our own work, in the order they were merged and tested), builds the engine
+# and the vision helper for an RTX 5090 (sm_120) + RTX 4070 Ti SUPER (sm_89), makes the Python venv, and writes the
+# two server configs from configs/*.json.in with $MODELS filled in.  Safe to re-run: patches already applied are
+# skipped and cmake only rebuilds what changed.  The expert pack, the MTP drafter and the chat template are
+# prepared by prepare.sh.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 STRATA_REPO=${STRATA_REPO:-https://github.com/Niko1221/Strata.git}
-STRATA_COMMIT=${STRATA_COMMIT:-82f46a8c8f475f001ad76d92f58f4a4f8ffb0253}   # tag v0.1.40.1 (2026-10-06)
+STRATA_COMMIT=${STRATA_COMMIT:-fb58e0dbc8399662c0e47c76578c6e878b14f6cf}   # tag v0.1.41 (2026-10-08)
 MODELS=${MODELS:-$PWD/models}
 CUDA_ARCHS=${CUDA_ARCHS:-"89;120"}
 JOBS=${JOBS:-3}          # a cicc/nvcc job takes ~3 GB of RAM; 3 jobs fit a 32 GB box next to a desktop
@@ -33,7 +34,7 @@ for p in ../patches/[0-9][0-9]-*.patch; do
     if grep -qxF "$name" .patches-applied; then
         echo "already applied  $name"
     elif patch -p1 --dry-run --forward --quiet < "$p" >/dev/null 2>&1; then
-        patch -p1 --forward --quiet -b -z .orig-v0140 < "$p"
+        patch -p1 --forward --quiet -b -z .orig-v0141 < "$p"
         echo "$name" >> .patches-applied
         echo "applied          $name"
     else
@@ -58,9 +59,13 @@ cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAM
       -DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
 cmake --build build-vision --target strata-vision -j"$JOBS"
 
-MODELS="$MODELS" python3 -c 'import os,sys; sys.stdout.write(open("../configs/flash-next-262k.json.in").read().replace("@MODELS@", os.environ["MODELS"]))' > strata-flash-next-262k.json
+for c in flash-next-262k flash-next-iq3xxs-262k; do
+    MODELS="$MODELS" python3 -c 'import os,sys; sys.stdout.write(open(sys.argv[1]).read().replace("@MODELS@", os.environ["MODELS"]))' \
+        "../configs/$c.json.in" > "strata-$c.json"
+done
 echo "$MODELS" > models.path      # prepare.sh and the launcher read it, so MODELS= is needed only here
 sha256sum -c --quiet ../patches/MANIFEST.sha256 && echo "the $(wc -l < ../patches/MANIFEST.sha256) patched files match patches/MANIFEST.sha256 (the tested tree)"
 echo
-echo "built: strata/build/strata, strata/build-vision/bin/strata-vision; config strata/strata-flash-next-262k.json (MODELS=$MODELS)"
+echo "built: strata/build/strata, strata/build-vision/bin/strata-vision; configs strata/strata-flash-next-262k.json (IQ3_S) and"
+echo "       strata/strata-flash-next-iq3xxs-262k.json (IQ3_XXS), MODELS=$MODELS"
 echo "next: download the model into $MODELS (README step 2), then ./prepare.sh, then launchers/flash-next-262k.sh"
