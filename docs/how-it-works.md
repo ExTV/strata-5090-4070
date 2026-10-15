@@ -475,3 +475,19 @@ Two things that produced wrong numbers this month, written down so they are not 
 - Rank by milliseconds per verify window, not tokens per second, whenever the change touches the drafter: the
   acceptance swings several points between identical runs and tokens per window moves with it. For a change to the
   draft length itself (`--spec`, `--spec-min-p`) tokens per second is the only honest gate, paired as above.
+
+## The later card's K/V whole in VRAM (patch 11)
+
+`--kv-resident` is one process-wide value that `kv_plan` reads when a session is carved; every later path reads
+each state's own `kv_mode`. `--kv-resident-later N` sets the value for the later stages' carves (and their
+pricing in the split search, the prompt-buffer estimate and the batch slots), and puts the first card's value back
+before the drafter is built, so its ring is untouched. With `0` the 4070's three attention layers are ordinary
+resident states: identity page table, no pinned host copy, no streaming counters.
+
+The one place the two kinds meet is the session copy under `--prefill-main`: the 5090 reads every layer of a prompt
+into its streamed session, and `session_copy_layers` hands layers [K, 48) to the 4070's session (after a fresh
+prompt, after a restore) and back (before a park or checkpoint). It used to insist on identical layouts; now one
+side may stream while the other is resident, and since the host copy and the VRAM pool share the identity row
+layout, the block range is one `cudaMemcpy` per array in either direction (host-to-device over the x1 link for a
+fresh prompt, about 3 KB per token; device-to-host for the decoded delta going back). The streamed receiver's
+blocks from the first rewritten one are evicted as before; a resident receiver needs nothing.

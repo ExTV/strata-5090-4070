@@ -11,7 +11,7 @@ A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the expert file. This is the
 exact setup that serves my own agents every day; what is here is what runs.
 
-- **Upstream Strata v0.1.41** plus 10 patches: the dual-GPU series, four open upstream PRs, two upstream commits and our own work
+- **Upstream Strata v0.1.41** plus 11 patches: the dual-GPU series, four open upstream PRs, two upstream commits and our own work
 - **ISTA GSQ-RCO IQ3_S** (the quality tier that still keeps every decode expert off the SSD here), with the
   IQ3_XXS config kept as the faster alternative
 - **160-200 tok/s decode** on IQ3_S (code 237, reasoning 194, prose 146 tok/s at temperature 0), prompts up to
@@ -97,7 +97,7 @@ Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 ## Requirements
 
 - **GPUs:** an RTX 5090 (or another 32 GB Blackwell card) plus a 16 GB NVIDIA card; the second one can sit on a chipset x1 slot.
-  The layer split (38) and the VRAM reserves are sized for exactly 32 + 16 GB.
+  The layer split (39) and the VRAM reserves are sized for exactly 32 + 16 GB.
 - **RAM:** 32 GB plus zram swap. With the model up, about 1-2 GB stays available and some engine memory
   sits in zram. Headless box: no RAM or VRAM is left for a desktop.
 - **Disk:** a fast NVMe with ~85 GB free for IQ3_S (55 GB of experts + 29 GB of PLE table), ~77 GB for IQ3_XXS
@@ -177,6 +177,7 @@ byte for byte (54 files, `patches/MANIFEST.sha256`).
 | 08 | ours | the tool-call parser tracks nested `<parameter=..>...</parameter>` pairs inside a value and reads the closer the model skips after one (`<parameter=limit>25</parameter>` then straight to `</function>`): 17 of 60 cut edits -> 0 |
 | 09 | upstream 6f3e3810 (v0.1.44) | `STRATA_COMMIT_BATCH` (default on): the commit of the accepted tokens into every GDN and attention layer's state in one launch per layer kind instead of ~100 graph nodes; bitwise, ~1% of the window here, 5% at 20K context |
 | 10 | upstream d3fb3e6f (v0.1.42), ported | the layer split's streamed-ring size is decided before the lend regions are sized, plus a start line with borrowed vs RAM-kept slots; inert on this config (the sizing already matched), carried for the line and the next rebase |
+| 11 | ours | `--kv-resident-later N`: the later stages' own `--kv-resident`; `0` keeps the whole K/V of the 4070's three attention layers in VRAM with no pinned copy, so nothing is read over the x1 link during decode (the session copy between a streamed and a resident state is new) |
 
 Already in v0.1.41 and no longer carried: the fork's RAM copy, pipelined windows and asynchronous tier, the
 CPU IQ kernels, #510, #525, #934, #1043, #1049. Left out: #904 (verify-window PDL; conflicts with upstream's
@@ -188,7 +189,8 @@ Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
 
 | Setting | Why |
 | --- | --- |
-| `"layer_split": "38"` | layers 0-37 on the 5090, 38-47 + drafter on the 4070, which holds every expert of its layers. 38 since 2026-10-15: against 37 it is -2% ms per verify window (-5% on code) and +8% decode after 80-200K prompts, prefill at parity; 39 adds nothing (IQ3_XXS was measured at 37) |
+| `"layer_split": "39"` | layers 0-38 on the 5090, 39-47 + drafter on the 4070, which holds every expert of its layers. 39 since 2026-10-15 evening, together with the resident K/V below (alone it equals 38); 37 -> 38 earlier that day was -2% per verify window |
+| `--kv-resident-later 0` | patch 11: the 4070 keeps the whole K/V of its attention layers in VRAM (+0.7 GB there, 0.8 GB of pinned RAM back): decode after 81-203K prompts +6-9%, 203K prefill 61.9 -> 57.2 s, 81K 24.5-29 -> 23-24 s; short prompts +0.2 ms per window (1.5-2.5%) |
 | `"vision": {"cuda_device": 1}` | the image encoder runs on the 4070 (1.28 GB there, 1.7 GB on the 5090), which is what makes room for the split |
 | `--prefill auto:16384` | IQ3_S has 3,000 fewer GPU-resident experts than IQ3_XXS; with 16K chunks every lent slot stays in locked RAM (32K: 41% of a chunk's loan re-read from the file); speed a wash, RAM cleaner. The IQ3_XXS config keeps 32768 |
 | `STRATA_PM_MTP_BATCH=1` | patch 04: the draft layer's prompt K/V on the 5090 (long prompts -20..25% TTFT) |

@@ -604,3 +604,23 @@ unchanged (81K 24.5-29.0 s, 203K 61.9 s). The NVMe counter added to the harness 
 Not built, on the evidence: a per-device `--kv-resident` so the 4070's three attention layers keep their whole KV
 in VRAM. The KV-streaming hit rate on the 4070 is 99.7% at short context and 93-94% at 203K, where it reads
 ~100 MiB per 300-token answer over the x1 link: about 0.6 ms of a 12 ms window, and nothing below ~100K tokens.
+
+## The later stage's K/V whole in VRAM (patch 11, 2026-10-15 night)
+
+`--kv-resident-later 0` on split 39 (the 4070 needs ~0.7 GB for the three layers' K/V; at split 38 it has 0.65 GB
+spare and would lose experts), same engine, one boot per arm, `tools/window_bench.py` twice per arm:
+
+| arm | ms/window median (7) | 20K context | 81K prefill x3 | 203K prefill | decode after 81K / 203K |
+| --- | --- | --- | --- | --- | --- |
+| split 38, streamed (the config until then) | 12.08 | 11.62 | 24.5 / 29.0 / 24.5 s | 61.9 s | 150-166 / 152 tok/s |
+| split 39, streamed | 12.04 / 12.13 | 12.45 / 11.97 | | | |
+| **split 39, `--kv-resident-later 0`** | 12.44 / 12.24 | **11.89 / 11.66** | **22.9 / 23.9 / 23.5 s** | **57.2 s** | **159-176 / 165 tok/s** |
+
+Short prompts pay about 0.2 ms per window (the attention layers' resident pools are 8x larger than the streamed
+window; not traced further). From 20K context on it wins, and the long-prompt gains are the point: the 4070 reads
+no K/V over its x1 link during decode (its counter used to show 93-94% VRAM hits and ~100 MiB per 300-token answer
+at 203K), and split 39 re-streams one 4070 layer fewer per prompt chunk (NVMe reads 60-64 -> 47-50 GB per 81K
+prompt, 157 -> 124 GB at 203K). Costs: the 203K-token hand-off to the 4070 after a fresh prompt or a restore
+crosses the link once (restores 2.8-2.9 -> 3.8 s in the spill check). Correctness on the new copy path: needle
+40K + four follow-ups + a 20K extension all right; the 200K spill round trip four times right (the "plus one" and
+"backwards" rounds included); planets and the train problem right.
