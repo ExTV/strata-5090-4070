@@ -32,9 +32,11 @@ if [ ! -f "$PACK/tokenizer-sharp/chat_template.jinja" ]; then
     command -v curl >/dev/null || { echo "curl is required to fetch the chat template" >&2; exit 1; }
     rm -rf "$PACK/tokenizer-sharp"; cp -r "$PACK/tokenizer" "$PACK/tokenizer-sharp"
     curl -sSfL "$TEMPLATE_URL" -o "$PACK/tokenizer-sharp/chat_template.jinja"
-    echo "$TEMPLATE_SHA  $PACK/tokenizer-sharp/chat_template.jinja" | sha256sum -c --quiet
+    echo "$TEMPLATE_SHA  $PACK/tokenizer-sharp/chat_template.jinja" | sha256sum -c --quiet \
+        || { rm -rf "$PACK/tokenizer-sharp"; echo "chat template checksum mismatch, nothing kept" >&2; exit 1; }
     sed -i "s/^{%- set _default_reasoning_effort = 'medium' %}$/{%- set _default_reasoning_effort = 'xhigh' %}/" "$PACK/tokenizer-sharp/chat_template.jinja"
-    echo "$XHIGH_SHA  $PACK/tokenizer-sharp/chat_template.jinja" | sha256sum -c --quiet
+    echo "$XHIGH_SHA  $PACK/tokenizer-sharp/chat_template.jinja" | sha256sum -c --quiet \
+        || { rm -rf "$PACK/tokenizer-sharp"; echo "edited chat template checksum mismatch, nothing kept" >&2; exit 1; }
 fi
 
 CVEC=$MODELS/Huihui-Qwen3.8-Flash-Next-refusal-direction-r.gguf
