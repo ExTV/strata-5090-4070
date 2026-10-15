@@ -11,7 +11,7 @@ A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the expert file. This is the
 exact setup that serves my own agents every day; what is here is what runs.
 
-- **Upstream Strata v0.1.41** plus 8 patches: the dual-GPU series, four open upstream PRs and our own work
+- **Upstream Strata v0.1.41** plus 10 patches: the dual-GPU series, four open upstream PRs, two upstream commits and our own work
 - **ISTA GSQ-RCO IQ3_S** (the quality tier that still keeps every decode expert off the SSD here), with the
   IQ3_XXS config kept as the faster alternative
 - **160-200 tok/s decode** on IQ3_S (code 237, reasoning 194, prose 146 tok/s at temperature 0), prompts up to
@@ -97,7 +97,7 @@ Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 ## Requirements
 
 - **GPUs:** an RTX 5090 (or another 32 GB Blackwell card) plus a 16 GB NVIDIA card; the second one can sit on a chipset x1 slot.
-  The layer split (37) and the VRAM reserves are sized for exactly 32 + 16 GB.
+  The layer split (38) and the VRAM reserves are sized for exactly 32 + 16 GB.
 - **RAM:** 32 GB plus zram swap. With the model up, about 1-2 GB stays available and some engine memory
   sits in zram. Headless box: no RAM or VRAM is left for a desktop.
 - **Disk:** a fast NVMe with ~85 GB free for IQ3_S (55 GB of experts + 29 GB of PLE table), ~77 GB for IQ3_XXS
@@ -175,6 +175,8 @@ byte for byte (54 files, `patches/MANIFEST.sha256`).
 | 06 | PR #2589 | `STRATA_SLOT_EXPIRE_S`: with `"parallel"` batch slots a short side request takes the slot whose conversation is cheapest to lose (inert without `"parallel"`) |
 | 07 | PR #2572 | with `"tool_call_recovery": true` a parameter written `<parameter name="X">` or as one JSON `<parameter>` keeps its value (off in the shipped config: this model never writes those forms, and recovery invented a call in 1 of 60 runs) |
 | 08 | ours | the tool-call parser tracks nested `<parameter=..>...</parameter>` pairs inside a value and reads the closer the model skips after one (`<parameter=limit>25</parameter>` then straight to `</function>`): 17 of 60 cut edits -> 0 |
+| 09 | upstream 6f3e3810 (v0.1.44) | `STRATA_COMMIT_BATCH` (default on): the commit of the accepted tokens into every GDN and attention layer's state in one launch per layer kind instead of ~100 graph nodes; bitwise, ~1% of the window here, 5% at 20K context |
+| 10 | upstream d3fb3e6f (v0.1.42), ported | the layer split's streamed-ring size is decided before the lend regions are sized, plus a start line with borrowed vs RAM-kept slots; inert on this config (the sizing already matched), carried for the line and the next rebase |
 
 Already in v0.1.41 and no longer carried: the fork's RAM copy, pipelined windows and asynchronous tier, the
 CPU IQ kernels, #510, #525, #934, #1043, #1049. Left out: #904 (verify-window PDL; conflicts with upstream's
@@ -186,8 +188,8 @@ Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
 
 | Setting | Why |
 | --- | --- |
-| `"layer_split": "37"` | layers 0-36 on the 5090, 37-47 + drafter on the 4070, which holds every expert of its layers; 37 gives the 5090 1,063 more cached experts than 36 (38 tested: fewer, slower 2K prompts) |
-| `"vision": {"cuda_device": 1}` | the image encoder runs on the 4070 (1.28 GB there, 1.7 GB on the 5090), which is what makes room for split 37 |
+| `"layer_split": "38"` | layers 0-37 on the 5090, 38-47 + drafter on the 4070, which holds every expert of its layers. 38 since 2026-10-15: against 37 it is -2% ms per verify window (-5% on code) and +8% decode after 80-200K prompts, prefill at parity; 39 adds nothing (IQ3_XXS was measured at 37) |
+| `"vision": {"cuda_device": 1}` | the image encoder runs on the 4070 (1.28 GB there, 1.7 GB on the 5090), which is what makes room for the split |
 | `--prefill auto:16384` | IQ3_S has 3,000 fewer GPU-resident experts than IQ3_XXS; with 16K chunks every lent slot stays in locked RAM (32K: 41% of a chunk's loan re-read from the file); speed a wash, RAM cleaner. The IQ3_XXS config keeps 32768 |
 | `STRATA_PM_MTP_BATCH=1` | patch 04: the draft layer's prompt K/V on the 5090 (long prompts -20..25% TTFT) |
 | `--mtp-hnorm stream` | upstream's opt-in drafter norm (one RMS per hyper-connection stream instead of one over all four); on since 2026-10-13 together with the park gain, not A/B'd on its own |
@@ -231,6 +233,8 @@ All talk to `127.0.0.1:8888` unless `STRATA_URL` is set.
 | `tools/depth_bench.py` | the depth rows above |
 | `tools/step_times.py NAME TEXTFILE` | tool-result sized reads on real text |
 | `tools/decode_after.py NAME` | decode right after a big prompt |
+| `tools/window_bench.py [TAG]` | the A/B gate for engine changes: ms per verify window over 7 short prompts and a 20K one, one line appended to `window-bench.jsonl` |
+| `tools/paired_ab.py TEMP ARM...` | per-request settings paired on one boot with a settle request and rotated order (see docs/how-it-works.md, measuring) |
 | `tools/tool_probe.py [N] [TAG]` | the two-turn agent tool-call probe (`MODEL=`, `EFFORT=` to send `reasoning_effort`) |
 | `tools/needle_followups.py` | 40K needle, four follow-ups, a 20K extension |
 | `tools/parking_check.py` | two alternating conversations: correctness and switch time |

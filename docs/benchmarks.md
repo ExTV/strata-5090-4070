@@ -561,3 +561,46 @@ captured that day parse correctly with the patch at chunk sizes 1 / 3 / 7 / 50 /
 PRs #2589 and #2572 (patches 06, 07) were measured the same day with `tool_call_recovery` on: 32/60, noise; the
 recovery rewrote 0 parameter tags (this model never writes `<parameter name=`) and invented a call named
 `new_string` once, so it stays off.
+
+## Config sweep, the commit graph and the lend ring (2026-10-15 evening, IQ3_S)
+
+Metric: milliseconds per verify window, `timings.predicted_ms / (predicted_n - draft_n_accepted)` from the chat
+response, over 7 short prompts (3 code, 2 reasoning, 2 prose, 600 tokens, temperature 0, thinking off) and one
+~20K-token prompt (300 tokens); one fresh boot per arm, the baseline booted twice (`tools/window_bench.py`).
+
+| arm | ms/window median (7) | code / 20K context | tok/s median (7) |
+| --- | --- | --- | --- |
+| split 37 (the config until then), two boots | 12.37 / 12.35 | 12.1-12.2 / 12.4-12.8 | 221 / 215 |
+| **split 38**, two boots | **12.10 / 12.20** | **11.5 / 11.9-12.1** | 229 / 224 |
+| split 39 | 12.04 | 11.9 / 12.45 | 213 (the 4070 idles 1.1 GB emptier for nothing) |
+| `--mtp-hnorm pooled` (the default) | 12.62, acceptance 83.5 vs 86.5% | | 200 |
+| `--pipeline-windows 1` | 16.40 | | 180 |
+| `--spec 3` / `--spec 5` | tok/s is the gate for K: 214 / 198 vs 215-221 | | 6 not run |
+| `--spec-min-p` 0.85 / 0.9 / 0.95 (paired, see below) | ratio to 0.8: 1.003 / 0.995 | | a no-op |
+
+Split 38 is the shipped value: one layer fewer on the 4070 shortens the serial sum (a layer costs ~0.22 ms on the
+5090 and ~0.37 ms on the 4070 per window). Fresh-prompt prefill is at parity (81K: 29.0 / 25.5 / 25.6 s on 37 vs
+29.2 / 25.9 / 26.7 on 38; 203K: 65.9 vs 59.9 s, one sample each) and decode after those prompts is better on 38
+(130-157 vs 148-168 tok/s). Noise between identical boots: ms/window +-0.05 on short prompts, +-0.4 at 20K; the
+prompt-read seconds swing 20-27 s on the same config (page faults), so they are not a gate.
+
+`--spec-min-p` first measured as +6-8% at 0.9, twice, and that was the measurement: the first request after a
+fresh prompt runs 10-15% slower (the prompt read and the refill of the lent expert slots), so an A/B that sends its
+arms in a fixed order per prompt flatters every arm but the first. With a settle request per prompt and the arm order
+rotated, 0.8 / 0.9 / 0.95 are equal: a higher value raises the acceptance (84 -> 89 -> 91%) and shortens the windows
+by the same amount; 1.0 collapses the drafts (-25%). `tools/paired_ab.py` is that protocol.
+
+**The commit graph in one launch (patch 09, upstream `STRATA_COMMIT_BATCH`, default on):** same binary, the kill
+switch as the off arm, one boot each: on 12.08 ms/window, 20K context 11.62, 231 tok/s; off 12.16 / 12.27 / 219.
+Bitwise identical per upstream's parity tools, so it stays on.
+
+**The lend ring decided before the regions are sized (patch 10):** inert on this config. The new start line reads
+"the prompt path borrows 2837 slots (ring 96 slots at chunk 16384), 2837 of them keep their experts in RAM too" and
+CUDA0 keeps the same 858 slots as before, because the series' own lend-in-RAM sizing already matched the ring. Prompts
+unchanged (81K 24.5-29.0 s, 203K 61.9 s). The NVMe counter added to the harness puts the prompt path's file reads at
+60-64 GB per 81K prompt and 157 GB per 203K: the 4070's layers re-streamed per 16K chunk under `--prefill-main`
+(see the 2026-10-08 note), not the ring.
+
+Not built, on the evidence: a per-device `--kv-resident` so the 4070's three attention layers keep their whole KV
+in VRAM. The KV-streaming hit rate on the 4070 is 99.7% at short context and 93-94% at 203K, where it reads
+~100 MiB per 300-token answer over the x1 link: about 0.6 ms of a 12 ms window, and nothing below ~100K tokens.

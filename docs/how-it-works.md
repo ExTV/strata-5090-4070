@@ -449,3 +449,29 @@ reads parameters a model writes as `<parameter name="X">` or as one JSON `<param
 `"tool_call_recovery": true`; this model never writes those forms (0 rewrites in 60 probe sequences) and the
 recovery mode invented a call once, so recovery stays off. Both are kept because they apply cleanly, pass their
 tests, and are where the series would go next.
+
+## The commit graph and the lend ring (patches 09, 10)
+
+Between a verify window and the next draft round the engine commits the accepted tokens into every layer's state:
+each GDN layer's convolution history and recurrent state, each attention layer's tail restore and indexer append.
+Upstream's `STRATA_COMMIT_BATCH` (patch 09, v0.1.44, default on) runs that as one launch per layer kind instead of
+about a hundred small graph nodes; the arithmetic per layer is the per-layer call's, bitwise (upstream ships parity
+tools for both kinds). On this box it is worth about 0.1 ms of the 12 ms window on short prompts and 0.6 ms at 20K
+context. `STRATA_COMMIT_BATCH=0` keeps the per-layer loop.
+
+Patch 10 is upstream's reordering of the layer split's streamed-ring decision (`decide_split_ring`, header
+`split_ring.hpp` with its CPU test) so the lend regions, the RAM copies of the experts the prompt path borrows, are
+sized with the ring the prompt path will really use, plus a start line that says how many slots are borrowed and how
+many of them have a RAM copy. In the series' tree the lend-in-RAM sizing already agreed with the 96-slot ring, so the
+patch changes nothing here; it is carried for the diagnostic line and so the next rebase meets upstream's code.
+
+## Measuring a change on this engine
+
+Two things that produced wrong numbers this month, written down so they are not repeated:
+
+- The first request after a fresh prompt runs 10-15% slower than the next ones (the prompt read, then the refill of
+  the lent expert slots). A paired A/B that sends its arms in a fixed order per prompt therefore favours every arm but
+  the first. Send a settle request after each new prompt and rotate the arm order (`tools/paired_ab.py`).
+- Rank by milliseconds per verify window, not tokens per second, whenever the change touches the drafter: the
+  acceptance swings several points between identical runs and tokens per window moves with it. For a change to the
+  draft length itself (`--spec`, `--spec-min-p`) tokens per second is the only honest gate, paired as above.
