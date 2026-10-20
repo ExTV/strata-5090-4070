@@ -11,7 +11,7 @@ A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the expert file. This is the
 exact setup that serves my own agents every day; what is here is what runs.
 
-- **Upstream Strata v0.1.41** plus 11 patches: the dual-GPU series, four open upstream PRs, two upstream commits and our own work
+- **Upstream Strata v0.1.41** plus 12 patches: the dual-GPU series, four open upstream PRs, two upstream commits and our own work
 - **ISTA GSQ-RCO IQ3_S** (the quality tier that still keeps every decode expert off the SSD here), with the
   IQ3_XXS config kept as the faster alternative
 - **160-200 tok/s decode** on IQ3_S (code 237, reasoning 194, prose 146 tok/s at temperature 0), prompts up to
@@ -163,7 +163,7 @@ launchers/flash-next-262k.sh
 ## What is in the patch series
 
 Each patch is one tested step, conflict resolutions included; applied to v0.1.41 they rebuild the tested tree
-byte for byte (54 files, `patches/MANIFEST.sha256`).
+byte for byte (62 files, `patches/MANIFEST.sha256`).
 
 | # | Source | What it does |
 | --- | --- | --- |
@@ -178,6 +178,7 @@ byte for byte (54 files, `patches/MANIFEST.sha256`).
 | 09 | upstream 6f3e3810 (v0.1.44) | `STRATA_COMMIT_BATCH` (default on): the commit of the accepted tokens into every GDN and attention layer's state in one launch per layer kind instead of ~100 graph nodes; bitwise, ~1% of the window here, 5% at 20K context |
 | 10 | upstream d3fb3e6f (v0.1.42), ported | the layer split's streamed-ring size is decided before the lend regions are sized, plus a start line with borrowed vs RAM-kept slots; inert on this config (the sizing already matched), carried for the line and the next rebase |
 | 11 | ours | `--kv-resident-later N`: the later stages' own `--kv-resident`; `0` keeps the whole K/V of the 4070's three attention layers in VRAM with no pinned copy, so nothing is read over the x1 link during decode (the session copy between a streamed and a resident state is new) |
+| 12 | ours | `--prefill-main-small S` / `--prefill-main-small-max M`: under `--prefill-main` every text prompt part up to M tokens (the shipped config: the whole context) is read split-wise: the 5090 runs its own layers out of its expert cache in its usual chunks and hands each chunk whole to the 4070 through one 640 MiB pinned buffer, and the 4070 runs its nine layers from its resident experts in S-token pieces while the 5090 reads the next chunk; a part is cut into ~4 chunks so short ones pipeline too. Before, every part past `--short-read` was read whole-model on the 5090, which streamed the 4070's layers' experts from the SSD for every 16K chunk (57 GB per 81K prompt): fresh 13K / 16K / 32K / 64K / 81K / 203K prompts 13.4 / 6.4 / 10.6 / 19.0 / 24-25 / 57.7 s -> 4.0 / 5.0 / 8.6 / 15.9 / 18.5-20 / 41 s, agent steps 3.3 / 6.5 / 3.9 -> 1.1 / 1.2 / 1.8 s, SSD reads ~0; the 4070 keeps a 512-token path (644 MiB, reserve 700 -> 420 MiB); also holds the draft head back from the later card's expert room, which the sizing had missed |
 
 Already in v0.1.41 and no longer carried: the fork's RAM copy, pipelined windows and asynchronous tier, the
 CPU IQ kernels, #510, #525, #934, #1043, #1049. Left out: #904 (verify-window PDL; conflicts with upstream's
@@ -243,6 +244,7 @@ All talk to `127.0.0.1:8888` unless `STRATA_URL` is set.
 | `tools/spill_check.py` | a 200K and a 5K conversation alternating: the spill to disk and back |
 | `tools/merged_tool_turn.py` | a client that merges a turn's tool calls (`OLD_IDS=1` shows the re-reads the split removes) |
 | `tools/spec_min_p_sweep.py NAME` | per-request drafter threshold A/B, no restart |
+| `tools/agent_steps.py TAG [SEED]` | a 13K first message and four tool-result follow-ups (1.5K / 2.4K / 5.4K / 0.5K tokens): prompt seconds and SSD GB per step (the patch 12 gate; `NVME=` names the device) |
 | `tools/snapshot.py` | page faults, swap, direct reclaim, NVMe, GPU counters; diff them around a run |
 
 ## Status

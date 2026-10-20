@@ -491,3 +491,31 @@ side may stream while the other is resident, and since the host copy and the VRA
 layout, the block range is one `cudaMemcpy` per array in either direction (host-to-device over the x1 link for a
 fresh prompt, about 3 KB per token; device-to-host for the decoded delta going back). The streamed receiver's
 blocks from the first rewritten one are evicted as before; a resident receiver needs nothing.
+
+## Short prompt parts split-wise under `--prefill-main` (patch 12)
+
+`--prefill-main` made the 5090 read every prompt chunk through all 48 layers, which is the right trade for a long
+prompt (the 4070's x1 link cannot keep up with a chunk's rows) but the wrong one for an agent step: each tool
+result of 1-6K tokens is one or two chunks, and for every chunk the 5090 streams the 4070's nine layers' experts
+from the GGUF, since only the 4070 holds them. That is ~10.7 GB of SSD reads and 3-6 s per step, and the
+short-read path through the decode windows (`--short-read`) only covers the first 768 tokens.
+
+`--prefill-main-small S` keeps the stage prompt paths that `--prefill-main` had dropped, in a small form: the 4070
+gets its own S-token path with its own buffers (no loan, so none of its experts leave VRAM), and the 5090's path is
+built chained to it, with its hand-off host buffers capped at S tokens, then switched to whole-model. A prompt
+part of up to `--prefill-main-small-max` tokens (8192) that is too long for the windows and carries no image rows
+is then read chained: the 5090's path is flipped to layers [0, 39), relaid to S tokens inside the slots it already
+keeps for short prompts (`STRATA_SPLIT_SMALL_OWN`), it runs its layers out of its expert cache, hands each chunk's
+rows (40 KB per token) to the 4070, and the 4070 runs 39-47 from its resident experts and feeds the drafter in
+place. The dispatcher treats such a part exactly like a window read: the 4070's session is ahead afterwards
+(`pm_stage_ahead`), and the next whole-model read, checkpoint or park syncs it first, as they already did for the
+windows. No checkpoint is taken inside a chained part, so parts stay short of the next periodic one.
+
+Two sizing lessons came with it. The 4070's expert room must hold the path back before its cache is filled; the
+estimate (`bytes_needed_owned`) is within 5% for a chunk below the streaming threshold (512 tokens: 454 priced,
+434-644 MiB taken) and ~2x over above it (1024: 1894 vs 812), so 512 is the size to use, and the reserve on the
+4070 goes 700 -> 420 MiB to keep all 4,608 experts. Pricing it by a dry init at start was wrong: that loads the
+4070's CUDA context before the RAM tier is sized, and the lend region's RAM copies drop from 2838 to ~2100 slots
+("not enough RAM for them"), after which long prompts read from the file. The same room never held back the draft
+head (213 MiB), which only ever fit because ~0.5 GB happened to stay spare; patch 12 holds it back explicitly.
+

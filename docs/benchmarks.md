@@ -624,3 +624,57 @@ prompt, 157 -> 124 GB at 203K). Costs: the 203K-token hand-off to the 4070 after
 crosses the link once (restores 2.8-2.9 -> 3.8 s in the spill check). Correctness on the new copy path: needle
 40K + four follow-ups + a 20K extension all right; the 200K spill round trip four times right (the "plus one" and
 "backwards" rounds included); planets and the train problem right.
+
+## Agent steps read split-wise (patch 12, 2026-10-15 night)
+
+`tools/agent_steps.py`: a 13K-token first message, then follow-ups of 1.5K / 2.4K / 5.4K / 0.5K fresh tokens
+(tool results), 60 tokens answered each; prompt seconds and the SSD bytes read per step, same seed on both arms,
+one boot each (IQ3_S, split 39, `--kv-resident-later 0`):
+
+| step | fresh tokens | production (whole-model) | `--prefill-main-small 512` |
+| --- | --- | --- | --- |
+| first message | 13,029 | 9.3 s, 12.4 GB | 5.5-6.9 s, 10-14 GB (whole-model, unchanged) |
+| tool result | 1,567 | 3.3 s, 10.6 GB | **1.2 s, 0.2 GB** |
+| tool result | 2,406 | 6.5 s, 10.9 GB | **1.3 s, 0.1 GB** |
+| tool result | 5,419 | 3.9 s, 10.7 GB | **2.5 s, 0.3 GB** |
+| short follow-up (windows) | 530 | 1.9 s, 0.1 GB | 1.9 s, 0.1 GB |
+
+Correctness: a needle in a 15K whole read, a chained 2K follow-up that asks for it and a second needle it carries,
+a 20K whole read after the chained one asking for all three, then a windows follow-up: all right. A 4 Mpx image
+in a follow-up takes the whole-model path as it must, and a chained read after it is fine. Decode: four boots with
+the flag read 12.43 / 12.44 / 12.62 / 12.77 ms per window against 12.34 / 12.36 / 12.52 without it, and a control
+with only the 4070's reserve lowered (no stage path at all) read 12.65, so the gap is this session's boot noise,
+not the path. Long whole-model reads on the shipped config after the change: 81K 24.3-25.0 s, 203K 57.7 s (before:
+23-24 s, 57.2 s). The 4070 sits at ~750 MiB free with the path, the reserve 420 MiB and all its experts resident.
+
+Where the chained read stops paying (`--prefill-main-small-max`, fresh first messages, same seeds, one boot each):
+chained at 512-token chunks reads 1,880 / 2,040 / 2,500 / 2,510 tok/s at 4K / 8K / 13K / 16K with 0.4-1.0 GB from
+the SSD and 2,230 / 2,210 at 32K / 64K; whole-model 16K chunks read 980 (13.4 s, 12 GB) / 2,505 at 13K / 16K and
+3,005 / 3,350 at 32K / 64K (23 / 46 GB). The shipped config sets the limit to 16384. `STRATA_PREFILL_TIMING=1` shows
+why the chained read flattens: the 4070 does a 512-token piece of its nine layers in 99 ms (5,170 tok/s), while the
+5090 at 512-token chunks spends 25% in expert dequantisation and 16% in the gate/up GEMMs, both per-chunk costs a
+16K chunk amortises 32x. Reading long prompts chained with the 5090 at 16K chunks and the 4070 consuming the
+hand-off in pieces is the next step, not built.
+
+### Every text part chained (the same night, the shipped config)
+
+With the stage consuming a whole 16K chunk in 512-token pieces from one pinned buffer and a part cut into ~4
+chunks, the chained read is the long-prompt path too (`--prefill-main-small-max 262144`). Fresh prompts, same
+seeds as the table above; the 81K x3 / 203K runs are `tools/long_prefill.py`-style unique prompts:
+
+| fresh tokens | whole-model (before) | chained, 4 chunks per part |
+| --- | --- | --- |
+| 4K / 8K | 2.1 / 3.5 s | 2.4 / 2.9 s |
+| 13K / 16K | 13.4 / 6.4 s (12 / 11 GB SSD) | 4.0 / 5.0 s (0.9 / 1.0 GB) |
+| 32K / 64K | 10.6 / 19.0 s (23 / 46 GB) | 8.6 / 15.9 s (1.9 / 3.6 GB) |
+| 81K x3 | 24.3-25.0 s (54-58 GB each) | 18.5 / 20.0 / 19.3 s (4.6 GB each) |
+| 203K | 57.7 s (139 GB) | 41.0 s (11.5 GB) |
+
+Agent steps (13K first message, then 1.5K / 2.4K / 5.4K / 0.5K): 6.4 / 1.1 / 1.2 / 1.8 / 1.9 s. Needle through
+whole, chained and windows reads right; the 200K spill check right in four rounds (the long one restored in 3.8-4.0 s);
+a 4 Mpx image follow-up takes the whole path and a chained read after it is fine; a 120K read cancelled by the
+client after 8 s leaves the conversation answerable from its last checkpoint. Decode 12.32 ms per window (the
+production band 12.3-12.5). The 5090 reads its 39 layers at ~5,300 tok/s in 16K chunks and the 4070 its 9 at
+~5,200 tok/s in 512-token pieces, so the pipeline is balanced; the 4070's piece size (1024 needs ~170 MiB more
+VRAM than it has at split 39) and its layer count (split 40-42) are the next knobs.
+

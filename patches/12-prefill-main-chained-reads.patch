@@ -1,0 +1,373 @@
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -159,6 +159,10 @@
+     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
+         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
+     }
++    /// LAYER SPLIT, --prefill-main-small (local): the hand-off buffers hold `n` tokens instead of the init chunk, for
++    /// a path that runs its chunk whole-model by default and hands only short parts (relaid to `n` or less) to the
++    /// next stage.  A chunk above `n` with a next stage set is refused at run time.  Set before `init`; 0 = the chunk.
++    void set_hand_chunk(int64_t n, bool single = false) { hand_chunk_ = n; hand_single_ = single; }
+ 
+     /// LAYER SPLIT: `helper` is another stage's prompt path (another GPU).  A prompt of one chunk runs the stages one
+     /// after the other, so while this stage reads it the helper's GPU idles: it then streams a share of this stage's
+@@ -200,6 +204,9 @@
+     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
+     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
+     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
++    int64_t hand_chunk_ = 0;            ///< set_hand_chunk: the hand-off buffers' size in tokens (0: the init chunk)
++    int64_t hand_T_ = 0;                ///< what `init` allocated them for
++    bool hand_single_ = false;          ///< one hand-off buffer: the next stage must be done with it before a chunk is handed
+ 
+     std::string next_err_;
+     std::future<bool> next_run_;
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1030,8 +1030,9 @@
+     }
+     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
+     arm_cpu_share(cpu_pool_ != nullptr);
+-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+-        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
++    hand_T_ = hand_chunk_ > 0 ? std::min(hand_chunk_, chunk) : chunk;   // (set_hand_chunk)
++    for (int b = 0; next_ != nullptr && b < (hand_single_ ? 1 : 2); ++b)
++        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) hand_T_ * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+             err = "prefill: the layer split's hand-off buffers";
+             return false;
+         }
+@@ -3989,8 +3990,15 @@
+         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
+         pt.mark(kPfStart, cs);
+         if (next_ != nullptr) {
+-            // The current hand-off slot was used two chunks ago.
+-            float* h = m.hand[hand_buf_];
++            if (hand_T_ > 0 && T > hand_T_) {   // set_hand_chunk: the buffers were sized for a shorter hand-off
++                err = "prefill: the layer split's hand-off buffers hold " + std::to_string(hand_T_) +
++                      " tokens, the chunk has " + std::to_string(T);
++                return false;
++            }
++            // The current hand-off slot was used two chunks ago - or, with one slot (set_hand_chunk single: a
++            // whole-chunk buffer the next stage reads in its own smaller pieces), the next stage is done with it first
++            if (hand_single_ && next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
++            float* h = m.hand[hand_single_ ? 0 : hand_buf_];
+             if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                 cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -174,6 +174,25 @@
+ an RTX 5090 + RTX 4070 Ti SUPER (x1) with IQ3_S at 262K: decode after 81K-203K prompts +6-9%, 200K prompts
+ -5-8%, short prompts within noise; costs the later card about 0.7 GB of VRAM at 262K with 8-bit KV.
+ 
++**Prompt parts split-wise under `--prefill-main`:** `--prefill-main-small S` (0 = off, the default) gives the later
++stage its own S-token prompt path (own buffers, no loan: its experts stay resident) and reads every text part of a
++prompt of at most `--prefill-main-small-max` tokens (default 8192; set it to the context to chain everything)
++split-wise: the first card runs its own layers out of its expert cache in its usual chunks, hands each chunk whole
++to the stage through one pinned host buffer (a chunk's rows, 40 KB a token: 640 MiB at a 16K chunk), and the stage
++runs its layers from its resident experts in S-token pieces while the first card reads the next chunk. A part is
++cut into about four chunks (at least 1024 tokens, at most the configured chunk) so the two cards overlap and the
++serial tail stays short. A part with image rows is read whole-model on the first card as before, which streams
++the stage's layers' experts from the file for every chunk (about 10.7 GB per 16K chunk on a 9-layer stage with
++IQ3_S). S must be a multiple of 256; at 512 the stage's path stays below the streaming threshold and takes about
++650 MiB on the later card (held back from its expert room, priced by `bytes_needed_owned`; the draft head's
++213 MiB is held back there too now). No conversation checkpoint is taken inside a chained part (the first card's
++session holds only its own layers' state for those cells, and runs a chunk ahead of the stage); the part's end
++checkpoint syncs the stage's state first, like a window read. Measured on the 5090 + 4070 Ti SUPER (x1), IQ3_S:
++fresh prompts of 4K / 8K / 13K / 16K / 32K / 64K read in 2.4 / 2.9 / 4.0 / 5.0 / 8.6 / 15.9 s (whole-model: 2.1 /
++3.5 / 13.4 / 6.4 / 10.6 / 19.0 s with 0.4 / 0.5 / 12 / 11 / 23 / 46 GB from the SSD), 81K in 18.5-20.0 s (24-25 s)
++and 203K in 41 s (57.7 s) with 4.6 / 11.5 GB instead of 57 / 139 GB from the SSD; agent steps of 1.5K / 2.4K /
++5.4K fresh tokens 1.1 / 1.2 / 1.8 s (3.3 / 6.5 / 3.9 s); decode unchanged.
++
+ **A separate VRAM reserve for the later cards:** `--vram-reserve-later-mib N` (default: `--vram-reserve-mib`'s value).
+ The card that drives the monitors needs more headroom than one that drives none; with the display on the last card,
+ `--vram-reserve-mib 300 --vram-reserve-later-mib 1800` gives the first card's cache that VRAM.
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -517,6 +517,13 @@
+     /// #282, opt-in: the largest chunk `--prefill auto` may take - 8192 by default; `--prefill auto:16384` or
+     /// `auto:32768` (or STRATA_PREFILL_AUTO_MAX) lets it go further, never past the context
+     int64_t prefill_auto_max = 8192;
++    /// local, --prefill-main only: `--prefill-main-small S`: a prompt part of at most --prefill-main-small-max tokens
++    /// (default 8192) that is too long for the verify windows is read split-wise in S-token chunks - CUDA0 runs its
++    /// own layers out of its cache and hands the rows to the stage, which runs its layers from its resident experts -
++    /// instead of whole-model on CUDA0, which streams the stage's layers' experts from the file for every chunk.
++    /// 0 (default): every such part is read whole-model.
++    int64_t prefill_main_small = 0;
++    int64_t prefill_main_small_max = 8192;
+     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
+     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
+     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
+@@ -816,6 +823,9 @@
+                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
+                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
+                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones\n"
++                 "  --prefill-main-small S  with --prefill-main: read prompt parts of up to --prefill-main-small-max\n"
++                 "                       tokens (default 8192) split-wise in S-token chunks (S a multiple of 256; the\n"
++                 "                       stage keeps S-token prompt buffers) instead of whole-model on CUDA0\n"
+                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
+                  "  --sync-every-layer   debug: synchronise after every layer\n"
+                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
+@@ -1816,6 +1826,15 @@
+             o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
+             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
+         }
++        else if (a == "--prefill-main-small") {
++            o.prefill_main_small = std::max(0LL, std::atoll(next("--prefill-main-small")));
++            if (o.prefill_main_small % 256 != 0) {
++                std::fprintf(stderr, "strata: --prefill-main-small must be a multiple of 256\n");
++                return 2;
++            }
++        }
++        else if (a == "--prefill-main-small-max")
++            o.prefill_main_small_max = std::max(0LL, std::atoll(next("--prefill-main-small-max")));
+         else if (a == "--no-split-rows") o.no_split_rows = true;
+         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
+         else if (a == "--vram-elastic") o.vram_elastic = true;
+@@ -2104,6 +2123,11 @@
+     // each batched prompt segment.  The later stage keeps its VRAM for its expert cache instead of the
+     // prompt-path buffers it no longer needs; decode stays split across the cards.
+     const bool prefill_main = multi_gpu && o.prefill_main;
++    // --prefill-main-small (local): the stage chunk of a chained short read; 0 = off.  Cleared below when the stage's
++    // prompt path cannot be set up or CUDA0's path owns its buffers (a chained read relays CUDA0's borrowed buffers).
++    int64_t pm_small = prefill_main && o.prefill_main_small > 0 ? o.prefill_main_small : 0;
++    if (o.prefill_main_small > 0 && !prefill_main)
++        std::fprintf(stderr, "strata generate: --prefill-main-small ignored: it needs --prefill-main on a layer split\n");
+     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
+     // split, the visible GPUs no stage runs on, in order
+     int remote_dev[3] = {1, 2, 3};
+@@ -3312,6 +3336,7 @@
+     // the windows and - only on the stage that carries them - the drafter and the head.
+     const int64_t kWindowMib = 96;       // the verify windows; 75 MiB measured, rounded up
+     const int64_t kDrafterMib = 1000;    // the MTP drafter (839 MiB) + the head, on the last stage only
++    const int64_t kDraftHeadMib = 224;   // the draft head alone (213 MiB over the full vocabulary), allocated at serve
+     // --pipeline-windows: a second verifier on every stage (its arena alone is 70-75 MiB and its graphs come on top:
+     // 64 MiB left two RTX 5070 Ti under Linux short of it) and, with the decode pipelined, two copies of the first
+     // stage's GDN state (sized from its session where the first card's cache is sized; this is the split search's
+@@ -4813,7 +4838,27 @@
+         const auto& lay = strata::kernels::cpu::expert_layout();
+         // the drafter and the head are already allocated by now (they load above, before this), so what is left
+         // to hold back is the windows - and `free_b` has already lost the drafter.
+-        const int64_t room = stage_room(st.dev, true, false);
++        int64_t room = stage_room(st.dev, true, false);
++        {   // local: the stage's own small prompt path (--prefill-main-small) and, on the drafter's stage, the draft
++            // head (allocated at serve, after this: "mtp: the draft head does not fit" otherwise) come out of the room
++            int64_t extra = 0;
++            if (pm_small > 0) {
++                // the estimate (bytes_needed_owned) is within 5% of what serve's init takes for a chunk below the
++                // streaming threshold (512: 454 vs 432 MiB on the 4070 Ti SUPER); above it the ring and the fused
++                // MoE buffers make it count ~2x, so --prefill-main-small 512 is the size to use.  Not priced by a dry
++                // init here: that loads this card's CUDA context before the RAM tier is sized and costs it ~1.3 GiB.
++                const int64_t est = (int64_t) strata::prefill::Prefill::bytes_needed_owned(g, st.ss, pm_small);
++                std::fprintf(stderr, "strata generate: layer split, CUDA%d: a %lld-token prompt path is priced at %lld MiB\n",
++                             st.dev, (long long) pm_small, (long long) (est >> 20));
++                extra += est + (64ll << 20);
++            }
++            if (!o.mtp.empty() && stp == stages.back()) extra += kDraftHeadMib << 20;
++            if (extra > 0)
++                std::fprintf(stderr, "strata generate: layer split, CUDA%d: %lld MiB held back for %s\n", st.dev,
++                             (long long) (extra >> 20),
++                             pm_small > 0 ? "the small prompt path and the draft head" : "the draft head");
++            room = std::max<int64_t>(room - extra, 0);
++        }
+         const strata::core::OnDevice on(st.dev);
+         {
+             size_t fb = 0, tb = 0;
+@@ -6627,31 +6672,72 @@
+         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
+         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
+-            for (size_t i = 0; i < stages.size() && !prefill_main; ++i) {   // --prefill-main: no stage prompt paths
++            // --prefill-main: no stage prompt paths - unless --prefill-main-small, which gives every stage its own
++            // S-token path (own buffers, no loan: its experts stay resident) for chained short reads
++            for (size_t i = 0; i < stages.size() && (!prefill_main || pm_small > 0); ++i) {
+                 GpuStage& st = *stages[i];
+                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
+                 const strata::core::OnDevice on(st.dev);
+                 void* sb = nullptr;              // this stage's own loan, out of its own cache
+                 uint64_t sbb = 0;
+                 // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
+-                if (i + 1 < pf_parts.size() && pf_parts[i + 1].first >= 0) {
++                if (!prefill_main && i + 1 < pf_parts.size() && pf_parts[i + 1].first >= 0) {
+                     sb = st.cache.device_slot(pf_parts[i + 1].first);
+                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
+                 }
+-                if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
+-                if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
+-                                err, sb, sbb)) {
++                if (share_pool && !prefill_main) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
++                size_t pf0 = 0, pf1 = 0, ptb = 0;
++                if (prefill_main) cudaMemGetInfo(&pf0, &ptb);
++                const bool st_ok = st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(),
++                                              prefill_main ? pm_small : o.prefill_chunk, (void*) st.stream, err, sb, sbb);
++                if (prefill_main && st_ok) {
++                    cudaMemGetInfo(&pf1, &ptb);
++                    std::fprintf(stderr, "strata serve: layer split, CUDA%d: the %lld-token prompt path took %lld MiB, "
++                                         "%lld MiB free\n", st.dev, (long long) pm_small,
++                                 (long long) (((int64_t) pf0 - (int64_t) pf1) >> 20), (long long) (pf1 >> 20));
++                }
++                if (!st_ok) {
+                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
++                    if (prefill_main) {   // the chained short reads are an option: without them, every read whole-model
++                        std::fprintf(stderr, "strata serve: --prefill-main-small off: %s\n", err.c_str());
++                        err.clear();
++                        pm_small = 0;
++                        for (size_t j = 0; j <= i; ++j) {
++                            const strata::core::OnDevice on_j(stages[j]->dev);
++                            stages[j]->sp.reset();
++                            (void) cudaGetLastError();
++                        }
++                        break;
++                    }
+                     return err.find("do not fit") != std::string::npos ? 2 : 1;
+                 }
+             }
+             if (multi_gpu) {
+-                if (prefill_main) sp.set_stage(0, -1, nullptr);   // all layers on the main device
+-                else sp.set_stage(0, split_at[0], &stages[0]->sp);
++                if (prefill_main && pm_small > 0) {   // chained for `init` (one whole-chunk hand-off buffer), whole after
++                    sp.set_stage(0, split_at[0], &stages[0]->sp);
++                    sp.set_hand_chunk(o.prefill_chunk, true);
++                } else if (prefill_main) {
++                    sp.set_stage(0, -1, nullptr);   // all layers on the main device
++                } else {
++                    sp.set_stage(0, split_at[0], &stages[0]->sp);
++                }
+             }
+             if (share_pool) sp.set_cpu_pool(&pool);
+             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
+                 return err.find("do not fit") != std::string::npos ? 2 : 1;
++            if (prefill_main) sp.set_stage(0, g.n_layers, nullptr);   // whole-model by default (pm_chain flips it)
++            if (prefill_main && pm_small > 0 && borrow == nullptr) {
++                std::fprintf(stderr, "strata serve: --prefill-main-small off: CUDA0's prompt path owns its buffers (a "
++                                     "chained read relays borrowed ones)\n");
++                pm_small = 0;
++            }
++            if (prefill_main && pm_small > 0)
++                std::fprintf(stderr, "strata serve: --prefill-main-small %lld: prompt parts of up to %lld tokens are read "
++                                     "split-wise (CUDA0 layers 0-%lld in its %lld-token chunks, the stage its own in "
++                                     "%lld-token pieces; the hand-off buffer %lld MiB of pinned RAM)\n",
++                             (long long) pm_small, (long long) o.prefill_main_small_max, (long long) (split_at[0] - 1),
++                             (long long) o.prefill_chunk, (long long) pm_small,
++                             (long long) ((o.prefill_chunk * (int64_t) (g.hc * g.n_embd) * 4) >> 20));
+             return 0;
+         };
+         static constexpr int64_t kStepChunks[] = {6144, 4096, 3072, 2048, 1536, 1024, 512};
+@@ -7235,6 +7321,12 @@
+         auto pm_main_whole = [&](std::string& e, int64_t cell_hi) -> bool {
+             return !prefill_main || !pm_stage_ahead || pm_sync(false, e, cell_hi);
+         };
++        // --prefill-main-small: CUDA0's prompt path runs layers [0, K) and hands its rows to the stage (on), or every
++        // layer (off, the default between reads)
++        auto pm_chain = [&](bool on) {
++            if (!prefill_main || pm_small <= 0) return;
++            sp.set_stage(0, on ? split_at[0] : g.n_layers, on ? &stages[0]->sp : nullptr);
++        };
+         // docs/DETAILS.md: one GPU without --batch; a build or model change makes the files unusable
+         strata::core::PrefixStore prefixes;
+         if (!o.prefix_cache_dir.empty() && o.prompt_cache > 0 && (stages.empty() || prefill_main) && o.batch <= 0) {
+@@ -7790,6 +7882,25 @@
+             }
+             return true;
+         };
++        if (prefill_main && pm_small > 0) {
++            // --prefill-main-small: a chained read ends on the last stage, with the chunk's rows on the drafter's device:
++            // the drafter's own pass reads them in place.  No checkpoint inside such a read: CUDA0's session has only
++            // its own layers' state for these cells (the dispatcher keeps chained parts short of the periodic one).
++            stages.back()->sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
++                std::vector<int32_t> nxt((size_t) T);
++                for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
++                if (use_mtp && !mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
++                const int64_t done = p0 + T;
++                pp_reached = done;
++                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
++                std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
++                            ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
++                strata::core::progress_at("reading the prompt (chained), done up to token", done);
++                strata::core::progress_beat();
++                std::fflush(stdout);
++                return true;
++            };
++        }
+         if (multi_gpu && !prefill_main) {   // STRATA_PREFILL_MAIN: on_chunk stays on the main sp (its rows are the last stage's)
+             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
+             sp.on_chunk = nullptr;
+@@ -10449,12 +10560,12 @@
+             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
+             // participant's own cache, and marking only that participant's own layers
+-            auto lend = [&](int64_t tokens, std::string& e) -> bool {
++            auto lend = [&](int64_t tokens, std::string& e, int64_t max_chunk = -1) -> bool {
+                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+                 const auto t_ln = Clock::now();
+                 // what this segment needs, capped by the configured chunk: a request lends only what its own
+                 // prompt needs, so a large chunk costs a short prompt nothing
+-                const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
++                const int64_t want_full = equal_chunk(tokens, max_chunk > 0 ? std::min(max_chunk, o.prefill_chunk) : o.prefill_chunk);
+                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
+                 const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
+                                                                                  : want_full;
+@@ -10718,12 +10829,25 @@
+                 if (to <= at) continue;
+                 err.clear();
+                 const bool win = windows_ok(at, to);
+-                if (win && !refill(err)) {
++                // --prefill-main-small: a part too long for the windows and short enough for the chained read (text
++                // only, short of the next periodic checkpoint) runs split-wise, like a window: CUDA0 its own layers
++                // out of its cache, the stage its own from its resident experts - nothing lent beyond the kept
++                // small-prompt slots, no stage expert streamed from the file
++                // (no periodic checkpoint inside a chained part: CUDA0's session holds only its own layers' state for
++                // those cells, and CUDA0 runs a chunk ahead of the stage; the part's end checkpoint syncs it)
++                const bool chain = !win && pm_small > 0 && to - at <= o.prefill_main_small_max &&
++                                   [&] {
++                                       if (sp.embd_rows != nullptr)
++                                           for (int64_t i = at; i < to; ++i)
++                                               if (sp.embd_rows[i] != nullptr) return false;
++                                       return true;
++                                   }();
++                if ((win || chain) && !refill(err)) {
+                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                     return 1;
+                 }
+-                if (win) pm_mask(false);
+-                if (!win && prefill_main) {
++                if (win || chain) pm_mask(false);
++                if (!win && !chain && prefill_main) {
+                     if (!pm_main_whole(err, at)) {
+                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                         std::printf("ERR %s\n", err.c_str());
+@@ -10731,16 +10855,23 @@
+                     }
+                     pm_mask(true);
+                 }
+-                if (!win && !lend(to - at, err)) {
++                // Chained: CUDA0 hands each of its chunks whole to the stage, which runs it in --prefill-main-small
++                // pieces from a hand-off buffer of a whole chunk, while CUDA0 reads the next.  A part is cut into
++                // about four chunks (at least 1024 tokens, at most the configured chunk) so the two cards overlap
++                // and the serial tail (the stage's last chunk) stays short; a long part keeps the full chunks.
++                const int64_t chain_cap = chain ? std::clamp<int64_t>(((to - at) / 4 + 255) / 256 * 256, 1024, o.prefill_chunk) : -1;
++                if (!win && !lend(to - at, err, chain_cap)) {
+                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                     return 1;
+                 }
+                 const auto tsp = Clock::now();
++                if (chain) pm_chain(true);
+                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
+-                if (prefill_main && win) pm_stage_ahead = true;   // the windows advanced only the stage's layers
++                if (chain) pm_chain(false);
++                if (prefill_main && (win || chain)) pm_stage_ahead = true;   // the windows / the chain advanced only the stage's layers
+                 if (trace) {
+                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
+-                                 win ? "windows" : "batched",
++                                 win ? "windows" : chain ? "chained" : "batched",
+                                  std::chrono::duration<double, std::milli>(Clock::now() - tsp).count());
+                     std::fflush(stderr);
+                 }
+@@ -10762,7 +10893,7 @@
+                 }
+                 // a batched read ran every layer on CUDA0: hand the stage its layers' state before anything reads
+                 // or saves it
+-                if (prefill_main && !win && !pm_sync(true, err, to)) {
++                if (prefill_main && !win && !chain && !pm_sync(true, err, to)) {
+                     std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                     std::printf("ERR %s\n", err.c_str());
+                     return 1;
