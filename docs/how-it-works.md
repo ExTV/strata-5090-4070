@@ -392,8 +392,8 @@ Three independent pieces in one patch, as they were tested together:
 - **`STRATA_ROUTE_TAIL_SKIP`** is upstream's 0.1.42 default, cherry-picked: an expert a verify window would
   have to fetch, and that every token of the window routes at rank 7 or lower, is neither copied nor computed.
   12.78 instead of 13.22 ms per window on IQ3_S (12 of 13 paired requests), 24.1 instead of 31.1 on the
-  SSD-bound unsloth quant. Answers change slightly (upstream: KL 0.003-0.006); `"STRATA_ROUTE_TAIL_SKIP": "0"`
-  restores 0.1.41's bytes. It arms itself only when no helper or peer GPU is in use and not every expert is
+  SSD-bound unsloth quant. Answers change slightly (upstream: KL 0.003-0.006), so the shipped configs set
+  `"STRATA_ROUTE_TAIL_SKIP": "0"`, which restores 0.1.41's bytes. It arms itself only when no helper or peer GPU is in use and not every expert is
   resident; a layer split is fine, each stage skips by itself.
 - **`STRATA_RAM_ADAPT=N`** (PR #1838, opt-in) lets the page-locked RAM copy follow the conversation. The PR
   moves experts between verify windows; with a layer split and `--pipeline-windows 2` a window is in flight

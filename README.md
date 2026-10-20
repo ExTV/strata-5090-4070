@@ -100,8 +100,9 @@ Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
   The layer split (39) and the VRAM reserves are sized for exactly 32 + 16 GB.
 - **RAM:** 32 GB plus zram swap. With the model up, about 1-2 GB stays available and some engine memory
   sits in zram. Headless box: no RAM or VRAM is left for a desktop.
-- **Disk:** a fast NVMe with ~85 GB free for IQ3_S (55 GB of experts + 29 GB of PLE table), ~77 GB for IQ3_XXS
-  (the PLE shard is the same file), plus up to 32 GB for conversations spilled to disk
+- **Disk:** a fast NVMe with ~135 GB free for IQ3_S (55 GB of experts, the 29 GB shard 2 and the 51 GB FP8 PLE
+  table), ~127 GB for IQ3_XXS, another 52 GB while `prepare.sh` builds the table (deleted after), plus up to
+  32 GB for conversations spilled to disk
   (`--conversation-spill-mib`, default 32768; the oldest file goes first).
 - **Software:** Linux, NVIDIA driver, CUDA toolkit (`nvcc`), `cmake`, `ninja`, `git`, `patch`, `curl`, Python 3.10+.
 
@@ -135,7 +136,8 @@ strata/.venv/bin/hf download alesha-pro/Qwen3.8-Flash-Next-abliterated-GSQ-RCO-S
 ./prepare.sh
 ```
 
-- Shard 1 (55 GB, the experts) is read in place; shard 2 (28.8 GB) is the PLE table. For the IQ3_XXS config
+- Shard 1 (55 GB, the experts) is read in place. Shard 2 (28.8 GB) is ISTA's IQ4_NL PLE table; the configs read
+  the FP8 table instead, but shard 2 must still exist (shard 1 declares a two-file split). For the IQ3_XXS config
   download `"IQ3_XXS/*"` as well (its shard 2 is the same bytes) and run `QUANT=IQ3_XXS ./prepare.sh`
 - The control vector (480 KB) is the refusal direction of huihui-ai's abliterated release, applied at runtime;
   leave the four `--control-vector*` / `--cvec*` arguments out of the config for the stock model
@@ -143,6 +145,10 @@ strata/.venv/bin/hf download alesha-pro/Qwen3.8-Flash-Next-abliterated-GSQ-RCO-S
   tools, and `packs/gsq-iq3_s/tokenizer-sharp`: the pack's tokenizer with the
   [Sharp chat template](https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates) v22.5.0 (Apache-2.0,
   fetched at a pinned revision and checked) and its default reasoning effort raised from medium to xhigh
+- It also builds `models/ple-fp8.gguf`: the PLE n-gram table exactly as Qwen ships it (FP8 E4M3, 51.2 GB), copied
+  out of the 33 `Qwen/Qwen3.8-Flash-Next-FP8` shards that hold it (pinned revision) by Strata's own
+  `tools/ple_fp8_pack.py`; IQ4_NL is 8% off those values per row. About 3% slower per decode window here.
+  `PLE_FP8=0 ./prepare.sh` skips it; then point `--ple-gguf` back at shard 2
 
 ### 3. Run
 
@@ -211,9 +217,10 @@ Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
 | `MALLOC_MMAP_THRESHOLD_`, `MALLOC_ARENA_MAX` | about 0.7 GB more available RAM, speed-neutral |
 | `--kv int8` | the KV cache stays at 8 bits |
 
-`STRATA_ROUTE_TAIL_SKIP` is on by default in this build (patch 05, upstream's 0.1.42 default): answers differ
-slightly from 0.1.41's bytes (upstream measured KL 0.003-0.006); `"STRATA_ROUTE_TAIL_SKIP": "0"` in the config's
-`env` restores them.
+`STRATA_ROUTE_TAIL_SKIP` is on by default in this build (patch 05, upstream's 0.1.42 default) and the shipped
+configs turn it off (`"STRATA_ROUTE_TAIL_SKIP": "0"`): it changes answers (upstream measured KL 0.003-0.006) for
+about 3% of a decode window on IQ3_S. The decode numbers in this README were measured with it on; delete the
+key to get them back.
 
 Headroom 4 assumes nothing else runs on the box: about 3.5 GB of engine memory goes to zram, and now and then
 a tool step stalls for a couple of seconds on page faults. Use 14 if you work on the desktop while it serves

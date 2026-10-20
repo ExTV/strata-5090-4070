@@ -2,7 +2,8 @@
 # One-time model preparation inside ./strata, for one quant (QUANT=IQ3_S, the shipped one, or IQ3_XXS): the dense
 # pack (attention, norms, tokenizer; the experts stay in the GGUF and are mmap'd by the engine), the MTP draft
 # runtime from the base model's draft head, and the pack's second tokenizer directory with the Sharp chat template
-# at xhigh effort.  Needs the GGUF shards in $MODELS/$QUANT/ (README step 2).  Skips what already exists.
+# at xhigh effort, and the FP8 PLE table.  Needs the GGUF shards in $MODELS/$QUANT/ (README step 2).  Skips what
+# already exists.
 set -euo pipefail
 cd "$(dirname "$0")/strata"
 MODELS=${MODELS:-$(cat models.path 2>/dev/null || echo "$PWD/../models")}   # models.path is written by install.sh
@@ -39,6 +40,23 @@ if [ ! -f "$PACK/tokenizer-sharp/chat_template.jinja" ]; then
         || { rm -rf "$PACK/tokenizer-sharp"; echo "edited chat template checksum mismatch, nothing kept" >&2; exit 1; }
 fi
 
+# The PLE n-gram table as Qwen ships it (FP8 E4M3, 51.2 GB) instead of ISTA's IQ4_NL shard 2 (8% off per row):
+# the checkpoint shards that hold it are fetched at a pinned revision, copied byte for byte into one GGUF by
+# Strata's tools/ple_fp8_pack.py, then deleted.  PLE_FP8=0 skips it; then point --ple-gguf back at shard 2.
+FP8_REPO=Qwen/Qwen3.8-Flash-Next-FP8
+FP8_REV=236dfdf285828023ca3bcd3f37366c58a3469b13
+PLE=$MODELS/ple-fp8.gguf
+if [ "${PLE_FP8:-1}" != 0 ] && [ ! -f "$PLE" ]; then
+    SRC=$MODELS/ple-fp8-src
+    .venv/bin/hf download "$FP8_REPO" model.safetensors.index.json --revision "$FP8_REV" --local-dir "$SRC"
+    mapfile -t FILES < <(.venv/bin/python -c 'import json, sys
+w = json.load(open(sys.argv[1]))["weight_map"]
+print("\n".join(sorted({f for k, f in w.items() if ".ngram_embedding." in k})))' "$SRC/model.safetensors.index.json")
+    .venv/bin/hf download "$FP8_REPO" "${FILES[@]}" --revision "$FP8_REV" --local-dir "$SRC"   # 33 files, 52 GB
+    .venv/bin/python tools/ple_fp8_pack.py --model "$SRC" --out "$PLE.part" && mv "$PLE.part" "$PLE"
+    rm -rf "$SRC"
+fi
+
 CVEC=$MODELS/Huihui-Qwen3.8-Flash-Next-refusal-direction-r.gguf
 [ -f "$CVEC" ] || echo "note: $CVEC is missing; the configs project it at runtime (README step 2)" >&2
-echo "pack $PACK, drafter mtp/rt and $PACK/tokenizer-sharp are ready"
+echo "pack $PACK, drafter mtp/rt, $PACK/tokenizer-sharp and the PLE table are ready"
