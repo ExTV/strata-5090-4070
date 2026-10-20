@@ -11,7 +11,7 @@ A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the expert file. This is the
 exact setup that serves my own agents every day; what is here is what runs.
 
-- **Upstream Strata v0.1.41** plus 12 patches: the dual-GPU series, four open upstream PRs, two upstream commits and our own work
+- **Upstream Strata v0.1.41** plus 13 patches: the dual-GPU series, four open upstream PRs, two upstream commits and our own work
 - **ISTA GSQ-RCO IQ3_S** (the quality tier that still keeps every decode expert off the SSD here), with the
   IQ3_XXS config kept as the faster alternative
 - **160-200 tok/s decode** on IQ3_S (code 237, reasoning 194, prose 146 tok/s at temperature 0), prompts up to
@@ -179,6 +179,7 @@ byte for byte (62 files, `patches/MANIFEST.sha256`).
 | 10 | upstream d3fb3e6f (v0.1.42), ported | the layer split's streamed-ring size is decided before the lend regions are sized, plus a start line with borrowed vs RAM-kept slots; inert on this config (the sizing already matched), carried for the line and the next rebase |
 | 11 | ours | `--kv-resident-later N`: the later stages' own `--kv-resident`; `0` keeps the whole K/V of the 4070's three attention layers in VRAM with no pinned copy, so nothing is read over the x1 link during decode (the session copy between a streamed and a resident state is new) |
 | 12 | ours | `--prefill-main-small S` / `--prefill-main-small-max M`: under `--prefill-main` every text prompt part up to M tokens (the shipped config: the whole context) is read split-wise: the 5090 runs its own layers out of its expert cache in its usual chunks and hands each chunk whole to the 4070 through one 640 MiB pinned buffer, and the 4070 runs its nine layers from its resident experts in S-token pieces while the 5090 reads the next chunk; a part is cut into ~4 chunks so short ones pipeline too. Before, every part past `--short-read` was read whole-model on the 5090, which streamed the 4070's layers' experts from the SSD for every 16K chunk (57 GB per 81K prompt): fresh 13K / 16K / 32K / 64K / 81K / 203K prompts 13.4 / 6.4 / 10.6 / 19.0 / 24-25 / 57.7 s -> 4.0 / 5.0 / 8.6 / 15.9 / 18.5-20 / 41 s, agent steps 3.3 / 6.5 / 3.9 -> 1.1 / 1.2 / 1.8 s, SSD reads ~0; the 4070 keeps a 512-token path (644 MiB, reserve 700 -> 420 MiB); also holds the draft head back from the later card's expert room, which the sizing had missed |
+| 13 | ours | the draft layer's K/V projections (28 MiB) are copied to the 5090 at load, before the expert cache takes its VRAM; before, `STRATA_PM_MTP_BATCH=1` copied them on the first whole-model prompt (an image part) and the engine died when the 5090 was already full. If the copy cannot be made, prompts fall back to the drafter's own pass on the 4070 instead of failing |
 
 Already in v0.1.41 and no longer carried: the fork's RAM copy, pipelined windows and asynchronous tier, the
 CPU IQ kernels, #510, #525, #934, #1043, #1049. Left out: #904 (verify-window PDL; conflicts with upstream's

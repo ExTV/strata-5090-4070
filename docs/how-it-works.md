@@ -519,3 +519,12 @@ estimate (`bytes_needed_owned`) is within 5% for a chunk below the streaming thr
 ("not enough RAM for them"), after which long prompts read from the file. The same room never held back the draft
 head (213 MiB), which only ever fit because ~0.5 GB happened to stay spare; patch 12 holds it back explicitly.
 
+
+## The draft layer's K/V projections copied at load (patch 13)
+
+`STRATA_PM_MTP_BATCH=1` (patch 04) computes the draft layer's prompt K/V on the 5090, which needs a copy of the
+drafter's K/V projections there (28 MiB). The copy was made lazily, on the first prompt read whole-model; with
+patch 12 that is normally the first prompt with an image part, and by then the expert cache had filled the 5090:
+the allocation failed and the engine died. The copy is now made right after the drafter loads, out of free VRAM
+before the cache is sized. If it still cannot be made, the prompt declines the batched path and the drafter runs
+its own pass on the 4070, as without the flag; the allocation error is cleared so that path does not trip on it.

@@ -1,0 +1,55 @@
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 298cffc..0ba91cf 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -216,6 +216,7 @@ bool MtpDrafter::kv_weights_on(int device, KvWeights& w, std::string& err) {
+     std::fclose(f);
+     const OnDevice on(device);
+     if (cudaMalloc((void**) &c.blob, (size_t) total) != cudaSuccess) {
++        cudaGetLastError();   // clear the allocation error so the fallback path does not trip over it
+         err = "mtp: the main device has no room for the draft layer's K/V projections (" + std::to_string(total >> 20) + " MiB)";
+         return false;
+     }
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index e83e4f8..b079e9e 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1324,7 +1324,14 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
+     const int64_t Nn = g.n_embd, HCN = g.hc * g.n_embd, KV = g.n_head_kv * g.head_dim;
+     constexpr int kQ8_0 = 8;   // GGML_TYPE_Q8_0
+     core::MtpDrafter::KvWeights w;
+-    if (!mtp.kv_weights_on(m.device, w, err)) return false;
++    {
++        // local: no room for the copy is not fatal; the caller runs the drafter's own pass instead
++        std::string kv_err;
++        if (!mtp.kv_weights_on(m.device, w, kv_err)) {
++            std::fprintf(stderr, "strata serve: %s\n", kv_err.c_str());
++            return decline("the drafter's K/V projections have no copy on the main device");
++        }
++    }
+     const float* w_ne = w.ne;
+     const void* w_fe = w.fe;
+     const float* w_nh = w.nh;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index a421fe0..6d81ac6 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4097,6 +4097,18 @@ int main(int argc, char** argv) {
+         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
+         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
++        // STRATA_PM_MTP_BATCH=1 needs the drafter's K/V projections on CUDA0 (28 MiB).  Copied lazily on the first
++        // whole-model prompt (an image part), it found CUDA0 already filled by the expert cache and the engine died;
++        // copied here it comes out of free VRAM before the cache is sized
++        if (!o.mtp.empty() && prefill_main && mtp.device() != 0 &&
++            strata::program::draft_kv::split_env_on(std::getenv("STRATA_PM_MTP_BATCH"))) {
++            strata::core::MtpDrafter::KvWeights kvw;
++            std::string kv_err;
++            if (mtp.kv_weights_on(0, kvw, kv_err))
++                std::fprintf(stderr, "strata generate: draft layer K/V projections copied to CUDA0 at load (STRATA_PM_MTP_BATCH=1)\n");
++            else
++                std::fprintf(stderr, "strata generate: %s; prompts fall back to the drafter's own pass\n", kv_err.c_str());
++        }
+         mtp.set_ple_session(&ss);
+         if (batch_mtp) {
+             for (int b = 0; b < o.batch; ++b) {
