@@ -678,3 +678,73 @@ production band 12.3-12.5). The 5090 reads its 39 layers at ~5,300 tok/s in 16K 
 ~5,200 tok/s in 512-token pieces, so the pipeline is balanced; the 4070's piece size (1024 needs ~170 MiB more
 VRAM than it has at split 39) and its layer count (split 40-42) are the next knobs.
 
+
+## Upstream v0.2.1 as the base (2026-10-21 to 2026-10-23, IQ3_S, split 39)
+
+The v0.1.41 series merged onto v0.2.1 (patch 01), first against production on 0.1.41, same session, desktop off:
+
+| | v0.1.41 build | v0.2.1 build |
+| --- | --- | --- |
+| decode, 600-token answers, greedy | 172-182 tok/s (12.4-12.9 ms/window) | **185 / 187 / 197 tok/s** (11.4-12.7 ms/window) |
+| 16K / 80K fresh prompt | | 4.9 s / 19.9 s (0.1.41: 19.0-19.2 s) |
+| agent steps | 3.7 / 1.3 / 1.3 / 1.9 / 2.0 s | the same |
+| needle, spill 4 rounds, image, planets | | identical answers |
+| boot | | 52 s |
+
+Trap found on the way: v0.2.1 merges the model card's sampling into the config's `sampling` block per key, so
+thinking-off requests got `presence_penalty 1.5`: different output, and every such request decoded serially
+(16.3-17.3 ms/window instead of 12.4-12.9). `"presence_penalty": 0.0` in the config fixes it.
+
+### A/Bs on the v0.2.1 build (fresh boots, interleaved)
+
+| Change | Result | Kept |
+| --- | --- | --- |
+| PR #3404 (drop superseded parked copies) | `conv_cache_test` PASS, no speed change | yes (patch 02) |
+| sm_89 MMVQ-IL table re-tuned on the 4070 Ti SUPER (PR #3453 style) | ms/window 12.64 / 12.15 / 12.11 / 12.11 (base / new / base / new), neutral | no |
+| `STRATA_SPLIT_SMALL_OWN` 3072 -> unset | ms/window 12.05 / 11.85 / 12.47 -> 11.72 / 11.91 / 11.73 (-2.7%), 229 vs 216 tok/s; frees 849 slots | removed |
+| `--short-read` 768 -> 128 | follow-ups of 285 / 425 / 700 fresh tokens after a 25K context: 0.8-1.1 / 1.3-1.8 / 2.1-3.0 s -> 0.40 / 0.47 / 0.63-0.68 s | yes |
+| image parts chained (patch 05) | OCR crop 5.13 s / 10.75 GB -> 1.23 s / 0.32 GB; full page 3.02 s / 10.35 GB -> 1.31 s / 0.04 GB; image in a 34K chat 2.88 s / 7.24 GB -> 1.65 s / 0.01 GB; 3 images 1.1 s | yes |
+| upstream 70f42407 (patch 03) | 406 serve tests OK; tool probe differences were temperature-1.0 noise (all misses model-side `bash` drops) | yes |
+| `STRATA_UNBUFFERED_LOAD=1` + `--resident-budget-gib 17.5` (O_DIRECT file tier) | 80K 19.0 s both, 149K 32.6 vs 31.6 s, 183K 49.1 s / 177 tok/s vs 48.6 s / 186, agent steps equal | no (only matters in the drift state below, not reproducible on a fresh boot) |
+
+The tool probe (`tools/tool_probe.py`) read only `reasoning` from the stream, but Strata streams
+`reasoning_content`, so turn 2 lost turn 1's thinking; fixed in this release. With the fix and the spill fix:
+`reasoning_effort` none 0/30 failures, the template default (xhigh) 3/30, xhigh 2/30.
+
+### Long days: drift onto file-only experts, and SSD writes (2026-10-22)
+
+Decode slid from ~200 to 35-50 tok/s over ~18 h of agent use. The log showed `file tier I/O ... for N MB of
+expert reads` growing from 0 to 5-14 GB per request, `decode waited` 13-16 s, GPU hit rate 99.4 -> ~95%. IQ3_S
+leaves 9.6 GiB of experts file-only (1.6 GiB of page cache next to them), and long agent sessions drift onto
+them; a restart only resets it. Fix (placement only): `STRATA_RAM_ADAPT=256` plus `"expert_profile_save"`, so
+the RAM copy takes in the experts the traffic reads from the file and the learned placement survives restarts.
+
+SSD writes: 0.37 TB written in 44 h, 231 GB of it spills (114 GB speculative idle spills, 32 GB from chats under
+1K tokens). `--conversation-cache-min-tokens 1024` and the new `--no-conversation-spill-idle` (patch 04) remove
+both. Reads do not wear the drive.
+
+### Very long agent conversations (2026-10-23)
+
+One agent conversation grew to 220K tokens. Decode by prompt size over that boot (396 requests):
+
+| Prompt | Requests | Decode tok/s | GPU expert hit |
+| --- | ---: | ---: | ---: |
+| < 40K | 77 | 193 | 98.5% |
+| 40-80K | 122 | 176 | 97.8% |
+| 80-120K | 80 | 158 | 98.2% |
+| 120-160K | 25 | 141 | 97.3% |
+| 160-200K | 65 | 84 | 95.7% |
+| 200K+ | 29 | 34 | 91.9% |
+
+At that size the KV takes VRAM from the expert cache and RAM from the page cache (MemAvailable ~1 GB, 12.5 GB of
+KV read from RAM on one request), and the misses go to the SSD: the worst request needed 186 GB of expert reads,
+the OS read 557 GB for them, and decode waited 229 s. After that conversation, fresh 3K prompts stayed at 18-22
+tok/s with 87% GPU hits and ~26 GB of file reads each; a restart gave 232-272 tok/s, 98-99% hits, 0 expert reads
+(the learned profile saved during the drift loaded fine). A fresh 183K prompt of real code on a fresh boot
+decodes at 177-186 tok/s, so it is the long session's history, not the length alone. Compact before ~150K.
+
+### Upstream's benchmark suite (2026-10-23)
+
+`tools/strata_bench.py --long`, the shipped config, already running: short chat 186.3 tok/s (153.7-254.8),
+TTFT 0.28 s; 4K 2,446 tok/s, 16K 3,917 tok/s, 32K 4,159 tok/s (7.74 s); agent session follow-ups 1.31 s TTFT,
+173.5 tok/s, 70.0% cache hit. Full report: [strata-bench-2026-10-23](strata-bench-2026-10-23/README.md).

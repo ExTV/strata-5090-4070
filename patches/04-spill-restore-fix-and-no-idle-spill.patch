@@ -1,0 +1,90 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 63e13353..718cccbf 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -749,6 +749,7 @@ struct Options {
+     /// a session file in this directory instead and read back when a request continues it (empty = off)
+     std::string conversation_spill_dir;
+     int64_t conversation_spill_mib = 32768;   ///< the spill directory's budget; the oldest file goes first
++    bool conversation_spill_idle = true;   ///< write a long conversation's spill 2 s after its request, before a switch
+     /// --serve: persistent prefix snapshots (docs/DETAILS.md): the state at the end of each system prompt, on disk
+     /// in this directory (empty = off) and the most recently used ones also in RAM
+     std::string prefix_cache_dir;
+@@ -914,6 +915,8 @@ void usage() {
+                  "  --conversation-spill-dir DIR  --serve: a conversation the RAM cache cannot park goes to a session\n"
+                  "                       file in DIR and comes back when a request continues it (off by default)\n"
+                  "  --conversation-spill-mib N  --serve: the spill directory's budget (default 32768)\n"
++                 "  --no-conversation-spill-idle  --serve: write a spill only when another conversation comes in,\n"
++                 "                       not ahead of it while idle (fewer SSD writes; the switch pays the write)\n"
+                  "  --prefix-cache-dir DIR  --serve: keep the state at the end of each system prompt in DIR, so a new\n"
+                  "                       chat with it reads only the rest (default off; one GPU, no --batch)\n"
+                  "  --prefix-cache-ram-mib N  --serve: of those, keep the latest in N MiB of RAM (default 2048)\n"
+@@ -2658,6 +2661,7 @@ int main(int argc, char** argv) {
+             else o.conversation_cache_slots = (int) number;
+         }
+         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
++        else if (a == "--no-conversation-spill-idle") o.conversation_spill_idle = false;
+         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
+         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+@@ -9503,6 +9507,10 @@ int main(int argc, char** argv) {
+         };
+         std::vector<ConvSpill> spills;
+         uint64_t spill_clock = 0, spill_seq = 0;
++        // the spill a request picked to restore, from the pick until its restore: the outgoing conversation's park
++        // runs in between, and another conversation's file is never kept for it or dropped by it (two conversations
++        // that share a start, a system prompt and tools say, both have a checkpoint that covers the other's tokens)
++        std::string spill_restoring;
+         const bool spill_on = !o.conversation_spill_dir.empty() && o.prompt_cache > 0 && o.batch <= 0 &&
+                               o.peer_device < 1 && (stages.empty() || prefill_main);
+         if (!o.conversation_spill_dir.empty() && !spill_on)
+@@ -9551,14 +9559,14 @@ int main(int argc, char** argv) {
+             };
+             size_t keep = spills.size(), keep_n = 0;
+             for (size_t i = 0; i < spills.size(); ++i) {
+-                if (spills[i].cvec != cvec_cached) continue;
++                if (spills[i].cvec != cvec_cached || spills[i].path == spill_restoring) continue;
+                 const size_t c = std::max(covers(spills[i].ids), covers(spills[i].ck_ids));
+                 if (c > keep_n) { keep = i; keep_n = c; }
+             }
+             if (keep < spills.size() && live.size() - keep_n <= kSpillBehind) {
+                 spills[keep].used = ++spill_clock;
+                 for (size_t i = spills.size(); i-- > 0;)   // any other, older spill of it goes
+-                    if (i != keep && spills[i].cvec == cvec_cached &&
++                    if (i != keep && spills[i].cvec == cvec_cached && spills[i].path != spill_restoring &&
+                         std::max(covers(spills[i].ids), covers(spills[i].ck_ids)) > 0)
+                         spill_drop(i);
+                 if (!cancel)
+@@ -12336,7 +12344,7 @@ int main(int argc, char** argv) {
+                     ram_tried = served;
+                     ram_adapt_idle();
+                 }
+-                if (spill_on && idle_tried != served) {
++                if (spill_on && o.conversation_spill_idle && idle_tried != served) {
+                     idle_tried = served;
+                     spill_idle();
+                 }
+@@ -13123,6 +13131,7 @@ int main(int argc, char** argv) {
+             std::vector<std::array<uint64_t, 5>> spill_kv;   // the K/V part sizes the read pass validated
+             // --conversation-spill-dir: a spilled conversation this prompt continues, when it covers more than
+             // everything above
++            spill_restoring.clear();
+             if (spill_on) {
+                 size_t pick = spills.size();
+                 bool pick_live = true;
+@@ -13176,6 +13185,7 @@ int main(int argc, char** argv) {
+                         incoming_live = pick_live;
+                         spill_restored = true;
+                         if (spill_stream) spill_path = spills[pick].path;
++                        spill_restoring = spills[pick].path;
+                         prefix = {};
+                         spills[pick].used = ++spill_clock;   // the file stays: the next spill of it may keep it
+                     } else {
+@@ -13368,6 +13378,7 @@ int main(int argc, char** argv) {
+                              (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                              conversations.size(), conversations.bytes(), conversations.borrowed());
+             }
++            spill_restoring.clear();   // the outgoing conversation is parked: the picked file is this one's again
+             if (incoming && !spill_path.empty()) {
+                 // the streamed spill: disk -> the authoritative pools in blocks of at most 16 MiB, bound to the part
+                 // sizes the read pass validated; once a block is written a failure is fatal, as below

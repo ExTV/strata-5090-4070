@@ -62,7 +62,7 @@ def stream(messages, seed):
         ch = json.loads(line[5:])["choices"][0]
         d = ch.get("delta", {})
         content += d.get("content") or ""
-        reasoning += d.get("reasoning") or ""
+        reasoning += d.get("reasoning") or d.get("reasoning_content") or ""
         for tc in d.get("tool_calls") or []:
             s = calls.setdefault(tc.get("index", 0), {"id": None, "name": None, "args": ""})
             if tc.get("id"):

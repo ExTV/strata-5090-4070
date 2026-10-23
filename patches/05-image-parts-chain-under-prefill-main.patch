@@ -1,0 +1,41 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 63e13353..718cccbf 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -13651,7 +13662,7 @@ int main(int argc, char** argv) {
+             // costs ~300 ms per run however few tokens it has (it streams every expert the chunk routes to that is
+             // not in VRAM over PCIe), and it borrows slots it must refill after (~180 ms); a window costs ~16 ms a
+             // token, with the misses on the CPU.  Each part below is decided on its own, so a long first message is
+-            // read batched and its header still goes through the windows.  Picture rows need the batched path.
++            // read batched and its header still goes through the windows.  Picture rows need the batched or chained path.
+             // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
+             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
+@@ -14675,19 +14686,16 @@ int main(int argc, char** argv) {
+                 if (to <= at) continue;
+                 err.clear();
+                 const bool win = windows_ok(at, to);
+-                // --prefill-main-small: a part too long for the windows and short enough for the chained read (text
+-                // only, short of the next periodic checkpoint) runs split-wise, like a window: CUDA0 its own layers
+-                // out of its cache, the stage its own from its resident experts - nothing lent beyond the kept
+-                // small-prompt slots, no stage expert streamed from the file
++                // --prefill-main-small: a part too long for the windows and short enough for the chained read (short
++                // of the next periodic checkpoint) runs split-wise, like a window: CUDA0 its own layers out of its
++                // cache, the stage its own from its resident experts - nothing lent beyond the kept small-prompt
++                // slots, no stage expert streamed from the file.  Picture rows chain too: they replace the token
++                // embedding at layer 0 on CUDA0, the stage takes CUDA0's rows like any other, and every stage holds
++                // the image positions (st.mrope).  Read whole, a picture part streamed the stage's experts from the
++                // file for every chunk (4-10 GB a request).
+                 // (no periodic checkpoint inside a chained part: CUDA0's session holds only its own layers' state for
+                 // those cells, and CUDA0 runs a chunk ahead of the stage; the part's end checkpoint syncs it)
+-                const bool chain = !win && pm_small > 0 && to - at <= o.prefill_main_small_max &&
+-                                   [&] {
+-                                       if (sp.embd_rows != nullptr)
+-                                           for (int64_t i = at; i < to; ++i)
+-                                               if (sp.embd_rows[i] != nullptr) return false;
+-                                       return true;
+-                                   }();
++                const bool chain = !win && pm_small > 0 && to - at <= o.prefill_main_small_max;
+                 if ((win || chain) && !refill(err)) {
+                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                     return 1;

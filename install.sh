@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Clones upstream Strata at the v0.1.41 tag into ./strata, applies the patch series in patches/ (the dual-GPU
-# series, four open upstream PRs and our own work, in the order they were merged and tested), builds the engine
-# and the vision helper for an RTX 5090 (sm_120) + RTX 4070 Ti SUPER (sm_89), makes the Python venv, and writes the
-# two server configs from configs/*.json.in with $MODELS filled in.  Safe to re-run: patches already applied are
-# skipped and cmake only rebuilds what changed.  The expert pack, the MTP drafter and the chat template are
-# prepared by prepare.sh.
+# Clones upstream Strata at the v0.2.1 tag into ./strata, applies the patch series in patches/ (our dual-GPU
+# series merged onto v0.2.1, one upstream PR, one upstream commit and our own fixes, in the order they were merged
+# and tested), builds the engine and the vision helper for an RTX 5090 (sm_120) + RTX 4070 Ti SUPER (sm_89), makes
+# the Python venv, and writes the two server configs from configs/*.json.in with $MODELS filled in.  Safe to
+# re-run: patches already applied are skipped and cmake only rebuilds what changed.  The expert pack, the MTP
+# drafter and the chat template are prepared by prepare.sh.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 STRATA_REPO=${STRATA_REPO:-https://github.com/Niko1221/Strata.git}
-STRATA_COMMIT=${STRATA_COMMIT:-fb58e0dbc8399662c0e47c76578c6e878b14f6cf}   # tag v0.1.41 (2026-10-08)
+STRATA_COMMIT=${STRATA_COMMIT:-90767252f420e25223c739d604145ad15911d48b}   # tag v0.2.1
 MODELS=${MODELS:-$PWD/models}
 CUDA_ARCHS=${CUDA_ARCHS:-"89;120"}
 JOBS=${JOBS:-3}          # a cicc/nvcc job takes ~3 GB of RAM; 3 jobs fit a 32 GB box next to a desktop
@@ -34,7 +34,7 @@ for p in ../patches/[0-9][0-9]-*.patch; do
     if grep -qxF "$name" .patches-applied; then
         echo "already applied  $name"
     elif patch -p1 --dry-run --forward --quiet < "$p" >/dev/null 2>&1; then
-        patch -p1 --forward --quiet -b -z .orig-v0141 < "$p"
+        patch -p1 --forward --quiet -b -z .orig-v021 < "$p"
         echo "$name" >> .patches-applied
         echo "applied          $name"
     else
@@ -49,9 +49,10 @@ fi
 
 # The engine. STRATA_ENABLE_CUDA is OFF by default (CPU tools only); the pinned llama.cpp commit is fetched by
 # cmake for ggml (or point STRATA_GGML_DIR at a local checkout of that commit).
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
+      -DSTRATA_MMQ_KQUANTS=OFF -DSTRATA_Q6K_EXPERTS=OFF -DSTRATA_MMQ_TQ_OVERLAY=OFF \
       -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" ${STRATA_GGML_DIR:+-DSTRATA_GGML_DIR=$STRATA_GGML_DIR}
-cmake --build build -j"$JOBS"
+cmake --build build --target strata -j"$JOBS"
 
 # The image encoder (llama.cpp's mtmd at the same pinned commit), on the GPU.
 LLAMA_DIR=${STRATA_GGML_DIR:-$PWD/build/_deps/strata_llamacpp-src}

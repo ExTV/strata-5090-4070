@@ -528,3 +528,37 @@ patch 12 that is normally the first prompt with an image part, and by then the e
 the allocation failed and the engine died. The copy is now made right after the drafter loads, out of free VRAM
 before the cache is sized. If it still cannot be made, the prompt declines the batched path and the drafter runs
 its own pass on the 4070, as without the flag; the allocation error is cleared so that path does not trip on it.
+
+## Upstream v0.2.1 as the base (2026-10-21)
+
+The v0.1.41 series (13 patches) was merged onto v0.2.1 (1,770 upstream commits) by hand: 20 files, ~100 hunks.
+Upstream had grown its own versions of several of our pieces (the park gain, the tail skip, RAM adapt, the
+commit batch, the lend-ring fix) and those won; ours stayed where upstream had nothing (`--prefill-main` and its
+chained reads, the SSD spill, the prefix store under `--prefill-main`, `pread`, the PLE prefetch, slot expiry,
+the parser fix, `--kv-resident-later`, the draft K/V copy). The result is patch 01. Two v0.2.1 behaviours matter
+here: the model card's sampling is merged per key under the config's (keep `presence_penalty: 0.0`), and a
+non-loopback bind needs an API key.
+
+## Image parts chained (patch 05)
+
+The chained split-wise read (old patch 12) excluded prompt parts with picture rows, so every image part ran
+whole-model on the 5090, and the 4070's layers' experts were streamed from the SSD for every chunk (7-11 GB per
+image request). Picture rows only replace the token embedding at layer 0, which runs on the 5090; the stage takes
+the 5090's rows like any other and holds the image positions, so the predicate was simply dropped.
+
+## The spill restore and idle writes (patch 04)
+
+A request that continues a spilled conversation picks the file, then parks the outgoing conversation, then
+restores. The park's spill dropped "older spills of this conversation" by checkpoint-prefix match, and two
+conversations that share a system prompt and tools match each other, so the picked file could be deleted before
+its restore (the engine exited on `No such file`). The picked path is now protected from the pick until just
+before its restore. `--no-conversation-spill-idle` turns off the speculative write 2 s after a request: a spill
+is then written only when another conversation actually comes in.
+
+## Placement that follows the traffic
+
+The RAM copy is sized at boot and filled from the profile. Long agent days move onto experts outside it, which
+are read from the file (page cache or SSD) on every miss. `STRATA_RAM_ADAPT=256` swaps up to 256 hot file-tier
+experts into the RAM copy between requests, and `"expert_profile_save"` writes the learned ranking every 10
+minutes and at exit so the next boot starts from it. Neither changes any math. What it cannot fix is a single
+conversation past ~160K tokens on 31 GB: the KV then competes with the experts for both VRAM and RAM.

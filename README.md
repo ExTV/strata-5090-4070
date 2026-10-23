@@ -11,18 +11,20 @@ A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the expert file. This is the
 exact setup that serves my own agents every day; what is here is what runs.
 
-- **Upstream Strata v0.1.41** plus 13 patches: the dual-GPU series, four open upstream PRs, two upstream commits and our own work
+- **Upstream Strata v0.2.1** plus 5 patches: our dual-GPU series merged onto it, one upstream PR, one upstream commit and our own fixes
 - **ISTA GSQ-RCO IQ3_S** (the quality tier that still keeps every decode expert off the SSD here), with the
   IQ3_XXS config kept as the faster alternative
-- **160-200 tok/s decode** on IQ3_S (code 237, reasoning 194, prose 146 tok/s at temperature 0), prompts up to
-  **3,480 tok/s**, a 260K-token prompt read in **76 s**
-- Decode never touches the SSD: the experts no card holds sit page-locked in RAM
+- **186 tok/s decode** median on IQ3_S (154-255 over short chats, 174 inside agent sessions), prompts up to
+  **4,160 tok/s** (32K in 7.7 s), a 183K-token prompt read in **49 s** and decoded at 177-186 tok/s after it
+- Decode never touches the SSD: the experts no card holds sit page-locked in RAM, and that RAM copy follows
+  the traffic between requests (placement saved across restarts)
 - Switching between conversations restores the parked one in **0.7-1.4 s**; a 200K conversation too big
   to park goes to the SSD and comes back in **2.8-2.9 s** instead of a 61 s re-read
 - The image encoder runs on the 4070, so the 5090 keeps more experts; the draft layer's prompt K/V is computed
   on the 5090 too, so long prompts no longer wait on the x1 link
 - Agent-friendly: tool calls parsed **44/60** on a probe that edits a file documenting the call format (21/60
-  with the stock template and parser), merged tool turns split, a 2.7K-token tool result answered in **3.6 s**
+  with the stock template and parser), merged tool turns split, agent follow-up turns answered in **0.8-1.8 s**
+- Images read split-wise too: an OCR crop in **1.2 s** instead of 5.1 s, with ~0 GB read from the SSD instead of 10 GB
 - The refusal direction is projected out at runtime (a 480 KB control vector, the weights untouched)
 - OpenAI and Anthropic compatible API on `:8888`, images on
 
@@ -30,7 +32,7 @@ exact setup that serves my own agents every day; what is here is what runs.
 
 ```bash
 git clone https://github.com/ExTV/strata-5090-4070.git && cd strata-5090-4070
-./install.sh                    # clone Strata v0.1.41, apply patches, build engine + vision helper, venv
+./install.sh                    # clone Strata v0.2.1, apply patches, build engine + vision helper, venv
 # download the model (step 2 below), then:
 ./prepare.sh                    # dense pack + MTP drafter + the Sharp chat template at xhigh
 launchers/flash-next-262k.sh    # serves http://127.0.0.1:8888/v1
@@ -40,7 +42,38 @@ launchers/flash-next-262k.sh    # serves http://127.0.0.1:8888/v1
 
 ## Performance
 
-### The shipped config (IQ3_S) and the IQ3_XXS alternative
+### Upstream's own benchmark suite (v0.2.1 build, IQ3_S, 2026-10-23)
+
+`tools/strata_bench.py --long` from Strata v0.2.1 against the running server (the shipped config, thinking off,
+temperature 0, 3 runs per test, medians with ranges). Full report:
+[docs/strata-bench-2026-10-23](docs/strata-bench-2026-10-23/README.md).
+
+| Test | Prompt tokens | Prompt tok/s | Decode tok/s | First token (s) |
+| --- | ---: | --- | --- | --- |
+| short chat | 200 | | 186.3 (153.7-254.8) | 0.28 (0.27-0.52) |
+| 4K prompt, fresh | 4,024 | 2,446 (1,909-2,830) | | 1.66 (1.44-2.12) |
+| 16K prompt, fresh | 16,056 | 3,917 (3,913-4,000) | | 4.12 (4.04-4.12) |
+| 32K prompt, fresh | 32,049 | 4,159 (4,150-4,206) | | 7.74 (7.65-7.75) |
+| agent session, follow-up turns | up to 14,881 | | 173.5 (145.3-201.5) | 1.31 (0.81-1.79) |
+
+Agent session cache hit 70.0 % (the rest is the new file text of each turn, read once).
+
+### Long prompts on the v0.2.1 build (2026-10-23, fresh boot)
+
+| Prompt | Prompt time | Decode after it | Read from the SSD |
+| --- | --- | --- | --- |
+| 80K random words | 19.0 s | 153-161 tok/s | 4.7-5.1 GB |
+| 149K random words | 31.6-32.6 s | 146-152 tok/s | 8.7-9.0 GB |
+| 183K of C++ source | 48.6-49.1 s | 177-186 tok/s | 4.0-4.2 GB |
+
+One thing a fresh boot does not show: an agent conversation that grows past ~160K tokens slows decode on
+31 GB of RAM (84 tok/s at 160-200K, 34 tok/s at 200K+ in one long session), and the expert placement it leaves
+behind stays slow for short prompts too until a restart (18-22 tok/s, 87% GPU hits; 232-272 tok/s after the
+restart). Compact long chats before ~150K. Details: [docs/benchmarks.md](docs/benchmarks.md).
+
+### The v0.1.41 build (history)
+
+#### The shipped config (IQ3_S) and the IQ3_XXS alternative
 
 Same engine, same settings except the quant and its prompt chunk, measured 2026-10-10 on this box
 (`tools/bench.py`, `tools/depth_bench.py`, `tools/step_times.py`; the probes and the tool-call runs on the
@@ -64,7 +97,7 @@ The IQ3_XXS numbers are from the same day on the same build; the IQ3_XXS history
 how the build got here. Quants that did not make it: ISTA Q2_0 (211 tok/s, all experts resident, lower
 quality), unsloth UD-IQ4_XS (58 tok/s: its 15,340 resident experts leave decode reading the SSD on 31 GB).
 
-### Against stock Strata on the same box (IQ3_XXS, 2026-10-07)
+#### Against stock Strata on the same box (IQ3_XXS, 2026-10-07)
 
 | | stock Strata 0.1.33, split 36 | this build, IQ3_XXS |
 | --- | --- | --- |
@@ -76,7 +109,7 @@ quality), unsloth UD-IQ4_XS (58 tok/s: its 15,340 resident experts leave decode 
 | switching between two chats (30K and 15K) | 20-48 s (full re-read) | **0.3-1.6 s** |
 | switching back to a 200K chat from a 5K one | ~47 s (full re-read) | **3.0-3.2 s** (from the SSD) |
 
-### Tool calls (2026-10-15, IQ3_S)
+#### Tool calls (2026-10-15, IQ3_S)
 
 `tools/tool_probe.py`, 60 two-turn sequences: parallel `read_file` calls with integer arguments, then an
 `edit_file` whose strings contain a literal `<parameter=limit>..</parameter>` line, plus a `bash` call.
@@ -86,11 +119,11 @@ quality), unsloth UD-IQ4_XS (58 tok/s: its 15,340 resident experts leave decode 
 | stock Qwen template, stock parser | 21/60 | |
 | Sharp template at its medium default | 8/60 | the edit's `new_string` empty in 15 |
 | Sharp at xhigh (shipped), stock parser | 30-33/60 | 17 edits cut at the nested `</parameter>`, 14 `bash` calls never written |
-| **Sharp at xhigh, patch 08** | **44/60** | 9 `bash` calls never written, 5 `new_string` never written, 2 turns ended inside the thinking |
+| **Sharp at xhigh, our parser fix (old patch 08, now in 01)** | **44/60** | 9 `bash` calls never written, 5 `new_string` never written, 2 turns ended inside the thinking |
 
 Every remaining miss is the model's: the raw engine output shows the call was never written. The model also
 writes `<parameter=limit>25</parameter>` and then skips the value's own closer in about half of these edits;
-patch 08 reads that correctly, which is the 17 -> 0.
+the parser fix reads that correctly, which is the 17 -> 0.
 
 Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 
@@ -114,7 +147,7 @@ Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 ./install.sh
 ```
 
-- Clones upstream Strata at tag v0.1.41 into `./strata` and applies `patches/` in order
+- Clones upstream Strata at tag v0.2.1 into `./strata` and applies `patches/` in order
 - Builds the engine and the vision helper for sm_89 + sm_120, creates the venv
 - Writes `strata/strata-flash-next-262k.json` (IQ3_S) and `strata/strata-flash-next-iq3xxs-262k.json`
 - Checks the patched files against `patches/MANIFEST.sha256` (the tested tree)
@@ -158,69 +191,66 @@ launchers/flash-next-262k.sh
 
 - Serves `http://127.0.0.1:8888/v1`: OpenAI chat completions and Anthropic messages, model name `qwen3.8-flash-next`
 - Overrides: `CONFIG=strata-flash-next-iq3xxs-262k.json` for the IQ3_XXS config, `PORT=`, `HOST=`
-- Sampling defaults 0.6 / 0.95 / 20; per-request drafter tuning with `"strata_tune": {"spec_min_p": 0.8}`
+- Sampling defaults 1.0 / 0.95 / 20, min_p 0, presence_penalty 0 (the model card's thinking set); per-request
+  drafter tuning with `"strata_tune": {"spec_min_p": 0.8}`. Keep `presence_penalty: 0.0` in the config: v0.2.1
+  merges the model card's sampling per key, which gives thinking-off requests `presence_penalty 1.5`; that
+  changes the output and sends every such request down the serial decode loop (16.3-17.3 ms per window instead
+  of 12.4-12.9)
 - A `max_tokens` that no longer fits the context gets a shorter completion instead of a 400
 - Reasoning effort: the template defaults to xhigh; a request's `reasoning_effort` (`none` .. `xhigh`) or
   `chat_template_kwargs.enable_thinking: false` overrides it
 
-> **No authentication.** `HOST=0.0.0.0` exposes the endpoint, image input included, to your whole network.
-> Only do that behind a firewall rule or a proxy that adds auth.
+> **API key for the network.** Strata v0.2.1 refuses to bind to anything but loopback without an API key.
+> For `HOST=0.0.0.0` give the server an API key (the server's `--help` and Strata's docs/DETAILS.md list the ways); clients send it as
+> a Bearer token in the `Authorization` header.
 
 ## What is in the patch series
 
-Each patch is one tested step, conflict resolutions included; applied to v0.1.41 they rebuild the tested tree
-byte for byte (62 files, `patches/MANIFEST.sha256`).
+Each patch is one tested step, conflict resolutions included; applied to v0.2.1 they rebuild the tested tree
+byte for byte (46 files, `patches/MANIFEST.sha256`).
 
 | # | Source | What it does |
 | --- | --- | --- |
-| 01 | ours + 10 PRs | the whole series of the previous release (v0.1.40.1 + 20 patches) merged onto v0.1.41: `--prefill-main` with conversation parking on a layer split, `pread` expert copies, the lend region in locked RAM, merged tool turns split into steps, the prefix cache under `--prefill-main`, conversations spilled to the SSD and restored in 16 MiB blocks, the idle spill write, plus the open PRs of that series (#1122, #1125, #547, #567, #572, #910 parts, #958, #1033, #1050, #1090, #1269) |
-| 02 | ours | merge fix: `prefill.cpp` keeps #547's `bytes_needed` source flag and the docs keep the prefill-main notes |
-| 03 | PR #1599 | `STRATA_SPLIT_MTP_BATCH=1`: the draft layer's prompt K/V computed in batches on the drafter's stage (opt-in; inert under `--prefill-main`, which is why 04 exists) |
-| 04 | ours | `STRATA_PM_MTP_BATCH=1`: under `--prefill-main` the draft layer's prompt K/V is computed on the 5090 and only the K/V rows cross the x1 link to the 4070 (an 82K prompt: 4.0-4.3 s of link traffic per chunk -> 0.3 s; 32K TTFT 9.9 -> 9.0 s, 82K 21.3 -> 16.8 s) |
-| 05 | PR #2265, v0.1.42, PR #1838 | `--conversation-cache-park-gain N`: a conversation is parked again only once it grew N tokens (before: every turn wrote a whole snapshot the next turn dropped, 294 GB over one day's log); `STRATA_ROUTE_TAIL_SKIP` (upstream's 0.1.42 default: a missed expert every token of a window routes at rank 7+ is skipped, ms per window 13.2 -> 12.8 here); `STRATA_RAM_ADAPT=N` (opt-in: the RAM copy follows the conversation between requests; does nothing on IQ3_S, +15-20% decode on the SSD-bound unsloth quant) |
-| 06 | PR #2589 | `STRATA_SLOT_EXPIRE_S`: with `"parallel"` batch slots a short side request takes the slot whose conversation is cheapest to lose (inert without `"parallel"`) |
-| 07 | PR #2572 | with `"tool_call_recovery": true` a parameter written `<parameter name="X">` or as one JSON `<parameter>` keeps its value (off in the shipped config: this model never writes those forms, and recovery invented a call in 1 of 60 runs) |
-| 08 | ours | the tool-call parser tracks nested `<parameter=..>...</parameter>` pairs inside a value and reads the closer the model skips after one (`<parameter=limit>25</parameter>` then straight to `</function>`): 17 of 60 cut edits -> 0 |
-| 09 | upstream 6f3e3810 (v0.1.44) | `STRATA_COMMIT_BATCH` (default on): the commit of the accepted tokens into every GDN and attention layer's state in one launch per layer kind instead of ~100 graph nodes; bitwise, ~1% of the window here, 5% at 20K context |
-| 10 | upstream d3fb3e6f (v0.1.42), ported | the layer split's streamed-ring size is decided before the lend regions are sized, plus a start line with borrowed vs RAM-kept slots; inert on this config (the sizing already matched), carried for the line and the next rebase |
-| 11 | ours | `--kv-resident-later N`: the later stages' own `--kv-resident`; `0` keeps the whole K/V of the 4070's three attention layers in VRAM with no pinned copy, so nothing is read over the x1 link during decode (the session copy between a streamed and a resident state is new) |
-| 12 | ours | `--prefill-main-small S` / `--prefill-main-small-max M`: under `--prefill-main` every text prompt part up to M tokens (the shipped config: the whole context) is read split-wise: the 5090 runs its own layers out of its expert cache in its usual chunks and hands each chunk whole to the 4070 through one 640 MiB pinned buffer, and the 4070 runs its nine layers from its resident experts in S-token pieces while the 5090 reads the next chunk; a part is cut into ~4 chunks so short ones pipeline too. Before, every part past `--short-read` was read whole-model on the 5090, which streamed the 4070's layers' experts from the SSD for every 16K chunk (57 GB per 81K prompt): fresh 13K / 16K / 32K / 64K / 81K / 203K prompts 13.4 / 6.4 / 10.6 / 19.0 / 24-25 / 57.7 s -> 4.0 / 5.0 / 8.6 / 15.9 / 18.5-20 / 41 s, agent steps 3.3 / 6.5 / 3.9 -> 1.1 / 1.2 / 1.8 s, SSD reads ~0; the 4070 keeps a 512-token path (644 MiB, reserve 700 -> 420 MiB); also holds the draft head back from the later card's expert room, which the sizing had missed |
-| 13 | ours | the draft layer's K/V projections (28 MiB) are copied to the 5090 at load, before the expert cache takes its VRAM; before, `STRATA_PM_MTP_BATCH=1` copied them on the first whole-model prompt (an image part) and the engine died when the 5090 was already full. If the copy cannot be made, prompts fall back to the drafter's own pass on the 4070 instead of failing |
+| 01 | ours + carried PRs | the whole v0.1.41 series (13 patches, see [the previous README](https://github.com/ExTV/strata-5090-4070/blob/1fa7992/README.md#what-is-in-the-patch-series)) merged onto v0.2.1 (1,770 upstream commits), 20 files / ~100 hunks resolved by hand. Upstream already had and kept: merge-v2 attention, the PromptEncoder (#567), the tail skip, the park gain (#2265), #1599, the commit batch, the lend-ring fix, the grouped resident gathers, RAM adapt (ours is gated to splits with no stages), the drafter's `mtp_first`. Ours on top: `--prefill-main` with the chained split-wise reads, the SSD spill, the prefix store under `--prefill-main`, `pread` expert copies, the PLE ticket / prefetch / early chain, slot expiry, the nested-parameter parser fix, `--kv-resident-later`, the draft K/V copy at load |
+| 02 | PR #3404 | a parked conversation's older copies are dropped when a newer one supersedes them, so the parking budget is not spent on dead snapshots |
+| 03 | upstream 70f42407 (#3441, #3075) | a tool call counts only when it names a declared tool (anything else goes back as text, so a client never runs a tool it did not offer); an envelope that drifted by a token (`<=NAME>`, `<function:NAME>`, `<NAME>`) is read as the call when NAME is declared; unread `<tool_call>` blocks are counted in the server window |
+| 04 | ours | the SSD spill: a request that picked another conversation's spill to restore no longer lets the outgoing conversation's park delete that file first (conversations that share a system prompt and tools match each other's checkpoints; with `--short-read 128` the tool probe crashed the engine 3 times on `spill-N.ses: No such file`, 0 after the fix in 114 spill reads); new `--no-conversation-spill-idle` writes a spill only when another conversation comes in, not ahead of it while idle (the switch pays the write, 0.2-0.7 s) |
+| 05 | ours | under `--prefill-main` prompt parts with pictures chain split-wise like text (the picture rows replace the token embedding at layer 0 on the 5090, every stage holds the image positions); before, every image part ran whole-model on the 5090 and streamed the 4070's 9.6 GiB of experts from the SSD: OCR crop (1,199 tokens) 5.13 s / 10.75 GB -> 1.23 s / 0.32 GB, full page 3.02 s / 10.35 GB -> 1.31 s / 0.04 GB, an image inside a 34K conversation 2.88 s / 7.24 GB -> 1.65 s / 0.01 GB; OCR answers identical |
 
-Already in v0.1.41 and no longer carried: the fork's RAM copy, pipelined windows and asynchronous tier, the
-CPU IQ kernels, #510, #525, #934, #1043, #1049. Left out: #904 (verify-window PDL; conflicts with upstream's
-kernel rewrite, decode is faster without it), PR #439 (batched expert gathers; deadlocks under
-`--prefill-main`), #2058 / #2059 (opt-in decode kernels, +3% slower here), #1598 / #1525 (neutral).
-Details for every piece: [docs/how-it-works.md](docs/how-it-works.md).
+Measured and left out on v0.2.1: the PR #3453-style sm_89 MMVQ table re-tuned on the 4070 Ti SUPER (bitwise
+parity on both cards, decode neutral: the 4070 holds 9 of 48 layers); `STRATA_UNBUFFERED_LOAD=1` with an explicit
+`--resident-budget-gib 17.5` (O_DIRECT file tier, equal on fresh boots). Details for every piece:
+[docs/how-it-works.md](docs/how-it-works.md).
 
 ## Tuning in the shipped config
 
 | Setting | Why |
 | --- | --- |
 | `"layer_split": "39"` | layers 0-38 on the 5090, 39-47 + drafter on the 4070, which holds every expert of its layers. 39 since 2026-10-15 evening, together with the resident K/V below (alone it equals 38); 37 -> 38 earlier that day was -2% per verify window |
-| `--kv-resident-later 0` | patch 11: the 4070 keeps the whole K/V of its attention layers in VRAM (+0.7 GB there, 0.8 GB of pinned RAM back): decode after 81-203K prompts +6-9%, 203K prefill 61.9 -> 57.2 s, 81K 24.5-29 -> 23-24 s; short prompts +0.2 ms per window (1.5-2.5%) |
+| `--kv-resident-later 0` | ours (in patch 01): the 4070 keeps the whole K/V of its attention layers in VRAM (+0.7 GB there, 0.8 GB of pinned RAM back): decode after 81-203K prompts +6-9%, 203K prefill 61.9 -> 57.2 s, 81K 24.5-29 -> 23-24 s; short prompts +0.2 ms per window (1.5-2.5%) |
 | `"vision": {"cuda_device": 1}` | the image encoder runs on the 4070 (1.28 GB there, 1.7 GB on the 5090), which is what makes room for the split |
 | `--prefill auto:16384` | IQ3_S has 3,000 fewer GPU-resident experts than IQ3_XXS; with 16K chunks every lent slot stays in locked RAM (32K: 41% of a chunk's loan re-read from the file); speed a wash, RAM cleaner. The IQ3_XXS config keeps 32768 |
-| `STRATA_PM_MTP_BATCH=1` | patch 04: the draft layer's prompt K/V on the 5090 (long prompts -20..25% TTFT) |
+| `STRATA_PM_MTP_BATCH=1` | ours (in patch 01): the draft layer's prompt K/V on the 5090 (long prompts -20..25% TTFT) |
 | `--mtp-hnorm stream` | upstream's opt-in drafter norm (one RMS per hyper-connection stream instead of one over all four); on since 2026-10-13 together with the park gain, not A/B'd on its own |
 | `--conversation-cache-park-gain 4096` | park again only after 4,096 new tokens: no snapshot churn on a long single conversation |
 | `--control-vector-scaled FILE:1.0 --control-vector-layer-range 4 44 --cvec-mode project --cvec-dir per-layer` | the refusal direction projected out of the residual stream at runtime; speed-neutral, the weights are ISTA's own; `"experimental_speed_projection": false` in a request turns it off |
 | `"tokenizer": ".../tokenizer-sharp"` | the Sharp template at xhigh: tool probe 33/60 vs 21/60 stock, short answers in a third of the tokens; at its medium default it dropped to 8/60, so effort is what matters |
-| `--short-read 768` | new text up to 768 tokens goes through the decode windows (a 150-token message: 1.7 to 0.5 s) |
+| `--short-read 128` | new text up to 128 tokens goes through the decode windows; longer parts chain split-wise (~0.35 s + 0.4 ms per token against 2.4-4 ms per token in the windows): follow-ups of 285 / 425 / 700 tokens 0.8-1.1 / 1.3-1.8 / 2.1-3.0 s at 768 -> 0.40 / 0.47 / 0.63-0.68 s |
 | `--conversation-cache-mib 1024`, 8 slots | parked chats survive the small side requests chat apps send; kept small so the engine has RAM |
 | `--conversation-spill-dir conversation-spill` | a chat too big to park is written to the SSD (~16 KB per token) and read back from there |
+| `--no-conversation-spill-idle`, `--conversation-cache-min-tokens 1024` | fewer SSD writes: one day's log showed 231 GB of spill writes, 114 GB of them speculative idle spills and 32 GB from chats under 1K tokens (every spill is at least ~230 MB: the recurrent state is a fixed size). Short chats are neither parked nor spilled; a long one is written when another conversation comes in |
+| `STRATA_RAM_ADAPT=256`, `"expert_profile_save"` | the RAM copy takes in the hot experts the traffic reads from the file, between requests (placement only, the math is the same); the learned placement is saved every 10 min and at exit and the next boot starts from it. Before, long agent days drifted onto the 9.6 GiB of file-only experts: decode 200 -> 35-50 tok/s over 18 h, 5-14 GB of file reads per request |
 | `--conversation-cache-min-free-mib 1024` | the default floor (2,560) refuses every park at headroom 4 |
 | `--prefix-cache-dir prefix-cache` | a known system prompt is restored from disk (about 430 MB per 20K tokens) |
-| `STRATA_SPLIT_SMALL_OWN=3072` | reads up to 3K tokens keep 986 cache slots: faster tool steps, decode 193 to 176 |
 | `STRATA_RESIDENT_HEADROOM_GIB=4` | the RAM the lend region leaves free: every borrowed slot stays in locked RAM, so refilling them after a prompt takes 0.15 s instead of 6 s |
 | `STRATA_PF_FUSED=1` | fused int8 tensor-core prompt kernels for the IQ packs (+9-13% on prompts) |
 | `MALLOC_MMAP_THRESHOLD_`, `MALLOC_ARENA_MAX` | about 0.7 GB more available RAM, speed-neutral |
 | `--kv int8` | the KV cache stays at 8 bits |
 
-`STRATA_ROUTE_TAIL_SKIP` is on by default in this build (patch 05, upstream's 0.1.42 default) and the shipped
+`STRATA_ROUTE_TAIL_SKIP` is on by default upstream since v0.1.42 and the shipped
 configs turn it off (`"STRATA_ROUTE_TAIL_SKIP": "0"`): it changes answers (upstream measured KL 0.003-0.006) for
-about 3% of a decode window on IQ3_S. The decode numbers in this README were measured with it on; delete the
-key to get them back.
+about 3% of a decode window on IQ3_S. The v0.2.1 numbers above were measured with it off; the v0.1.41 history
+tables with it on.
 
 Headroom 4 assumes nothing else runs on the box: about 3.5 GB of engine memory goes to zram, and now and then
 a tool step stalls for a couple of seconds on page faults. Use 14 if you work on the desktop while it serves
@@ -228,9 +258,9 @@ a tool step stalls for a couple of seconds on page faults. Use 14 if you work on
 once and decode to a third: the tier is sized at boot.
 
 Parking 1024 MiB holds chats up to about 50K tokens. Anything longer is written to the spill directory
-instead (a 200K chat is a 3.1 GB file, written in 1.6-2.5 s while the server is idle; a request that
-arrives meanwhile cancels the write), and the file is kept after it is read back,
-so the next switch reuses it while the chat is at most 8,192 tokens past it. The files belong to one server
+when another conversation comes in (a 200K chat is a 3.1 GB file; the switch pays the write, 0.2-0.7 s for the
+usual sizes), and the file is kept after it is read back, so the next switch reuses it while the chat is at most
+8,192 tokens past it. Chats under 1,024 tokens are neither parked nor spilled. The files belong to one server
 run: they are deleted when it stops and when it starts. With 64 GB of RAM raise the parking budget to 6144
 or more.
 
@@ -252,15 +282,15 @@ All talk to `127.0.0.1:8888` unless `STRATA_URL` is set.
 | `tools/spill_check.py` | a 200K and a 5K conversation alternating: the spill to disk and back |
 | `tools/merged_tool_turn.py` | a client that merges a turn's tool calls (`OLD_IDS=1` shows the re-reads the split removes) |
 | `tools/spec_min_p_sweep.py NAME` | per-request drafter threshold A/B, no restart |
-| `tools/agent_steps.py TAG [SEED]` | a 13K first message and four tool-result follow-ups (1.5K / 2.4K / 5.4K / 0.5K tokens): prompt seconds and SSD GB per step (the patch 12 gate; `NVME=` names the device) |
+| `tools/agent_steps.py TAG [SEED]` | a 13K first message and four tool-result follow-ups (1.5K / 2.4K / 5.4K / 0.5K tokens): prompt seconds and SSD GB per step (the chained-read gate; `NVME=` names the device) |
+| `strata/tools/strata_bench.py --url http://127.0.0.1:8888 --long` | upstream's own suite (short chat, 4K / 16K / 32K prompts, a 5-turn agent session): the report in `docs/strata-bench-2026-10-23/` |
 | `tools/snapshot.py` | page faults, swap, direct reclaim, NVMe, GPU counters; diff them around a run |
 
 ## Status
 
-- The patch series is checked in CI against a pristine v0.1.41 checkout.
-- Upstream is at v0.1.44.1 (2026-10-14); a merge of this tree onto it conflicts in 8 files and nothing in
-  0.1.42-0.1.44 changes decode on NVIDIA, so the rebase waits. The pieces of those releases worth having
-  (the park gain, the tail skip) are carried as patch 05.
+- The patch series is checked in CI against a pristine v0.2.1 checkout.
+- The IQ3_S config is what runs here every day; the IQ3_XXS config was carried forward with the same changes
+  and has not been booted on the v0.2.1 build.
 - `install.sh` and `prepare.sh` have not been run end to end from a clean checkout yet; reports welcome.
 
 ## License
