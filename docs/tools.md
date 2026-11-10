@@ -22,4 +22,7 @@ All talk to `127.0.0.1:8888` unless `STRATA_URL` is set.
 | `tools/prompt_bench.py WORDS...` | fresh random-word prompts with a needle and a follow-up (`23700 74000` = 80K and 250K tokens) |
 | `tools/grow_chat.py [LIMIT]` | one conversation grown to the context limit, ~4.5K tokens of source per turn: seconds per turn, decode, MemAvailable |
 | `tools/ple_header_patch.py FILE` | makes Unsloth's standalone PLE table loadable through `--ple-gguf` (run by `prepare.sh`) |
+| `tools/engine_logprobs.py capture\|ids\|run\|ppl\|vs-llama\|vs` | teacher-forced log-probabilities straight from the engine (the server stopped): perplexity, top-token agreement and KL against a `llama-perplexity` logits file or another run ([quality.md](quality.md)) |
+| `tools/lcb_gen.py OUT.jsonl --data test6.jsonl` | LiveCodeBench code generation with the harness's prompt against any OpenAI-compatible endpoint (`LCB_AUTH`, `--think`, `--workers`, `--openrouter`) |
+| `tools/lcb_grade.py` | grades it with the harness's checker; run it in a container without network (command in the file) |
 | `tools/make_comparison_chart.py` | redraws `docs/comparison-light.svg` and `-dark.svg` (the README image) from the numbers in the script |

@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 504" width="1000" height="504" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="This build against upstream Strata v0.2.13 on the same PC: six measurements">
-<rect width="1000" height="504" rx="10" fill="#1a1a19"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 746" width="1000" height="746" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="This build against upstream Strata v0.2.13 on the same PC: six speed measurements and three output quality checks">
+<rect width="1000" height="746" rx="10" fill="#1a1a19"/>
 <text x="30" y="42" font-size="22" font-weight="600" fill="#f0efec">Same PC, same model files: this build against upstream Strata</text>
 <text x="30" y="66" font-size="13.5" fill="#c3c2b7">RTX 5090 + RTX 4070 Ti SUPER, 31 GB of RAM. Qwen3.8-Flash-Next UD-IQ3_XXS at the full 262,144-token context.</text>
 <rect x="30" y="82" width="12" height="12" rx="2" fill="#3987e5"/>
@@ -66,6 +66,42 @@
 <path d="M736,374 h41.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-41.0 z" fill="#d95926"/>
 <text x="788.0" y="385.5" font-size="13" font-weight="600" fill="#f0efec">9 / 30</text>
 <text x="736" y="420" font-size="12.5" fill="#c3c2b7">21 more passed</text>
-<text x="30" y="470" font-size="11.5" fill="#898781">Measured 2026-11-10, each server freshly started at the login screen, thinking off, temperature 0. Upstream: both cards, 262,144 context,</text>
-<text x="30" y="486" font-size="11.5" fill="#898781">images on, every other setting its own default. One run per bar (decode: 3 runs here, 2 upstream). Details: docs/benchmarks.md</text>
+<line x1="30" y1="448" x2="970" y2="448" stroke="#383835" stroke-width="1"/>
+<text x="30" y="476" font-size="17" font-weight="600" fill="#f0efec">Output quality of this build</text>
+<rect x="380" y="465" width="12" height="12" rx="2" fill="#898781"/>
+<text x="398" y="476" font-size="13" fill="#f0efec">Reference, named on each bar</text>
+<text x="30" y="510" font-size="15" font-weight="600" fill="#f0efec">Perplexity</text>
+<text x="30" y="528" font-size="12" fill="#898781">25,500 WikiText-2 tokens, lower is better</text>
+<line x1="96" y1="542" x2="96" y2="600" stroke="#383835" stroke-width="1"/>
+<text x="30" y="559.5" font-size="12" fill="#c3c2b7">This build</text>
+<path d="M96,548 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#3987e5"/>
+<text x="253.0" y="559.5" font-size="13" font-weight="600" fill="#f0efec">3.2115</text>
+<text x="30" y="587.5" font-size="12" fill="#c3c2b7">llama.cpp</text>
+<path d="M96,576 h145.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-145.8 z" fill="#898781"/>
+<text x="252.8" y="587.5" font-size="13" font-weight="600" fill="#f0efec">3.2079</text>
+<text x="96" y="622" font-size="12.5" fill="#c3c2b7">0.11% apart</text>
+<text x="350" y="510" font-size="15" font-weight="600" fill="#f0efec">Same top token as llama.cpp</text>
+<text x="350" y="528" font-size="12" fill="#898781">percent of 25,500 positions, higher is better</text>
+<line x1="416" y1="542" x2="416" y2="600" stroke="#383835" stroke-width="1"/>
+<text x="350" y="559.5" font-size="12" fill="#c3c2b7">This build</text>
+<path d="M416,548 h145.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-145.8 z" fill="#3987e5"/>
+<text x="572.8" y="559.5" font-size="13" font-weight="600" fill="#f0efec">95.1%</text>
+<text x="350" y="587.5" font-size="12" fill="#c3c2b7">Untuned</text>
+<path d="M416,576 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#898781"/>
+<text x="573.0" y="587.5" font-size="13" font-weight="600" fill="#f0efec">95.2%</text>
+<text x="416" y="622" font-size="12.5" fill="#c3c2b7">not token-identical, tuned or not</text>
+<text x="670" y="510" font-size="15" font-weight="600" fill="#f0efec">LiveCodeBench v6</text>
+<text x="670" y="528" font-size="12" fill="#898781">problems solved of 175, thinking off, higher is better</text>
+<line x1="736" y1="542" x2="736" y2="600" stroke="#383835" stroke-width="1"/>
+<text x="670" y="559.5" font-size="12" fill="#c3c2b7">This build</text>
+<path d="M736,548 h134.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-134.6 z" fill="#3987e5"/>
+<text x="881.6" y="559.5" font-size="13" font-weight="600" fill="#f0efec">109 / 175</text>
+<text x="670" y="587.5" font-size="12" fill="#c3c2b7">API</text>
+<path d="M736,576 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#898781"/>
+<text x="893.0" y="587.5" font-size="13" font-weight="600" fill="#f0efec">118 / 175</text>
+<text x="736" y="622" font-size="12.5" fill="#c3c2b7">62.3% against 67.4%, p = 0.12</text>
+<text x="30" y="680" font-size="11.5" fill="#898781">Measured 2026-11-10, each server freshly started at the login screen, thinking off, temperature 0. Upstream: both cards, 262,144 context,</text>
+<text x="30" y="696" font-size="11.5" fill="#898781">images on, every other setting its own default. One run per bar (decode: 3 runs here, 2 upstream). Details: docs/benchmarks.md</text>
+<text x="30" y="712" font-size="11.5" fill="#898781">Quality: llama.cpp on the same files; Untuned = this build with its tuning switches off; API = the hosted Qwen3.8 Flash at full size,</text>
+<text x="30" y="728" font-size="11.5" fill="#898781">against this 3.5-bit quant (a gap inside the noise of 175 problems). Details: docs/quality.md</text>
 </svg>

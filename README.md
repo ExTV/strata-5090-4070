@@ -9,7 +9,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/comparison-dark.svg">
-  <img src="docs/comparison-light.svg" alt="This build against upstream Strata v0.2.13 on the same PC: decode 251 vs 85 tokens per second, a 20K prompt in 10.3 vs 65 seconds, 80K in 15.4 vs 89.2, 250K in 46.7 vs 257.4, a turn in a 256K chat in 2.1 vs 12.7 seconds, tool-call probe 30 of 30 vs 9 of 30">
+  <img src="docs/comparison-light.svg" alt="This build against upstream Strata v0.2.13 on the same PC: decode 251 vs 85 tokens per second, a 20K prompt in 10.3 vs 65 seconds, 80K in 15.4 vs 89.2, 250K in 46.7 vs 257.4, a turn in a 256K chat in 2.1 vs 12.7 seconds, tool-call probe 30 of 30 vs 9 of 30. Output quality of this build: perplexity 3.2115 vs 3.2079 for llama.cpp on the same files, the same top token as llama.cpp on 95.1% of positions, LiveCodeBench v6 109 of 175 vs 118 for the hosted API">
 </picture>
 
 A patched build and a tuned config of [Strata](https://github.com/Niko1221/Strata) for one specific box: a
@@ -32,7 +32,7 @@ git clone https://github.com/ExTV/strata-5090-4070.git && cd strata-5090-4070
 launchers/flash-next-262k.sh    # serves http://127.0.0.1:8888/v1
 ```
 
-[Benchmarks](docs/benchmarks.md) · [How it works](docs/how-it-works.md) · [Tuning](docs/tuning.md) ·
+[Benchmarks](docs/benchmarks.md) · [Quality](docs/quality.md) · [How it works](docs/how-it-works.md) · [Tuning](docs/tuning.md) ·
 [Patches](docs/patches.md) · [Tools](docs/tools.md) · [Issues](https://github.com/ExTV/strata-5090-4070/issues)
 
 ## Performance
@@ -58,6 +58,23 @@ each server freshly started at the login screen, thinking off, temperature 0.
 - The needle hidden in each long prompt came back on both
 - One run per row unless several values are listed. How each gain was found:
   [docs/benchmarks.md](docs/benchmarks.md); older builds and quants: [docs/history.md](docs/history.md)
+
+## Output quality
+
+Measured 2026-11-10 on the shipped config. Methods and every row: [docs/quality.md](docs/quality.md).
+
+| Check | Reference | This build |
+| --- | --- | --- |
+| Perplexity, 25,500 WikiText-2 tokens, same model files | llama.cpp: 3.2079 | 3.2115 (+0.11%) |
+| Same most likely token as llama.cpp | | 95.1% |
+| LiveCodeBench v6, 175 problems, thinking off | Qwen3.8 Flash API: 118 (67.4%) | 109 (62.3%) |
+
+- Perplexity matches llama.cpp on the same files; the output is not token-for-token the same, with this
+  repository's tuning (95.1%) or without it (95.2%)
+- The tuning switches reorder the math and are not bit-exact: 96.7% the same top token as with them off, at
+  equal perplexity
+- LiveCodeBench compares a 3.5-bit quant with the hosted model; 175 problems put the 5-point gap inside the
+  noise (p = 0.12), and it does not isolate the speed work
 
 ## Requirements
 
@@ -167,6 +184,7 @@ All talk to `127.0.0.1:8888` unless `STRATA_URL` is set. The full list: [docs/to
 | `tools/prompt_bench.py WORDS...` | fresh prompts with a hidden needle (`23700 74000` = 80K and 250K tokens) |
 | `tools/grow_chat.py [LIMIT]` | one chat grown to the context limit: seconds per turn, decode, available RAM |
 | `tools/tool_probe.py [N] [TAG]` | the two-turn agent tool-call probe |
+| `tools/engine_logprobs.py` | per-token log-probabilities from the engine: perplexity, and agreement with llama.cpp |
 | `tools/make_comparison_chart.py` | redraws the image at the top from the numbers in the script |
 
 ## Status
