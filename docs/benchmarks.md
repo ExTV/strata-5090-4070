@@ -748,3 +748,88 @@ decodes at 177-186 tok/s, so it is the long session's history, not the length al
 `tools/strata_bench.py --long`, the shipped config, already running: short chat 186.3 tok/s (153.7-254.8),
 TTFT 0.28 s; 4K 2,446 tok/s, 16K 3,917 tok/s, 32K 4,159 tok/s (7.74 s); agent session follow-ups 1.31 s TTFT,
 173.5 tok/s, 70.0% cache hit. Full report: [strata-bench-2026-10-23](strata-bench-2026-10-23/README.md).
+
+
+## Unsloth UD-IQ3_XXS and the Q8_0 PLE table (2026-11-04)
+
+Same build, same session, both at 196K and split 40: UD-IQ3_XXS 11.76 ms per verify window (224.5 tok/s median),
+IQ3_S 11.16 (225.7); the tool-call probe 28/30 against 22/30. Unsloth's files leave the 4070 about 400 MiB more
+room, so split 39 holds every expert of layers 39-47 there with ~915 MiB free.
+
+| Arm on UD-IQ3_XXS (window bench twice, 5 decodes, 2K / 16K / 80K fresh prompts) | ms/window | decode median | 80K |
+| --- | --- | --- | --- |
+| split 40, `--prefill auto:16384` | 11.62 / 11.70 | 171 / 158 tok/s | 20.4 / 19.7 s |
+| `--prefill auto:8192` | noise | | 17.7 s |
+| split 39 | | 194 tok/s | |
+| **split 39 + `auto:8192`** (shipped until 2026-11-10) | 11.21 / 11.13 | 195 / 190 tok/s | 18.1 / 18.0 s |
+| `--vision` off, `--adapt-every 2 --adapt-swaps 192 --adapt-decay 0.92` | no gain | | |
+
+The PLE table: FP8 E4M3 has one scale for the whole table, so its relative RMSE against Unsloth's BF16 table is
+0.0265 (3,000 random rows); Unsloth's Q8_0 table measures 0.0053, Q5_1 0.0376, IQ4_NL 0.0757. The Q8_0 table is
+3.2 GB larger than FP8 (54.4 GB) and replaced it. Its effect on answers was not measured separately.
+
+`STRATA_HC_Q8=1`, which upstream recommends for Unsloth files on CUDA, garbles output on this layer-split build
+(tool-call arguments with stray tags, empty stops); the config sets it to 0.
+
+262,144 tokens with nothing swapped out, which failed on IQ3_S with 31 GB: a conversation grown to 257K in 56
+turns took 2.7-3.75 s per turn (~3.7K tokens each), decode mean 201 tok/s, lowest MemAvailable 2.36 GB, 868
+pages swapped box-wide, all in the first turns; a fresh 253.8K needle prompt 51.6 s, correct.
+
+## Prompt slots in RAM and thread placement (2026-11-10, UD-IQ3_XXS)
+
+All on fresh boots at the login screen (28.3-29.7 GB available before the boot, the 5090 at 104 MiB), one boot
+per arm: `tools/window_bench.py`, then `tools/prompt_bench.py 23700 74000`.
+
+### What the prompt path borrows
+
+The boot log of the 2026-11-04 config said it: `the prompt path borrows 1543 slots (ring 96 slots at chunk
+8192), 193 of them keep their experts in RAM too` and `1350 of the 1543 borrowed slots have no RAM copy: their
+experts are streamed from the model file during every chunk`. Decode was already complete: 13,180 slots on the
+5090, 4,608 on the 4070, and the 12.83 GiB of experts outside VRAM all inside the 13.2 GiB RAM budget.
+
+| Arm | Borrowed slots / with a RAM copy | ms/window | 20K | 80K | 250K | SSD read: window bench / long prompts | Lowest MemAvailable |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `--prefill auto:8192`, budget 13.2 | 1,543 / 193 | 11.35 | 13.0 s | 18.4 s | 50.1 s | 25.9 / 132.9 GB | 4.1 GB |
+| `--prefill 4096` | 962 / 193 | 11.52 | 11.8 | 16.9 | 49.4 | 26.0 / 144.7 | 3.1 |
+| budget 14.4 | 1,549 / 823 | 11.07 | 12.2 | 17.3 | 49.0 | 14.6 / 79.6 | 1.8 |
+| **`--prefill 4096`, budget 14.7** | 962 / all | 11.02 | **10.3** | **15.4** | **46.9** | **3.3 / 18.6** | 2.2 |
+| `--prefill 2048`, budget 13.9 | 681 / 560 | 11.30 | 11.2 | 17.0 | | 9.3 / 13.9 (80K only) | 2.8 |
+
+`--prefill auto:4096` boots with chunk 8192: `auto` takes the largest chunk up to 8192 and `auto:N` only raises
+that cap. The needle was returned from every prompt.
+
+### Thread placement on a hybrid CPU
+
+i7-14700K (8 P-cores, 12 E-cores). The engine takes 13 pool workers (the P-cores but one and half of the
+E-cores) and by default leaves its other threads where they were created.
+
+| Arm (on `--prefill 4096`, budget 14.7) | ms/window, median of 7 | tok/s median | 80K |
+| --- | --- | --- | --- |
+| default | 11.02, 11.11 (pool on P-cores only) | 241, 243 | 15.4 s |
+| `--aux-cpus auto` (72 threads to CPUs 1, 22-27) | 10.59, 10.49 | 246, 251 | 15.4 s |
+| `--aux-cpus auto --pool-affinity p-cores` | 10.31 | 252 | 15.4 s |
+| **`--aux-cpus auto --host-core sibling`** | **10.21, 10.17, 10.19** | 250, 251, 254 | 15.4-15.5 s |
+
+`--aux-cpus auto` measured neutral here on the v0.1.41 build (2026-10-09), when the pool took 19 workers and
+left only one CPU for 23 helper threads.
+
+### The shipped config after both
+
+250K fresh prompt 46.7 s (needle correct), 170 tok/s right after it, 233 on the follow-up; 14.2 GB read from the
+SSD. A conversation grown to 255.7K tokens in 56 turns (`tools/grow_chat.py`): every turn 2.0-2.5 s, decode
+mean 174 tok/s, nothing swapped out, lowest MemAvailable 1.68 GB, the service's memory peak 25.7 GiB, 5.1 GB
+read from the SSD over the whole conversation. Tool-call probe 30/30. An image request 0.8 s.
+
+A profile of this config (`STRATA_PREFILL_TIMING`, `STRATA_DECODE_TIMING`): an 80K prompt spends 15.0 s of GPU
+time on the 5090's 39 layers (embed and steps 21%, gate/up GEMM 18%, waiting on expert copies 10%, GDN 10%, the
+hyper-connection read 8%), and the 4070 reads its 9 layers in about 0.83 s per 4,096 tokens, fed at the 5090's
+pace. Decode: 7.1-7.9 ms of a window on the 5090 stage, about 3.2 on the 4070, 0.8-1.0 ms of host work per
+window (experts computed on the CPU from the RAM copy: 0.5 entries per layer and window).
+
+### Booted under a desktop instead
+
+The 2026-11-04 config started with KDE and a browser open (21.5 GB available, 941 MiB of the 5090 in use): the
+engine clamps its own RAM budget (`--resident-budget-gib 13.20 exceeds available RAM`) to 11.52 GiB, 2.24 GiB
+of decode experts come from the file, the 5090 holds 12,693 slots instead of 13,180. 14.31 ms per window
+(176.5 tok/s median) against 11.35, a 202.7K prompt in 49.0 s, 3.6 GB of desktop memory pushed to zram at boot,
+0.8-1.8 GB available. It works; it is not what the config is sized for.

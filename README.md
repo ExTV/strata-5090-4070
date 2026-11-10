@@ -11,15 +11,16 @@ A patched build of [Strata](https://github.com/Niko1221/Strata) for one specific
 a 32 GB card, a 16 GB card in a chipset x1 slot, and less RAM than the expert file. This is the
 exact setup that serves my own agents every day; what is here is what runs.
 
-- **Upstream Strata v0.2.1** plus 5 patches: our dual-GPU series merged onto it, one upstream PR, one upstream commit and our own fixes
-- **ISTA GSQ-RCO IQ3_S** (the quality tier that still keeps every decode expert off the SSD here), with the
-  IQ3_XXS config kept as the faster alternative
-- **186 tok/s decode** median on IQ3_S (154-255 over short chats, 174 inside agent sessions), prompts up to
-  **4,160 tok/s** (32K in 7.7 s), a 183K-token prompt read in **49 s** and decoded at 177-186 tok/s after it
-- Decode never touches the SSD: the experts no card holds sit page-locked in RAM, and that RAM copy follows
-  the traffic between requests (placement saved across restarts)
-- Switching between conversations restores the parked one in **0.7-1.4 s**; a 200K conversation too big
-  to park goes to the SSD and comes back in **2.8-2.9 s** instead of a 61 s re-read
+- **Upstream Strata v0.2.1** plus 8 patches: our dual-GPU series merged onto it, upstream PRs and commits it
+  does not have yet, and our own fixes
+- **Unsloth V3.1 UD-IQ3_XXS** with Unsloth's Q8_0 PLE table (the shipped config since 2026-11-04); the ISTA
+  GSQ-RCO IQ3_S and IQ3_XXS configs are kept
+- **250 tok/s decode** median over short answers (10.2 ms per verify window), 174 tok/s mean inside a
+  conversation grown to 256K tokens; fresh prompts: 20K in **10.3 s**, 80K in **15.4 s**, 250K in **46.7 s**
+- Decode never touches the SSD: the experts no card holds sit page-locked in RAM, and so does every cache slot
+  the prompt path borrows, so a 250K prompt reads 14 GB from the SSD instead of 133 GB
+- A conversation grown turn by turn to 256K tokens answers every turn in **2.0-2.5 s** with nothing swapped out
+  on 31 GB of RAM (no parking, spill or prefix store in this config; the IQ3_S config still has them)
 - The image encoder runs on the 4070, so the 5090 keeps more experts; the draft layer's prompt K/V is computed
   on the 5090 too, so long prompts no longer wait on the x1 link
 - Agent-friendly: tool calls parsed **44/60** on a probe that edits a file documenting the call format (21/60
@@ -34,7 +35,7 @@ exact setup that serves my own agents every day; what is here is what runs.
 git clone https://github.com/ExTV/strata-5090-4070.git && cd strata-5090-4070
 ./install.sh                    # clone Strata v0.2.1, apply patches, build engine + vision helper, venv
 # download the model (step 2 below), then:
-./prepare.sh                    # dense pack + MTP drafter + the Sharp chat template at xhigh
+./prepare.sh                    # dense pack, MTP drafter, the Sharp chat template at xhigh, the Q8_0 PLE table
 launchers/flash-next-262k.sh    # serves http://127.0.0.1:8888/v1
 ```
 
@@ -42,7 +43,31 @@ launchers/flash-next-262k.sh    # serves http://127.0.0.1:8888/v1
 
 ## Performance
 
-### Upstream's own benchmark suite (v0.2.1 build, IQ3_S, 2026-10-23)
+### The shipped config (UD-IQ3_XXS, 2026-11-10, fresh boot at the login screen)
+
+`tools/window_bench.py` (7 short answers of 600 tokens and one 20K prompt, thinking off, temperature 0),
+`tools/prompt_bench.py` (fresh random-word prompts with a needle) and `tools/grow_chat.py` (one conversation
+grown to the context limit). "Before" is the same build and model with the 2026-11-04 settings
+(`--prefill auto:8192`, RAM budget 13.2 GiB, no thread placement), measured the same day.
+
+| | Before | Shipped |
+| --- | --- | --- |
+| decode, ms per verify window (median of 7) | 11.35 | **10.17-10.21** (3 runs, 2 boots) |
+| decode, tok/s (median of 7) | 231.5 | **250-254** |
+| 20K fresh prompt | 13.0 s | **10.3 s** |
+| 80K fresh prompt | 18.4 s | **15.4 s** |
+| 250K fresh prompt | 50.1 s | **46.7 s** |
+| read from the SSD, 80K + 250K prompts | 132.9 GB | 18.6 GB |
+| conversation grown to 256K, per turn | 2.7-3.75 s (2026-11-04, ~3.7K new tokens per turn) | **2.0-2.5 s** (~4.5K per turn) |
+| swapped out over that conversation | 0 | 0 |
+| lowest MemAvailable over that conversation | 2.36 GB (2026-11-04) | 1.68 GB |
+
+The needle came back from every long prompt; the tool-call probe (`tools/tool_probe.py 30`) passed 30 of 30 on
+the shipped config (28 of 30 on 2026-11-04, 22 of 30 on IQ3_S the same day). One run per row unless stated;
+identical boots differ by about 1.5% per verify window. Where each gain comes from:
+[docs/benchmarks.md](docs/benchmarks.md#prompt-slots-in-ram-and-thread-placement-2026-11-10-ud-iq3_xxs).
+
+### Upstream's own benchmark suite (v0.2.1 build, IQ3_S config, 2026-10-23)
 
 `tools/strata_bench.py --long` from Strata v0.2.1 against the running server (the shipped config, thinking off,
 temperature 0, 3 runs per test, medians with ranges). Full report:
@@ -131,12 +156,14 @@ Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 
 - **GPUs:** an RTX 5090 (or another 32 GB Blackwell card) plus a 16 GB NVIDIA card; the second one can sit on a chipset x1 slot.
   The layer split (39) and the VRAM reserves are sized for exactly 32 + 16 GB.
-- **RAM:** 32 GB plus zram swap. With the model up, about 1-2 GB stays available and some engine memory
-  sits in zram. Headless box: no RAM or VRAM is left for a desktop.
-- **Disk:** a fast NVMe with ~135 GB free for IQ3_S (55 GB of experts, the 29 GB shard 2 and the 51 GB FP8 PLE
-  table), ~127 GB for IQ3_XXS, another 52 GB while `prepare.sh` builds the table (deleted after), plus up to
-  32 GB for conversations spilled to disk
-  (`--conversation-spill-mib`, default 32768; the oldest file goes first).
+- **RAM:** 32 GB. With the shipped config up, 3 GB stays available at idle and 1.7 GB at the end of a 256K
+  conversation, with nothing swapped out. It is sized for a boot at the login screen: started under a desktop
+  with a browser open the engine shrinks its RAM copy by itself (11.5 instead of 14.7 GiB here), reads the rest
+  from the SSD and decodes about 26% slower per window.
+- **Disk:** a fast NVMe with ~140 GB free for UD-IQ3_XXS (55 GB of experts in shards 2-3, the 29 GB shard 4 and
+  the 54 GB Q8_0 PLE table); ~135 GB for IQ3_S (55 GB of experts, the 29 GB shard 2 and the 51 GB FP8 PLE
+  table) plus 52 GB while `prepare.sh` builds that table (deleted after) and up to 32 GB for conversations
+  spilled to disk (`--conversation-spill-mib`, the IQ3_S config only).
 - **Software:** Linux, NVIDIA driver, CUDA toolkit (`nvcc`), `cmake`, `ninja`, `git`, `patch`, `curl`, Python 3.10+.
 
 ## Install
@@ -149,7 +176,8 @@ Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 
 - Clones upstream Strata at tag v0.2.1 into `./strata` and applies `patches/` in order
 - Builds the engine and the vision helper for sm_89 + sm_120, creates the venv
-- Writes `strata/strata-flash-next-262k.json` (IQ3_S) and `strata/strata-flash-next-iq3xxs-262k.json`
+- Writes `strata/strata-flash-next-ud-iq3xxs-262k.json` (Unsloth UD-IQ3_XXS, the shipped config),
+  `strata/strata-flash-next-262k.json` (IQ3_S) and `strata/strata-flash-next-iq3xxs-262k.json`
 - Checks the patched files against `patches/MANIFEST.sha256` (the tested tree)
 - Safe to re-run
 
@@ -164,10 +192,25 @@ Every run, A/B and rejected knob: [docs/benchmarks.md](docs/benchmarks.md).
 
 ```bash
 strata/.venv/bin/pip install -U huggingface_hub
-strata/.venv/bin/hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "IQ3_S/*" "mmproj-*" --local-dir models
+strata/.venv/bin/hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-IQ3_XXS/*" --local-dir models
+strata/.venv/bin/hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "mmproj-*" --local-dir models
 strata/.venv/bin/hf download alesha-pro/Qwen3.8-Flash-Next-abliterated-GSQ-RCO-Strata-GGUF Huihui-Qwen3.8-Flash-Next-refusal-direction-r.gguf --local-dir models
 ./prepare.sh
 ```
+
+- UD-IQ3_XXS is four shards: 1 is the vocabulary (11 MB), 2 and 3 the experts (read in place), 4 Unsloth's
+  IQ4_NL PLE table (28.8 GB). The config reads the Q8_0 table instead, but shard 4 must still exist (shard 1
+  declares a four-file split). The image encoder weights are ISTA's `mmproj` file (the one tested here)
+- `prepare.sh` builds the pack `packs/unsloth-ud-iq3_xxs-v31` with `iq_pack.py --compat-bf16`, downloads
+  Unsloth's standalone Q8_0 PLE table (`engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file`, 54.4 GB) to
+  `models/ple-q8_0.gguf` and patches 82 bytes of its header so v0.2.1 loads it through `--ple-gguf`
+  (`tools/ple_header_patch.py`; `--restore` undoes it). Against the BF16 table its relative RMSE is 0.0053; the
+  FP8 table's is 0.0265 and IQ4_NL's 0.0757
+- Keep `"STRATA_HC_Q8": "0"` in this config: with the Q8 hyper-connection read on, this build garbles tool-call
+  arguments on the layer split
+
+For the ISTA quants instead: download `"IQ3_S/*"` (or `"IQ3_XXS/*"`) from the ISTA repository as well and run
+`QUANT=IQ3_S ./prepare.sh`; then:
 
 - Shard 1 (55 GB, the experts) is read in place. Shard 2 (28.8 GB) is ISTA's IQ4_NL PLE table; the configs read
   the FP8 table instead, but shard 2 must still exist (shard 1 declares a two-file split). For the IQ3_XXS config
@@ -190,7 +233,7 @@ launchers/flash-next-262k.sh
 ```
 
 - Serves `http://127.0.0.1:8888/v1`: OpenAI chat completions and Anthropic messages, model name `qwen3.8-flash-next`
-- Overrides: `CONFIG=strata-flash-next-iq3xxs-262k.json` for the IQ3_XXS config, `PORT=`, `HOST=`
+- Overrides: `CONFIG=strata-flash-next-262k.json` (IQ3_S) or `strata-flash-next-iq3xxs-262k.json`, `PORT=`, `HOST=`
 - Sampling defaults 1.0 / 0.95 / 20, min_p 0, presence_penalty 0 (the model card's thinking set); per-request
   drafter tuning with `"strata_tune": {"spec_min_p": 0.8}`. Keep `presence_penalty: 0.0` in the config: v0.2.1
   merges the model card's sampling per key, which gives thinking-off requests `presence_penalty 1.5`; that
@@ -207,7 +250,7 @@ launchers/flash-next-262k.sh
 ## What is in the patch series
 
 Each patch is one tested step, conflict resolutions included; applied to v0.2.1 they rebuild the tested tree
-byte for byte (46 files, `patches/MANIFEST.sha256`).
+byte for byte (48 files, `patches/MANIFEST.sha256`).
 
 | # | Source | What it does |
 | --- | --- | --- |
@@ -216,6 +259,9 @@ byte for byte (46 files, `patches/MANIFEST.sha256`).
 | 03 | upstream 70f42407 (#3441, #3075) | a tool call counts only when it names a declared tool (anything else goes back as text, so a client never runs a tool it did not offer); an envelope that drifted by a token (`<=NAME>`, `<function:NAME>`, `<NAME>`) is read as the call when NAME is declared; unread `<tool_call>` blocks are counted in the server window |
 | 04 | ours | the SSD spill: a request that picked another conversation's spill to restore no longer lets the outgoing conversation's park delete that file first (conversations that share a system prompt and tools match each other's checkpoints; with `--short-read 128` the tool probe crashed the engine 3 times on `spill-N.ses: No such file`, 0 after the fix in 114 spill reads); new `--no-conversation-spill-idle` writes a spill only when another conversation comes in, not ahead of it while idle (the switch pays the write, 0.2-0.7 s) |
 | 05 | ours | under `--prefill-main` prompt parts with pictures chain split-wise like text (the picture rows replace the token embedding at layer 0 on the 5090, every stage holds the image positions); before, every image part ran whole-model on the 5090 and streamed the 4070's 9.6 GiB of experts from the SSD: OCR crop (1,199 tokens) 5.13 s / 10.75 GB -> 1.23 s / 0.32 GB, full page 3.02 s / 10.35 GB -> 1.31 s / 0.04 GB, an image inside a 34K conversation 2.88 s / 7.24 GB -> 1.65 s / 0.01 GB; OCR answers identical |
+| 06 | upstream #3470, #3350, #3602 | three upstream fixes that came after v0.2.1: copy streams and events of short-lived threads go back to a pool instead of leaking a few MiB of VRAM on the later card per long cold prompt (#3470); a conversation checkpoint whose copy ran out of memory is skipped instead of ending the request (#3350, upstream f62589fd); a PLE read that failed no longer leaves the next ticket waiting for ever (#3602, upstream ebe3383a) |
+| 07 | PR #4844 | with `--pipeline-windows 2` and `--adapt-async 1` on a layer split, an adaptive round finished after the pipelined loop marked a stale range, so newly placed experts ended up in neither VRAM nor RAM and were read from the file: decode drifted down over hours until a restart. Two lines; in upstream since v0.2.12 |
+| 08 | PR #5108 | the MMQ row table gets room for ggml's stream-k fixup read, which ran past its end on long prompts on the second card of a layer split (`prefill copy_i32: illegal memory access`). In upstream since v0.2.12 |
 
 Measured and left out on v0.2.1: the PR #3453-style sm_89 MMVQ table re-tuned on the 4070 Ti SUPER (bitwise
 parity on both cards, decode neutral: the 4070 holds 9 of 48 layers); `STRATA_UNBUFFERED_LOAD=1` with an explicit
@@ -223,6 +269,20 @@ parity on both cards, decode neutral: the 4070 holds 9 of 48 layers); `STRATA_UN
 [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Tuning in the shipped config
+
+The UD-IQ3_XXS config differs from the IQ3_S one (the table below) in these settings:
+
+| Setting | Why |
+| --- | --- |
+| `--prefill 4096` with `--resident-budget-gib 14.7` | the prompt path borrows expert-cache slots from the 5090 and gives them back after the prompt; a borrowed slot whose expert has no RAM copy is streamed from the SSD on every chunk. At chunk 8192 it borrows 1,543 slots and 13.2 GiB held 193 of them; at 4096 it borrows 962 and 14.7 GiB holds them all (12.83 GiB of experts outside VRAM + 1.87 GiB for the loan). Either change alone is a few percent; together 80K 18.4 -> 15.4 s and SSD reads -85%. `--prefill auto:4096` is not the same thing: `auto` never picks below 8192 |
+| `--aux-cpus auto --host-core sibling` | on a hybrid CPU (8P+12E here) the engine takes 13 pool workers, which leaves CPUs free: its 72 helper threads (the CUDA driver's, the adaptive tier's, the prompt helpers) move to those, and the host thread to the first core's SMT sibling. Threads only, never a result: 11.0-11.1 -> 10.5-10.6 ms per window with `--aux-cpus auto`, 10.2 with both |
+| `--conversation-cache-mib 0`, no spill or prefix directory | parking, the SSD spill and the prefix store are off: on 31 GB they cost RAM the 256K conversation needs, and a same-chat follow-up is reused from the live state anyway. Switching chats re-reads the other one |
+| `--ple-gguf .../ple-q8_0.gguf` | Unsloth's Q8_0 PLE table, five times closer to BF16 than the FP8 one |
+| `"STRATA_HC_Q8": "0"` | see step 2 |
+| `STRATA_GR_NORM_FAST`, `SCORES_HALVE`, `TOPK_SPLIT`, `QIL`, `SIDE_MIXER=2`, `ATTN_DAILY`, `GU_SWIGLU`, `GR_UP75`, `GR_DOWN_TG`, `FUSE_HEAD_GR`, `LFUSE`, `GR_V3`, `IO_THREADS=64`, `UNBUFFERED_LOAD` | upstream's opt-in kernels and readers that measured faster here (on IQ3_S, 2026-10-23): decode about -4.5% per window, 80K prompts -9%. All bitwise except `GR_V3` (the hyper-connection read in another FP32 summation order) |
+
+Measured and not kept on this config: `--prefill 2048` (80K 17.0 s), `--pool-affinity p-cores` (neutral),
+RAM budget 14.4 at chunk 8192 (covers 823 of 1,549 borrowed slots; 80K 17.3 s and 1.3 GB less RAM margin).
 
 | Setting | Why |
 | --- | --- |
@@ -285,13 +345,21 @@ All talk to `127.0.0.1:8888` unless `STRATA_URL` is set.
 | `tools/agent_steps.py TAG [SEED]` | a 13K first message and four tool-result follow-ups (1.5K / 2.4K / 5.4K / 0.5K tokens): prompt seconds and SSD GB per step (the chained-read gate; `NVME=` names the device) |
 | `strata/tools/strata_bench.py --url http://127.0.0.1:8888 --long` | upstream's own suite (short chat, 4K / 16K / 32K prompts, a 5-turn agent session): the report in `docs/strata-bench-2026-10-23/` |
 | `tools/snapshot.py` | page faults, swap, direct reclaim, NVMe, GPU counters; diff them around a run |
+| `tools/prompt_bench.py WORDS...` | fresh random-word prompts with a needle and a follow-up (`23700 74000` = 80K and 250K tokens) |
+| `tools/grow_chat.py [LIMIT]` | one conversation grown to the context limit, ~4.5K tokens of source per turn: seconds per turn, decode, MemAvailable |
+| `tools/ple_header_patch.py FILE` | makes Unsloth's standalone PLE table loadable through `--ple-gguf` (run by `prepare.sh`) |
 
 ## Status
 
 - The patch series is checked in CI against a pristine v0.2.1 checkout.
-- The IQ3_S config is what runs here every day; the IQ3_XXS config was carried forward with the same changes
-  and has not been booted on the v0.2.1 build.
-- `install.sh` and `prepare.sh` have not been run end to end from a clean checkout yet; reports welcome.
+- The UD-IQ3_XXS config is what runs here every day (since 2026-11-04; these settings since 2026-11-10). The
+  IQ3_S config ran here until then; the ISTA IQ3_XXS config was carried forward and has not been booted on the
+  v0.2.1 build.
+- `install.sh` and `prepare.sh` have not been run end to end from a clean checkout yet, and the UD-IQ3_XXS
+  steps of `prepare.sh` (the pack, the Q8_0 table download) were done by hand here, not through the script;
+  the header patch tool was checked against the real file. Reports welcome.
+- Upstream is at v0.2.13. This build stays on v0.2.1 on purpose: layer splits like this one report slower
+  prompts and decode on the newer engines, and the two fixes that mattered here (patches 07 and 08) are carried.
 
 ## License
 

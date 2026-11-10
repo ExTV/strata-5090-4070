@@ -2,7 +2,7 @@
 # Clones upstream Strata at the v0.2.1 tag into ./strata, applies the patch series in patches/ (our dual-GPU
 # series merged onto v0.2.1, one upstream PR, one upstream commit and our own fixes, in the order they were merged
 # and tested), builds the engine and the vision helper for an RTX 5090 (sm_120) + RTX 4070 Ti SUPER (sm_89), makes
-# the Python venv, and writes the two server configs from configs/*.json.in with $MODELS filled in.  Safe to
+# the Python venv, and writes the three server configs from configs/*.json.in with $MODELS filled in.  Safe to
 # re-run: patches already applied are skipped and cmake only rebuilds what changed.  The expert pack, the MTP
 # drafter and the chat template are prepared by prepare.sh.
 set -euo pipefail
@@ -60,13 +60,13 @@ cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAM
       -DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
 cmake --build build-vision --target strata-vision -j"$JOBS"
 
-for c in flash-next-262k flash-next-iq3xxs-262k; do
+for c in flash-next-ud-iq3xxs-262k flash-next-262k flash-next-iq3xxs-262k; do
     MODELS="$MODELS" python3 -c 'import os,sys; sys.stdout.write(open(sys.argv[1]).read().replace("@MODELS@", os.environ["MODELS"]))' \
         "../configs/$c.json.in" > "strata-$c.json"
 done
 echo "$MODELS" > models.path      # prepare.sh and the launcher read it, so MODELS= is needed only here
 sha256sum -c --quiet ../patches/MANIFEST.sha256 && echo "the $(wc -l < ../patches/MANIFEST.sha256) patched files match patches/MANIFEST.sha256 (the tested tree)"
 echo
-echo "built: strata/build/strata, strata/build-vision/bin/strata-vision; configs strata/strata-flash-next-262k.json (IQ3_S) and"
-echo "       strata/strata-flash-next-iq3xxs-262k.json (IQ3_XXS), MODELS=$MODELS"
+echo "built: strata/build/strata, strata/build-vision/bin/strata-vision; configs strata/strata-flash-next-ud-iq3xxs-262k.json"
+echo "       (Unsloth UD-IQ3_XXS, the shipped one), strata-flash-next-262k.json (IQ3_S) and strata-flash-next-iq3xxs-262k.json, MODELS=$MODELS"
 echo "next: download the model into $MODELS (README step 2), then ./prepare.sh, then launchers/flash-next-262k.sh"
