@@ -787,13 +787,13 @@ The boot log of the 2026-11-04 config said it: `the prompt path borrows 1543 slo
 experts are streamed from the model file during every chunk`. Decode was already complete: 13,180 slots on the
 5090, 4,608 on the 4070, and the 12.83 GiB of experts outside VRAM all inside the 13.2 GiB RAM budget.
 
-| Arm | Borrowed slots / with a RAM copy | ms/window | 20K | 80K | 250K | SSD read: window bench / long prompts | Lowest MemAvailable |
+| Arm | Borrowed slots / with a RAM copy | ms/window | 20K | 80K | 250K | SSD read (GiB): window bench / long prompts | Lowest MemAvailable |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `--prefill auto:8192`, budget 13.2 | 1,543 / 193 | 11.35 | 13.0 s | 18.4 s | 50.1 s | 25.9 / 132.9 GB | 4.1 GB |
-| `--prefill 4096` | 962 / 193 | 11.52 | 11.8 | 16.9 | 49.4 | 26.0 / 144.7 | 3.1 |
-| budget 14.4 | 1,549 / 823 | 11.07 | 12.2 | 17.3 | 49.0 | 14.6 / 79.6 | 1.8 |
-| **`--prefill 4096`, budget 14.7** | 962 / all | 11.02 | **10.3** | **15.4** | **46.9** | **3.3 / 18.6** | 2.2 |
-| `--prefill 2048`, budget 13.9 | 681 / 560 | 11.30 | 11.2 | 17.0 | | 9.3 / 13.9 (80K only) | 2.8 |
+| `--prefill auto:8192`, budget 13.2 | 1,543 / 193 | 11.35 | 13.0 s | 18.4 s | 50.1 s | 25.3 / 129.8 | 4.1 GB |
+| `--prefill 4096` | 962 / 193 | 11.52 | 11.8 | 16.9 | 49.4 | 25.4 / 141.3 | 3.1 |
+| budget 14.4 | 1,549 / 823 | 11.07 | 12.2 | 17.3 | 49.0 | 14.3 / 77.7 | 1.8 |
+| **`--prefill 4096`, budget 14.7** | 962 / all | 11.02 | **10.3** | **15.4** | **46.9** | **3.2 / 18.1** | 2.2 |
+| `--prefill 2048`, budget 13.9 | 681 / 560 | 11.30 | 11.2 | 17.0 | | 9.0 / 13.6 (80K only) | 2.8 |
 
 `--prefill auto:4096` boots with chunk 8192: `auto` takes the largest chunk up to 8192 and `auto:N` only raises
 that cap. The needle was returned from every prompt.
@@ -815,9 +815,9 @@ left only one CPU for 23 helper threads.
 
 ### The shipped config after both
 
-250K fresh prompt 46.7 s (needle correct), 170 tok/s right after it, 233 on the follow-up; 14.2 GB read from the
+250K fresh prompt 46.7 s (needle correct), 170 tok/s right after it, 233 on the follow-up; 13.9 GiB read from the
 SSD. A conversation grown to 255.7K tokens in 56 turns (`tools/grow_chat.py`): every turn 2.0-2.5 s, decode
-mean 174 tok/s, nothing swapped out, lowest MemAvailable 1.68 GB, the service's memory peak 25.7 GiB, 5.1 GB
+mean 174 tok/s, nothing swapped out, lowest MemAvailable 1.68 GB, the service's memory peak 25.7 GiB, 5.0 GiB
 read from the SSD over the whole conversation. Tool-call probe 30/30. An image request 0.8 s.
 
 A profile of this config (`STRATA_PREFILL_TIMING`, `STRATA_DECODE_TIMING`): an 80K prompt spends 15.0 s of GPU
@@ -833,3 +833,43 @@ engine clamps its own RAM budget (`--resident-budget-gib 13.20 exceeds available
 of decode experts come from the file, the 5090 holds 12,693 slots instead of 13,180. 14.31 ms per window
 (176.5 tok/s median) against 11.35, a 202.7K prompt in 49.0 s, 3.6 GB of desktop memory pushed to zram at boot,
 0.8-1.8 GB available. It works; it is not what the config is sized for.
+
+## Against upstream v0.2.13 on the same PC (2026-11-10)
+
+Upstream at tag v0.2.13 in its own folder, installed by its own `setup.sh --family unsloth --model UD-IQ3_XXS
+--context 262144 --vision gpu --gpus 0,1 --yes` with the model files already on disk (`--gguf-dir`, all four
+shards, checksums verified by the setup): the ready-made engine 0.1.59 from the update feed, its own pack, the
+IQ4_NL PLE table of shard 4, the stock chat template. What it chose: `--expert-cache auto --prefill auto --spec 4
+--spec-min-p 0.5 --kv int8 --resident-budget-gib 8 --vram-reserve-mib 700 --pool-workers 13`, K/V streaming off
+(it wants 53 GB of RAM for it), layer split auto = layers 0-10 on the 4070 and 11-47 on the 5090 (4,373 + 10,188
+expert slots; ours 4,608 + 13,180 the other way round), 8 GiB of the 19.3 GiB of experts outside VRAM in RAM, and
+none of the 3,674 cache slots its prompt path borrows with a RAM copy. Booted at the login screen like ours;
+29.5 GB available before the boot, 12.5 GB after.
+
+| | Upstream v0.2.13 | This build (same day) |
+| --- | --- | --- |
+| window bench, ms per verify window (median of 7) | 36.34, 38.01 | 10.21, 10.17, 10.19 |
+| window bench, tok/s (median of 7) | 84.3, 86.1 | 250.1, 250.7, 253.7 |
+| draft acceptance over the 7 answers | 0.71 | 0.85 |
+| 20K fresh prompt (in the window bench) | 65.9 s, 64.1 s | 10.3 s |
+| 80K fresh prompt (79,911 / 80,065 tokens) | 89.2 s | 15.4 s |
+| 250K fresh prompt | 257.4 s | 46.7 s |
+| SSD read: one window bench | 180-184 GiB | 3.2 GiB |
+| SSD read: the 80K + 250K prompts | 761 GiB | 18 GiB |
+| chat grown to 256K, 56 turns: seconds per turn | median 12.7, max 13.9 | median 2.1, max 2.5 |
+| decode over that chat (80-token answers) | 117 tok/s mean | 174 tok/s mean |
+| lowest MemAvailable over that chat | 6.0 GB | 1.8 GB |
+| tool-call probe, 30 sequences | 9 passed | 30 passed |
+
+The needle came back from every long prompt on both, and neither swapped during the runs. Most of upstream's
+21 probe failures are the edit cut at the nested `<parameter=limit>` line (`new_string wrong:
+'<parameter=limit>25'`), which is what the parser fix in patch 01 and the Sharp template address. Upstream's
+answers in the window bench run to the 600-token limit while the Sharp template's are shorter, so compare the
+rates, not request times.
+
+Not a like-for-like engine comparison: upstream is its newest engine on its default placement for a 31 GB box,
+ours is v0.2.1 with patches and a config tuned on this exact hardware. It is what each gives on this PC today.
+
+One trap for anyone repeating this next to another Strata folder: v0.2.13's setup (even `setup.py --check`)
+moved the `packs/` and `mtp/` folders of the Strata checkout this one was a git worktree of into the shared data
+folder. Nothing was lost, but the other server did not start until they were moved back.

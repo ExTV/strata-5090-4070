@@ -1,0 +1,20 @@
+# The patch series
+
+Each patch is one tested step, conflict resolutions included; applied to v0.2.1 they rebuild the tested tree
+byte for byte (48 files, `patches/MANIFEST.sha256`).
+
+| # | Source | What it does |
+| --- | --- | --- |
+| 01 | ours + carried PRs | the whole v0.1.41 series (13 patches, see [the previous README](https://github.com/ExTV/strata-5090-4070/blob/1fa7992/README.md#what-is-in-the-patch-series)) merged onto v0.2.1 (1,770 upstream commits), 20 files / ~100 hunks resolved by hand. Upstream already had and kept: merge-v2 attention, the PromptEncoder (#567), the tail skip, the park gain (#2265), #1599, the commit batch, the lend-ring fix, the grouped resident gathers, RAM adapt (ours is gated to splits with no stages), the drafter's `mtp_first`. Ours on top: `--prefill-main` with the chained split-wise reads, the SSD spill, the prefix store under `--prefill-main`, `pread` expert copies, the PLE ticket / prefetch / early chain, slot expiry, the nested-parameter parser fix, `--kv-resident-later`, the draft K/V copy at load |
+| 02 | PR #3404 | a parked conversation's older copies are dropped when a newer one supersedes them, so the parking budget is not spent on dead snapshots |
+| 03 | upstream 70f42407 (#3441, #3075) | a tool call counts only when it names a declared tool (anything else goes back as text, so a client never runs a tool it did not offer); an envelope that drifted by a token (`<=NAME>`, `<function:NAME>`, `<NAME>`) is read as the call when NAME is declared; unread `<tool_call>` blocks are counted in the server window |
+| 04 | ours | the SSD spill: a request that picked another conversation's spill to restore no longer lets the outgoing conversation's park delete that file first (conversations that share a system prompt and tools match each other's checkpoints; with `--short-read 128` the tool probe crashed the engine 3 times on `spill-N.ses: No such file`, 0 after the fix in 114 spill reads); new `--no-conversation-spill-idle` writes a spill only when another conversation comes in, not ahead of it while idle (the switch pays the write, 0.2-0.7 s) |
+| 05 | ours | under `--prefill-main` prompt parts with pictures chain split-wise like text (the picture rows replace the token embedding at layer 0 on the 5090, every stage holds the image positions); before, every image part ran whole-model on the 5090 and streamed the 4070's 9.6 GiB of experts from the SSD: OCR crop (1,199 tokens) 5.13 s / 10.75 GB -> 1.23 s / 0.32 GB, full page 3.02 s / 10.35 GB -> 1.31 s / 0.04 GB, an image inside a 34K conversation 2.88 s / 7.24 GB -> 1.65 s / 0.01 GB; OCR answers identical |
+| 06 | upstream #3470, #3350, #3602 | three upstream fixes that came after v0.2.1: copy streams and events of short-lived threads go back to a pool instead of leaking a few MiB of VRAM on the later card per long cold prompt (#3470); a conversation checkpoint whose copy ran out of memory is skipped instead of ending the request (#3350, upstream f62589fd); a PLE read that failed no longer leaves the next ticket waiting for ever (#3602, upstream ebe3383a) |
+| 07 | PR #4844 | with `--pipeline-windows 2` and `--adapt-async 1` on a layer split, an adaptive round finished after the pipelined loop marked a stale range, so newly placed experts ended up in neither VRAM nor RAM and were read from the file: decode drifted down over hours until a restart. Two lines; in upstream since v0.2.12 |
+| 08 | PR #5108 | the MMQ row table gets room for ggml's stream-k fixup read, which ran past its end on long prompts on the second card of a layer split (`prefill copy_i32: illegal memory access`). In upstream since v0.2.12 |
+
+Measured and left out on v0.2.1: the PR #3453-style sm_89 MMVQ table re-tuned on the 4070 Ti SUPER (bitwise
+parity on both cards, decode neutral: the 4070 holds 9 of 48 layers); `STRATA_UNBUFFERED_LOAD=1` with an explicit
+`--resident-budget-gib 17.5` (O_DIRECT file tier, equal on fresh boots). Details for every piece:
+[docs/how-it-works.md](how-it-works.md).

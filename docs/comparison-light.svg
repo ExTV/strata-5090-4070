@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 504" width="1000" height="504" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="This build against upstream Strata v0.2.13 on the same PC: six measurements">
+<rect width="1000" height="504" rx="10" fill="#fcfcfb"/>
+<text x="30" y="42" font-size="22" font-weight="600" fill="#0b0b0b">Same PC, same model files: this build against upstream Strata</text>
+<text x="30" y="66" font-size="13.5" fill="#52514e">RTX 5090 + RTX 4070 Ti SUPER, 31 GB of RAM. Qwen3.8-Flash-Next UD-IQ3_XXS at the full 262,144-token context.</text>
+<rect x="30" y="82" width="12" height="12" rx="2" fill="#2a78d6"/>
+<text x="48" y="93" font-size="13" fill="#0b0b0b">This build (Strata v0.2.1 + 8 patches, tuned config)</text>
+<rect x="380" y="82" width="12" height="12" rx="2" fill="#eb6834"/>
+<text x="398" y="93" font-size="13" fill="#0b0b0b">Upstream v0.2.13 (engine 0.1.59), as its own setup installs it</text>
+<text x="30" y="136" font-size="15" font-weight="600" fill="#0b0b0b">Decode speed</text>
+<text x="30" y="154" font-size="12" fill="#898781">tokens per second, median of 7 answers, higher is better</text>
+<line x1="96" y1="168" x2="96" y2="226" stroke="#c3c2b7" stroke-width="1"/>
+<text x="30" y="185.5" font-size="12" fill="#52514e">This build</text>
+<path d="M96,174 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#2a78d6"/>
+<text x="253.0" y="185.5" font-size="13" font-weight="600" fill="#0b0b0b">251</text>
+<text x="30" y="213.5" font-size="12" fill="#52514e">Upstream</text>
+<path d="M96,202 h46.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-46.8 z" fill="#eb6834"/>
+<text x="153.8" y="213.5" font-size="13" font-weight="600" fill="#0b0b0b">85</text>
+<text x="96" y="248" font-size="12.5" fill="#52514e">3.0x faster</text>
+<text x="350" y="136" font-size="15" font-weight="600" fill="#0b0b0b">20K-token prompt</text>
+<text x="350" y="154" font-size="12" fill="#898781">seconds to read, lower is better</text>
+<line x1="416" y1="168" x2="416" y2="226" stroke="#c3c2b7" stroke-width="1"/>
+<text x="350" y="185.5" font-size="12" fill="#52514e">This build</text>
+<path d="M416,174 h19.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-19.8 z" fill="#2a78d6"/>
+<text x="446.8" y="185.5" font-size="13" font-weight="600" fill="#0b0b0b">10.3 s</text>
+<text x="350" y="213.5" font-size="12" fill="#52514e">Upstream</text>
+<path d="M416,202 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#eb6834"/>
+<text x="573.0" y="213.5" font-size="13" font-weight="600" fill="#0b0b0b">65.0 s</text>
+<text x="416" y="248" font-size="12.5" fill="#52514e">6.3x faster</text>
+<text x="670" y="136" font-size="15" font-weight="600" fill="#0b0b0b">80K-token prompt</text>
+<text x="670" y="154" font-size="12" fill="#898781">seconds to read, lower is better</text>
+<line x1="736" y1="168" x2="736" y2="226" stroke="#c3c2b7" stroke-width="1"/>
+<text x="670" y="185.5" font-size="12" fill="#52514e">This build</text>
+<path d="M736,174 h21.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-21.9 z" fill="#2a78d6"/>
+<text x="768.9" y="185.5" font-size="13" font-weight="600" fill="#0b0b0b">15.4 s</text>
+<text x="670" y="213.5" font-size="12" fill="#52514e">Upstream</text>
+<path d="M736,202 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#eb6834"/>
+<text x="893.0" y="213.5" font-size="13" font-weight="600" fill="#0b0b0b">89.2 s</text>
+<text x="736" y="248" font-size="12.5" fill="#52514e">5.8x faster</text>
+<text x="30" y="308" font-size="15" font-weight="600" fill="#0b0b0b">250K-token prompt</text>
+<text x="30" y="326" font-size="12" fill="#898781">seconds to read, lower is better</text>
+<line x1="96" y1="340" x2="96" y2="398" stroke="#c3c2b7" stroke-width="1"/>
+<text x="30" y="357.5" font-size="12" fill="#52514e">This build</text>
+<path d="M96,346 h23.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-23.2 z" fill="#2a78d6"/>
+<text x="130.2" y="357.5" font-size="13" font-weight="600" fill="#0b0b0b">46.7 s</text>
+<text x="30" y="385.5" font-size="12" fill="#52514e">Upstream</text>
+<path d="M96,374 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#eb6834"/>
+<text x="253.0" y="385.5" font-size="13" font-weight="600" fill="#0b0b0b">257.4 s</text>
+<text x="96" y="420" font-size="12.5" fill="#52514e">5.5x faster</text>
+<text x="350" y="308" font-size="15" font-weight="600" fill="#0b0b0b">Turn in a chat grown to 256K</text>
+<text x="350" y="326" font-size="12" fill="#898781">seconds per turn, median of 56, lower is better</text>
+<line x1="416" y1="340" x2="416" y2="398" stroke="#c3c2b7" stroke-width="1"/>
+<text x="350" y="357.5" font-size="12" fill="#52514e">This build</text>
+<path d="M416,346 h20.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-20.8 z" fill="#2a78d6"/>
+<text x="447.8" y="357.5" font-size="13" font-weight="600" fill="#0b0b0b">2.1 s</text>
+<text x="350" y="385.5" font-size="12" fill="#52514e">Upstream</text>
+<path d="M416,374 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#eb6834"/>
+<text x="573.0" y="385.5" font-size="13" font-weight="600" fill="#0b0b0b">12.7 s</text>
+<text x="416" y="420" font-size="12.5" fill="#52514e">6.0x faster</text>
+<text x="670" y="308" font-size="15" font-weight="600" fill="#0b0b0b">Tool-call probe</text>
+<text x="670" y="326" font-size="12" fill="#898781">sequences passed, of 30, higher is better</text>
+<line x1="736" y1="340" x2="736" y2="398" stroke="#c3c2b7" stroke-width="1"/>
+<text x="670" y="357.5" font-size="12" fill="#52514e">This build</text>
+<path d="M736,346 h146.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-146.0 z" fill="#2a78d6"/>
+<text x="893.0" y="357.5" font-size="13" font-weight="600" fill="#0b0b0b">30 / 30</text>
+<text x="670" y="385.5" font-size="12" fill="#52514e">Upstream</text>
+<path d="M736,374 h41.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-41.0 z" fill="#eb6834"/>
+<text x="788.0" y="385.5" font-size="13" font-weight="600" fill="#0b0b0b">9 / 30</text>
+<text x="736" y="420" font-size="12.5" fill="#52514e">21 more passed</text>
+<text x="30" y="470" font-size="11.5" fill="#898781">Measured 2026-11-10, each server freshly started at the login screen, thinking off, temperature 0. Upstream: both cards, 262,144 context,</text>
+<text x="30" y="486" font-size="11.5" fill="#898781">images on, every other setting its own default. One run per bar (decode: 3 runs here, 2 upstream). Details: docs/benchmarks.md</text>
+</svg>
