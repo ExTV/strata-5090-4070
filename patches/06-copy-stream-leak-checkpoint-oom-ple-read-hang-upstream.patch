@@ -1,0 +1,335 @@
+--- a/src/core/conversation_copy.hpp
++++ b/src/core/conversation_copy.hpp
+@@ -6,38 +6,111 @@
+ #include <cuda_runtime.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cstddef>
+ #include <cstdlib>
++#include <mutex>
+ #include <thread>
+ #include <vector>
+ 
+ namespace strata::core::conversation_detail {
+ 
++/// The private copy streams and ordering events (below) belong to a thread, but a thread can be short-lived: the layer
++/// split's later stages run each prompt chunk on a fresh std::async thread, and a checkpoint part is saved on it.  The
++/// handles used to be created per thread and never destroyed, so every such thread left one stream and one event per
++/// device behind - a few MiB of VRAM per long cold prompt on the later cards, until a stream could not be created any
++/// more and the copy failed with "out of memory" (#3350, #3470).  Now a thread hands its handles back to a process-wide
++/// pool when it ends and the next thread takes them: the number of handles is the number of threads copying at once.
++/// The pool is leaked on purpose (a thread may end after the statics are gone).
++struct CopyHandlePool {
++    std::mutex mu;
++    std::vector<std::vector<cudaStream_t>> streams;   // free ones, by device
++    std::vector<std::vector<cudaEvent_t>> events;
++    long streams_created = 0, events_created = 0;
++};
++inline CopyHandlePool& copy_handle_pool() {
++    static CopyHandlePool* p = new CopyHandlePool;
++    return *p;
++}
++/// How many streams / events the process has created for these copies (tests: it stays at the peak number of threads
++/// copying at once, not at the number of threads that ever copied).
++inline long copy_streams_created() {
++    CopyHandlePool& p = copy_handle_pool();
++    std::lock_guard<std::mutex> lk(p.mu);
++    return p.streams_created;
++}
++inline long copy_events_created() {
++    CopyHandlePool& p = copy_handle_pool();
++    std::lock_guard<std::mutex> lk(p.mu);
++    return p.events_created;
++}
++struct ThreadCopyHandles {
++    std::vector<cudaStream_t> streams;   // by device, nullptr = none yet
++    std::vector<cudaEvent_t> events;
++    ThreadCopyHandles() = default;
++    ThreadCopyHandles(const ThreadCopyHandles&) = delete;
++    ThreadCopyHandles& operator=(const ThreadCopyHandles&) = delete;
++    ~ThreadCopyHandles() {
++        CopyHandlePool& p = copy_handle_pool();
++        std::lock_guard<std::mutex> lk(p.mu);
++        if (p.streams.size() < streams.size()) p.streams.resize(streams.size());
++        if (p.events.size() < events.size()) p.events.resize(events.size());
++        for (size_t d = 0; d < streams.size(); ++d)
++            if (streams[d]) p.streams[d].push_back(streams[d]);
++        for (size_t d = 0; d < events.size(); ++d)
++            if (events[d]) p.events[d].push_back(events[d]);
++    }
++};
++inline ThreadCopyHandles& thread_copy_handles() {
++    thread_local ThreadCopyHandles t;
++    return t;
++}
++
+ /// Conversation snapshot / checkpoint copies go through a private non-blocking stream of the current device
+ /// instead of the legacy (null) stream.  A plain cudaMemcpy is ordered against every blocking stream of the
+ /// device, and while another thread captures a graph on one (a drafter or a stage worker), HIP refuses it with
+ /// "operation would make the legacy stream depend on a capturing blocking stream".  The caller's contract is
+ /// unchanged: the device was synchronized before the copy (the copy itself is complete on return).
+-/// private_stream: this thread's stream on the current device, created on first use.
++/// private_stream: this thread's stream on the current device: one a finished thread handed back, else a new one on
++/// first use.
+ inline cudaError_t private_stream(cudaStream_t& s) {
+     int dev = 0;
+     cudaError_t e = cudaGetDevice(&dev);
+     if (e != cudaSuccess) return e;
+-    thread_local std::vector<cudaStream_t> streams;
++    std::vector<cudaStream_t>& streams = thread_copy_handles().streams;
+     if (dev < 0) dev = 0;
+-    if ((size_t) dev >= streams.size()) streams.resize((size_t) dev + 1, nullptr);   // never destroyed: process lifetime
++    if ((size_t) dev >= streams.size()) streams.resize((size_t) dev + 1, nullptr);
+     if (!streams[(size_t) dev]) {
+-        e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
+-        if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
++        CopyHandlePool& p = copy_handle_pool();
++        std::lock_guard<std::mutex> lk(p.mu);
++        if ((size_t) dev < p.streams.size() && !p.streams[(size_t) dev].empty()) {
++            streams[(size_t) dev] = p.streams[(size_t) dev].back();
++            p.streams[(size_t) dev].pop_back();
++        } else {
++            e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
++            if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
++            ++p.streams_created;
++        }
+     }
+     s = streams[(size_t) dev];
+     return cudaSuccess;
+ }
+ 
++/// STRATA_TEST_COPY_FAIL_AT=N (tests only, #3350): the N-th snapshot / checkpoint copy of the process fails with
++/// cudaErrorMemoryAllocation, as when a card has no memory left for the copy.  Unset: nothing.
++inline long test_copy_fail_at() {
++    static const long v = [] { const char* e = std::getenv("STRATA_TEST_COPY_FAIL_AT"); return e ? std::atol(e) : 0L; }();
++    return v;
++}
++
+ /// `queued`: the copy is only queued on the private stream, and the caller synchronizes the device (or orders a
+ /// later launch after it with order_after_queued) before anything reads the target or writes the source.
+ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bool queued = false) {
++    if (const long at = test_copy_fail_at(); at > 0) {
++        static std::atomic<long> copies{0};
++        if (++copies == at) return cudaErrorMemoryAllocation;
++    }
+     cudaStream_t s = nullptr;
+     cudaError_t e = private_stream(s);
+     if (e != cudaSuccess) return e;
+@@ -106,12 +179,20 @@
+     int dev = 0;
+     e = cudaGetDevice(&dev);
+     if (e != cudaSuccess) return e;
+-    thread_local std::vector<cudaEvent_t> events;
++    std::vector<cudaEvent_t>& events = thread_copy_handles().events;
+     if (dev < 0) dev = 0;
+-    if ((size_t) dev >= events.size()) events.resize((size_t) dev + 1, nullptr);    // never destroyed: process lifetime
++    if ((size_t) dev >= events.size()) events.resize((size_t) dev + 1, nullptr);
+     if (!events[(size_t) dev]) {
+-        e = cudaEventCreateWithFlags(&events[(size_t) dev], cudaEventDisableTiming);
+-        if (e != cudaSuccess) { events[(size_t) dev] = nullptr; return e; }
++        CopyHandlePool& p = copy_handle_pool();
++        std::lock_guard<std::mutex> lk(p.mu);
++        if ((size_t) dev < p.events.size() && !p.events[(size_t) dev].empty()) {
++            events[(size_t) dev] = p.events[(size_t) dev].back();
++            p.events[(size_t) dev].pop_back();
++        } else {
++            e = cudaEventCreateWithFlags(&events[(size_t) dev], cudaEventDisableTiming);
++            if (e != cudaSuccess) { events[(size_t) dev] = nullptr; return e; }
++            ++p.events_created;
++        }
+     }
+     e = cudaEventRecord(events[(size_t) dev], s);
+     if (e != cudaSuccess) return e;
+--- /dev/null
++++ b/src/core/conversation_copy_streams_test.cpp
+@@ -0,0 +1,86 @@
++// The conversation copy streams and events are pooled across threads (#3350, #3470): short-lived threads (the layer
++// split's later stages run each prompt chunk on a fresh std::async thread) must not leave a stream and an event behind
++// each.  Synthetic 4 KiB copies, no model; needs a CUDA device (skips, exit 77, without one).
++#include "conversation_copy.hpp"
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <thread>
++#include <vector>
++
++using namespace strata::core::conversation_detail;
++
++namespace {
++int checks = 0;
++void check(bool ok, const char* label) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
++}
++
++// one thread's work on device `dev`: a queued copy, the ordering event, a synchronous copy
++bool one_thread(int dev, void* d, void* h, size_t bytes) {
++    if (cudaSetDevice(dev) != cudaSuccess) return false;
++    if (copy_nonblocking(d, h, bytes, true) != cudaSuccess) return false;
++    if (order_after_queued() != cudaSuccess) return false;
++    if (copy_nonblocking(h, d, bytes, false) != cudaSuccess) return false;
++    return cudaDeviceSynchronize() == cudaSuccess;
++}
++}  // namespace
++
++int main() {
++    int n_dev = 0;
++    if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) {
++        (void) cudaGetLastError();
++        std::printf("conversation_copy_streams_test: no CUDA device, skipped\n");
++        return 77;
++    }
++    constexpr size_t bytes = 4096;
++    void* d = nullptr;
++    check(cudaMalloc(&d, bytes) == cudaSuccess, "device buffer");
++    std::vector<char> h(bytes, 7);
++
++    // 1. 200 threads, one after the other (a chunk per std::async thread): the handles are reused, not created per thread
++    const long s0 = copy_streams_created(), e0 = copy_events_created();
++    for (int i = 0; i < 200; ++i) {
++        bool ok = false;
++        std::thread t([&] { ok = one_thread(0, d, h.data(), bytes); });
++        t.join();
++        check(ok, "a short-lived thread's copies succeed");
++    }
++    check(copy_streams_created() - s0 <= 1, "200 sequential threads create at most one stream");
++    check(copy_events_created() - e0 <= 1, "200 sequential threads create at most one event");
++
++    // 2. threads at the same time each have their own (the number is bounded by the concurrency)
++    const long s1 = copy_streams_created();
++    std::atomic<int> fails{0};
++    for (int round = 0; round < 10; ++round) {
++        std::vector<std::thread> ts;
++        for (int k = 0; k < 6; ++k)
++            ts.emplace_back([&] { for (int j = 0; j < 5; ++j) if (!one_thread(0, d, h.data(), bytes)) ++fails; });
++        for (auto& t : ts) t.join();
++    }
++    check(fails.load() == 0, "concurrent threads' copies succeed");
++    check(copy_streams_created() - s1 <= 6, "ten rounds of 6 concurrent threads create at most 6 more streams");
++
++    // 3. a second device has its own
++    if (n_dev > 1) {
++        const long s2 = copy_streams_created();
++        for (int i = 0; i < 50; ++i) {
++            bool ok = false;
++            std::thread t([&] {
++                ok = cudaSetDevice(1) == cudaSuccess;
++                void* d1 = nullptr;
++                ok = ok && cudaMalloc(&d1, bytes) == cudaSuccess && one_thread(1, d1, h.data(), bytes);
++                if (d1) cudaFree(d1);
++            });
++            t.join();
++            check(ok, "device 1: a short-lived thread's copies succeed");
++        }
++        check(copy_streams_created() - s2 <= 1, "device 1: 50 sequential threads create at most one stream");
++    }
++    cudaFree(d);
++    std::printf("conversation_copy_streams_test: %d checks passed (%ld streams, %ld events created in all)\n", checks,
++                copy_streams_created(), copy_events_created());
++    return 0;
++}
+--- a/src/ngram/ple_reader.cpp
++++ b/src/ngram/ple_reader.cpp
+@@ -481,6 +481,13 @@
+     const bool rearm = m.keep_us > 0 && (m.last_issue_us <= 0 || now - m.last_issue_us > m.keep_window_us);
+     m.last_issue_us = now;
+     TicketState& ts = m.tickets[id];
++    // After a failed read the reader stays failed (`collect` reports `error` until the next `open`) and its worker has
++    // parked (worker_loop). A ticket queued now would never be read and `collect` would wait for it for ever, so it
++    // is not queued: it has no jobs, and `collect` returns the error at once.
++    if (!m.error.empty()) {
++        ts.pending = 0;
++        return Ticket{id};
++    }
+     std::unordered_map<uint64_t, size_t> by_page;     // aligned offset -> index in `jobs`
+     std::vector<Job> jobs;
+     uint32_t attached = 0;                             // prefetch reads in flight this ticket waits for
+@@ -562,7 +569,7 @@
+         });
+         it = m.tickets.find(t.id);
+         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
+-        if (!m.error.empty()) { err = m.error; return false; }
++        if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
+         m.stats.wait_us += now_us() - start;
+         m.tickets.erase(it);
+         return true;
+@@ -575,7 +582,7 @@
+         it = m.tickets.find(t.id);
+         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
+     }
+-    if (!m.error.empty()) { err = m.error; return false; }
++    if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
+     m.stats.wait_us += now_us() - start;
+     m.tickets.erase(it);
+     return true;
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1748,6 +1748,15 @@
+     return false;
+ }
+ 
++/// #3350: a conversation checkpoint is an optimization, like parking.  After a failed save: true when the failure was
++/// only the copy's memory (a host or driver allocation, which does not stick), so the caller goes on without that
++/// checkpoint; false when the GPU itself is unwell (a sticky error comes back from the synchronize), which still ends
++/// the request as before.
++bool checkpoint_failure_is_survivable() {
++    (void) cudaGetLastError();   // clears a failed allocation; a sticky error is not cleared and is returned again below
++    return cudaDeviceSynchronize() == cudaSuccess;
++}
++
+ /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
+ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+     std::string error;
+@@ -10193,7 +10202,15 @@
+                 } else {
+                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
+                 }
+-                if (!saved) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
++                if (!saved) {
++                    // #3350: only a GPU that is unwell ends the request; a copy that ran out of memory skips this checkpoint
++                    if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {
++                        e = "saving a conversation checkpoint failed" + ckpt_why;
++                        return false;
++                    }
++                    std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
++                                         "above); the request goes on without it\n", (long long) done);
++                }
+                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
+                 if (tail_checkpoint) pp_tail_saved = true;
+             }
+@@ -10229,7 +10246,16 @@
+                     part_next[i] = done + o.prompt_cache_every;
+                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
+                     part.ids.assign(cur.begin(), cur.begin() + done);
+-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
++                    if (!checkpoint_save(part, stage_ss, g)) {
++                        // #3350: the copy ran out of memory (not the GPU): leave this part out. The set at `done` is then
++                        // incomplete and the checkpoint is skipped below, as for a part that was never made
++                        if (!checkpoint_failure_is_survivable()) { e = "saving a checkpoint part failed"; return false; }
++                        std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: stage %zu's state could not be copied "
++                                             "out (see above); the request goes on without it\n", (long long) done, i);
++                        std::lock_guard<std::mutex> lk(part_mu);
++                        part_at[done].resize(stages.size() + 1);   // (marks the set as seen; its empty parts make it incomplete)
++                        return true;
++                    }
+                     std::lock_guard<std::mutex> lk(part_mu);
+                     auto& v = part_at[done];
+                     v.resize(stages.size() + 1);
+@@ -14777,8 +14803,12 @@
+                 at = to;
+                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
+                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
+-                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+-                    return 1;
++                    if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {   // #3350: only an unwell GPU ends the request
++                        std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
++                        return 1;
++                    }
++                    std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
++                                         "above); the request goes on without it\n", (long long) to);
+                 }
+                 if (to == pin_at && !pin_checkpoint(pin_at))
+                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);

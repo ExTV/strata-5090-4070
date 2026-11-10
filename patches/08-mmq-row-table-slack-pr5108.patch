@@ -1,0 +1,51 @@
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -1130,6 +1130,12 @@
+ // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
+ // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
+ constexpr size_t MMQ_TAIL = 4096;
++// upstream #5108: the MMQ row table (`ids_identity`, T*K rows) is read past its end by ggml's stream-k fixup
++// (mul_mat_q_stream_k_fixup loads ids_dst for a whole J-column tile before comparing it with the expert's rows), up to
++// ceil(max_rows / J) * J ints past a late expert's first row.  max_rows <= T and J <= 128 on NVIDIA (256 leaves room):
++// T + 256 rows of slack keep the read inside the allocation (else Xid 31 / "prefill copy_i32: an illegal memory
++// access" on a long prompt on a layer split's second card).
++constexpr size_t mmq_ids_rows(size_t T) { return T * (size_t) K + T + 256; }
+ struct MmqPlan {
+     bool any = false, fallback = true;
+     std::vector<char> layer;                   // per layer: MMQ
+@@ -1641,7 +1647,7 @@
+     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+     if (mmq_plan().any) {
+         const MmqPlan& mp = mmq_plan();
+-        m.ids_identity = o.take<int32_t>(T * K, ok);
++        m.ids_identity = o.take<int32_t>(mmq_ids_rows(T), ok);   // (its over-read slack: mmq_ids_rows)
+         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
+         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+@@ -2085,7 +2091,7 @@
+             return false;
+     }
+     const core::OnDevice on(P.dev);
+-    mmq::iota(P.ident, T * K, P.s);           // the helper's row table: a refill may have overwritten its slots
++    mmq::iota(P.ident, (int64_t) mmq_ids_rows((size_t) T), P.s);           // the helper's row table: a refill may have overwritten its slots
+     return true;
+ }
+ 
+@@ -2429,7 +2435,7 @@
+     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+     if (mmq_plan().any) {
+         const MmqPlan& mp = mmq_plan();
+-        o.take<int32_t>(T * K, ok);
++        o.take<int32_t>(mmq_ids_rows(T), ok);   // ids_identity
+         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
+         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+@@ -2718,7 +2724,7 @@
+     const cudaStream_t cs = (cudaStream_t) m.cs;
+     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
+     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
+-    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
++    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, (int64_t) mmq_ids_rows((size_t) m.T), m.cs);
+     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
+     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
+     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
